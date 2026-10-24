@@ -1,0 +1,12 @@
+# Normalize line endings across platforms
+* text=auto
+
+# Rust sources are UTF-8
+*.rs text
+*.toml text
+*.md text
+
+# Binary assets
+*.rizref binary
+*.png binary
+*.ico binary

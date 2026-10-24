@@ -1,0 +1,18 @@
+# RizRef — ignore rules
+
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local design documents — deliberately NOT published:
+#   docs/plans  (working phase plans)
+#   docs/study   (reverse-engineering notes on the reference application)
+/docs/plans/
+/docs/study/
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
