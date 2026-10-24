@@ -100,10 +100,13 @@ Audit result for the current tree (`x86_64-pc-windows-msvc`, `normal,build`):
 
 Two deliberate exclusions, both recorded rather than hidden:
 
-- **`wgpu`'s `gles` backend is off.** It pulls `glutin_wgl_sys`, an `-sys` crate outside
-  the accepted family. Consequence: this build has Vulkan and DX12 but no GL fallback,
-  so phase 01 must either accept that crate (it is declaration-only, like `windows-sys`)
-  or drop the GL fallback from the plan.
+- **`wgpu`'s `gles` backend is off, and the GL fallback is dropped by decision.** It pulls
+  `glutin_wgl_sys`, an `-sys` crate outside the accepted family, so the backend order is
+  **Vulkan → DX12** only. The pure-Rust rule wins over the third backend: for a machine
+  with no usable Vulkan or DX12 driver, the intended last resort is the CPU raster path
+  (`tiny-skia`, already a dependency), not OpenGL. Revisiting this means either accepting
+  `glutin_wgl_sys` as an FFI-only exception or building the CPU path — both are recorded
+  options, not lost work.
 - **HEIF/HEIC/AVIF are recognised but not decoded.** No mature pure-Rust decoder exists
   today. Such a file is identified by its signature and reported as unsupported, instead
   of being misreported as corrupt. JPEG, PNG, WebP, GIF, BMP, ICO, TGA, PNM and QOI cover

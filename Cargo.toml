@@ -68,14 +68,14 @@ image = { version = "0.25.10", default-features = false, features = [
 
 # --- window, GPU, clipboard, dialogs: rizref (bin) -------------------------
 winit = "0.30.13"
-# Fallback order required by phase 01 is Vulkan -> DX12 (-> GL, see below); the
-# Metal and WebGPU backends are switched off deliberately.
+# Backend order: Vulkan -> DX12 (see README.md); the Metal and WebGPU backends are
+# switched off deliberately, and the GL fallback is dropped by decision rather than
+# left ambiguous.
 #
 # `gles` is deliberately NOT enabled here: it pulls `glutin_wgl_sys`, an `-sys`
 # crate outside the accepted `windows` family, which the pure-Rust rule does not
-# allow (see the audit note in README.md). Consequence: phase 01 must resolve
-# that conflict before it can implement the GL fallback; Vulkan and DX12 are
-# unaffected and cover current Windows hardware.
+# allow (see the audit note in README.md). The pure-Rust answer for a machine with
+# no usable Vulkan/DX12 driver is the CPU raster path (`tiny-skia`), not OpenGL.
 wgpu = { version = "30.0.1", default-features = false, features = [
     "std",
     "parking_lot",
