@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A push that fixes a lint failure should not queue behind the run it fixes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Workspace lints live in the root Cargo.toml, so a lint failure here is a
+      # policy failure, not a matter of taste.
+      - name: Lint every target
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the workspace
+        run: cargo build --workspace
+      - name: Run the tests
+        run: cargo test --workspace
+      # The pure-Rust rule is the one constraint that is easy to break by adding
+      # a feature flag, and impossible to notice in review. Catching it here is
+      # cheaper than catching it in a released binary.
+      - name: Audit the dependency tree for native bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --workspace --target x86_64-pc-windows-msvc -e normal,build > dependency-tree.txt
+          # Crates whose name marks them as native bindings, with the version cut off.
+          bindings=$(grep -oE '[a-z0-9_]+(-[a-z0-9_]+)*[-_]sys v[0-9][^ ]*' dependency-tree.txt \
+            | sed -E 's/ v[0-9].*$//' | sort -u)
+          # Accepted: the Win32/COM FFI family, plus bindings that declare an API
+          # without linking anything (see the README audit note).
+          accepted='^(windows-sys|windows-targets|windows_[a-z0-9_]+|renderdoc-sys)$'
+          unexpected=$(printf '%s\n' "$bindings" | grep -Ev "$accepted" || true)
+          printf 'native-binding crates found:\n%s\n' "$bindings"
+          if [ -n "$unexpected" ]; then
+            printf '::error::dependency tree contains native bindings that are not accepted: %s\n' "$unexpected"
+            exit 1
+          fi
