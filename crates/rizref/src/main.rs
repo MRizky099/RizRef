@@ -1,17 +1,12 @@
 //! RizRef — the application binary.
 //!
-//! # Phase 00 scope
+//! # Scope
 //!
-//! What exists here is deliberately small: argument handling, logging, and a
-//! startup summary that exercises every part of the pinned dependency set. The
-//! window, the wgpu surface and the render loop arrive in phase 01; the platform
-//! glue for the single-instance guard, the native message box and drag-and-drop
-//! arrives with it, in [`platform`].
-//!
-//! Printing that summary is not decoration. It is the cheapest way to prove that
-//! a build really links and initialises what the plan says it does — the GPU
-//! backend flags, the CPU rasteriser, the font database, the clipboard, the
-//! native dialogs — before any of it is wired to a window.
+//! `app::run` owns the launch sequence: arguments, logging, the panic hook,
+//! the single-instance handshake, then the event loop with a window and a GPU
+//! surface (phase 01). The canvas, input mapping and item pipeline arrive with
+//! phases 02+. Platform glue — the mutex, the args pipe, the message box —
+//! lives in [`platform`], the only module allowed to call Win32 directly.
 
 #![deny(unsafe_code)]
 
