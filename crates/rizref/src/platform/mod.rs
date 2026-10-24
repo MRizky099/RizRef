@@ -1,26 +1,30 @@
 //! Windows platform glue: everything that talks to the operating system.
 //!
-//! This module is where the `windows` crate is used, and where phase 01 adds the
-//! three things the window needs from the OS rather than from winit:
+//! This module is where the `windows` crate is used. Three things the window
+//! needs come from the OS rather than from winit:
 //!
-//! * **Single-instance guard.** A named mutex; a second launch forwards its
-//!   arguments — typically a board to open — to the running instance and exits,
-//!   so double-clicking a `.rizref` file does not start a second board.
-//! * **Named-pipe or window-message hand-off** of those arguments.
+//! * **Single-instance guard.** A named mutex decides who is primary; a named
+//!   pipe carries the arguments of a second launch — typically a board to open
+//!   — to the running instance, which logs them and (from phase 05 on) opens
+//!   them, so double-clicking a `.rizref` file never starts a second app.
 //! * **Panic reporting.** A native message box next to the log file, because an
 //!   application without a console has nowhere else to say that it died.
+//! * **Logging location.** The user's local-appdata directory, queried from the
+//!   environment at runtime — never a hardcoded path.
 //!
-//! Drag-and-drop (`IDropTarget`) belongs here too, as does the opt-in per-monitor
-//! DPI awareness declaration.
+//! Drag-and-drop (`IDropTarget`) and the Explorer thumbnail provider belong here
+//! too, in later phases.
 //!
 //! # Unsafe code
 //!
 //! Every crate in this workspace sets `#![deny(unsafe_code)]`. Win32 calls are
-//! `unsafe`, so the functions added here will each carry a narrow, documented
+//! `unsafe`, so each function in the submodules carries a narrow, documented
 //! `#[allow(unsafe_code)]` on the smallest possible item, with a safety note
 //! stating the invariant that makes the call sound. Keeping that confined to
-//! this module is the point: the rest of the application stays safe Rust that
-//! `#![forbid]`-style rules can be applied to later.
-//!
-//! Nothing is implemented yet — the module is here so the rule above has a
-//! written home before the first `unsafe` block appears.
+//! this module is the point: the rest of the application stays safe Rust.
+
+pub mod message_box;
+pub mod single_instance;
+
+pub use message_box::alert;
+pub use single_instance::{SingleInstance, forward_args_to_primary, serve_forwarded_args};
