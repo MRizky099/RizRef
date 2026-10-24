@@ -1,0 +1,135 @@
+# RizRef — cargo workspace root.
+#
+# Layering (see README.md for the full picture):
+#   rizref-core     scene model, geometry, commands — no IO, no UI, no windowing
+#   rizref-format   the `.rizref` container — the only writer of scene files
+#   rizref-codecs   image decode/encode dispatch on pure-Rust codec backends
+#   rizref          the application binary: window, renderer, input, platform glue
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/rizref",
+    "crates/rizref-core",
+    "crates/rizref-format",
+    "crates/rizref-codecs",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/MRizky099/RizRef"
+
+# ---------------------------------------------------------------------------
+# Workspace dependencies.
+#
+# Pure-Rust rule: a dependency that vendors or links C/C++ is rejected. Win32 /
+# COM FFI binding crates (`windows`, `windows-sys`) are the only accepted
+# exception, because they contain nothing but declarations. `cargo tree` is
+# audited for any other `*-sys` crate as part of the phase-00 verification.
+#
+# Every dependency is declared once here and opted into by a member with
+# `dep.workspace = true`, so a version can never drift between crates.
+# ---------------------------------------------------------------------------
+
+[workspace.dependencies]
+
+# --- maths and (de)serialization: rizref-core, rizref-format ----------------
+glam = { version = "0.34.1", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+# --- container internals: rizref-format ------------------------------------
+lz4_flex = "0.14.0"
+# `pure` selects BLAKE3's Rust-intrinsics implementation. Without it the build
+# script assembles BLAKE3's hand-written C assembly whenever a C compiler is on
+# PATH, which the pure-Rust rule does not allow. With `pure`, no C or assembly
+# is compiled or linked into the binary; the build script still declares `cc` and
+# probes one compiler flag on x86_64, which compiles nothing into our artifacts.
+# See the dependency audit in README.md.
+blake3 = { version = "1.8.7", features = ["pure"] }
+
+# --- image codecs: rizref-codecs -------------------------------------------
+png = "0.18.1"
+zune-jpeg = "0.5.15"
+jpeg-encoder = "0.7.1"
+image-webp = "0.2.4"
+gif = "0.14.2"
+ico = "0.6.0"
+# `default-features = false` keeps the optional AVIF/rav1e, EXR and TIFF stacks
+# out of the build; only the plain raster backends the decision table lists are
+# enabled here. WebP and ICO are covered by `image-webp` and `ico` above.
+image = { version = "0.25.10", default-features = false, features = [
+    "bmp",
+    "pnm",
+    "qoi",
+    "tga",
+] }
+
+# --- window, GPU, clipboard, dialogs: rizref (bin) -------------------------
+winit = "0.30.13"
+# Fallback order required by phase 01 is Vulkan -> DX12 (-> GL, see below); the
+# Metal and WebGPU backends are switched off deliberately.
+#
+# `gles` is deliberately NOT enabled here: it pulls `glutin_wgl_sys`, an `-sys`
+# crate outside the accepted `windows` family, which the pure-Rust rule does not
+# allow (see the audit note in README.md). Consequence: phase 01 must resolve
+# that conflict before it can implement the GL fallback; Vulkan and DX12 are
+# unaffected and cover current Windows hardware.
+wgpu = { version = "30.0.1", default-features = false, features = [
+    "std",
+    "parking_lot",
+    "dx12",
+    "vulkan",
+    "wgsl",
+] }
+tiny-skia = "0.12.0"
+# `fontconfig` is off: it is a C library, and RizRef reads the Windows font
+# database through `fontdb`'s pure-Rust backends instead.
+cosmic-text = { version = "0.19.0", default-features = false, features = [
+    "std",
+    "swash",
+] }
+# Clipboard text plus PNG/BMP image data. arboard already builds its own `image`
+# dependency with `default-features = false`, so this does not pull rav1e in.
+arboard = "3.7.0"
+rfd = { version = "0.17.2", features = ["common-controls-v6"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Reserved for the phase-01 FFI glue (single-instance mutex, Win32 message box,
+# COM dialogs, IDropTarget). Declared here so no crate has to guess a version;
+# intentionally not linked yet — no phase-00 code makes Win32 calls.
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# ---------------------------------------------------------------------------
+# Lint policy. Members opt in with `[lints] workspace = true`.
+# `unsafe_code` is denied crate-wide; the phase-01 FFI glue modules that must
+# call Win32 will carry a narrow, documented local `allow`.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# The skeleton must not ship unfinished code paths.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+# ---------------------------------------------------------------------------
+# Release profile, sized against the phase-07 budget of a < 15 MB single exe.
+# Budgets are recorded in README.md; phase 07 measures them.
+# ---------------------------------------------------------------------------
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

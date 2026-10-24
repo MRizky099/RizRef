@@ -1,0 +1,23 @@
+[package]
+name = "rizref"
+description = "The RizRef application: window, renderer, input and Windows platform glue."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rizref-core = { path = "../rizref-core" }
+rizref-format = { path = "../rizref-format" }
+rizref-codecs = { path = "../rizref-codecs" }
+
+winit.workspace = true
+wgpu.workspace = true
+tiny-skia.workspace = true
+cosmic-text.workspace = true
+arboard.workspace = true
+rfd.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
