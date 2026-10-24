@@ -10,6 +10,9 @@
 /docs/plans/
 /docs/study/
 
+# Local scratch space (generated helpers, issue bodies, exports)
+/.local/
+
 # Editor / OS noise
 .idea/
 .vscode/
