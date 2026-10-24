@@ -1,0 +1,3 @@
+# RizRef builds on stable Rust; the CI pins the same channel.
+[toolchain]
+channel = "stable"

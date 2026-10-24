@@ -96,14 +96,26 @@ arboard = "3.7.0"
 rfd = { version = "0.17.2", features = ["common-controls-v6"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Rolling daily log files (pure Rust). Retention is pruned by the application
+# at startup, so no log-rotation service is involved.
+tracing-appender = "0.2.3"
+# Drives wgpu's async adapter/device requests to completion. wgpu 30 returns
+# futures even on native; pollster is the smallest pure-Rust executor (no
+# runtime, no dependencies).
+pollster = "0.4.0"
 # Reserved for the phase-01 FFI glue (single-instance mutex, Win32 message box,
-# COM dialogs, IDropTarget). Declared here so no crate has to guess a version;
-# intentionally not linked yet — no phase-00 code makes Win32 calls.
+# COM dialogs, IDropTarget). Declared here so no crate has to guess a version.
+# Phase 01 links it for: named mutex + named pipe (single instance), the
+# message box (panic reporting). Pipes and file I/O need their own features.
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_IO",
     "Win32_System_Ole",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
