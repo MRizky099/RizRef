@@ -1,0 +1,24 @@
+[package]
+name = "rizref-format"
+description = "Reader and writer for the `.rizref` board container: the single source of truth for the file layout."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rizref-core = { path = "../rizref-core" }
+serde.workspace = true
+serde_json.workspace = true
+lz4_flex.workspace = true
+blake3.workspace = true
+
+# `harness = false`: stable Rust has no `#[bench]`, so the target is a small
+# program that prints its own timings. `test = false` keeps `cargo test` from
+# running those timings as a unit test.
+[[bench]]
+name = "container"
+harness = false
+test = false

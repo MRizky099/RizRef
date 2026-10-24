@@ -1,0 +1,21 @@
+[package]
+name = "rizref-core"
+description = "Scene model, geometry and command history for RizRef: deterministic, no IO, no UI."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+
+# `harness = false`: stable Rust has no `#[bench]`, so the target is a small
+# program that prints its own timings. `test = false` keeps `cargo test` from
+# running those timings as a unit test.
+[[bench]]
+name = "geometry"
+harness = false
+test = false
