@@ -382,12 +382,7 @@ mod tests {
         assert_close(camera.eye, v(200.0, 100.0));
         // Every corner of the rect lands inside the padded viewport.
         let padded = DVec2::splat(50.0);
-        for corner in [
-            v(0.0, 0.0),
-            v(400.0, 0.0),
-            v(0.0, 200.0),
-            v(400.0, 200.0),
-        ] {
+        for corner in [v(0.0, 0.0), v(400.0, 0.0), v(0.0, 200.0), v(400.0, 200.0)] {
             let screen = camera.world_to_screen(corner, viewport);
             assert!(
                 screen.x >= padded.x - 1.0e-9
@@ -419,12 +414,7 @@ mod tests {
         );
         assert_close(camera.eye, v(200.0, 100.0));
         // And the content still fits: every corner is inside the viewport.
-        for corner in [
-            v(0.0, 0.0),
-            v(400.0, 0.0),
-            v(0.0, 200.0),
-            v(400.0, 200.0),
-        ] {
+        for corner in [v(0.0, 0.0), v(400.0, 0.0), v(0.0, 200.0), v(400.0, 200.0)] {
             let screen = camera.world_to_screen(corner, viewport);
             assert!(
                 screen.x >= 0.0
