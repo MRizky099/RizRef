@@ -18,16 +18,25 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use glam::DVec2;
+use rizref_core::{ItemId, Scene, SceneId, SceneRectTracker};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::canvas::{self, HudUpload};
+use crate::dev_state;
+use crate::hud::HudSurface;
+use crate::input::{self, Button as InputButton, Command, Key as InputKey, Trigger};
 use crate::platform::{self, SingleInstance, forward_args_to_primary, serve_forwarded_args};
-use crate::renderer::{FrameError, GpuSurface};
+use crate::renderer::{FrameError, FrameParams, GpuSurface};
+use crate::text::TextEngine;
+use crate::view::ViewState;
 
 /// The window RizRef opens.
 ///
@@ -57,6 +66,12 @@ impl Default for WindowPlan {
 /// A dark grey rather than black: reference images sit on the board for hours,
 /// and a pure-black surround makes mid-tone artwork look washed out.
 pub const CANVAS_BACKGROUND: [u8; 4] = [24, 24, 28, 255];
+
+/// Readout surface width in logical pixels; the upload scales with the DPI.
+const READOUT_WIDTH: f64 = 420.0;
+
+/// Readout surface height in logical pixels.
+const READOUT_HEIGHT: f64 = 40.0;
 
 /// How many daily log files to keep when pruning at startup.
 const LOG_FILES_KEPT: usize = 14;
@@ -306,22 +321,66 @@ enum AppEvent {
     ForwardedArgs(Vec<String>),
 }
 
-/// Everything the event loop owns: the window, its surface, and the state
-/// later phases grow into it.
+/// Everything the event loop owns: the window, its surface, the canvas state
+/// and the view the user looks through.
 struct App {
     plan: WindowPlan,
     window: Option<Arc<Window>>,
     renderer: Option<GpuSurface>,
+    /// The camera, the active gesture and the zoom animation.
+    view: ViewState,
+    /// The board: item z-order and the tracked scene rect. Placeholder content
+    /// until the image pipeline lands in phase 03.
+    #[allow(dead_code)]
+    scene: Scene,
+    scene_rects: SceneRectTracker,
+    /// Item ids of the placeholder items, parallel to their instances. The
+    /// scene and the ids join the manipulation phase (04); phase 02 reads only
+    /// the tracked rect and the instances.
+    #[allow(dead_code)]
+    placeholder_ids: Vec<ItemId>,
+    /// The instances the renderer draws, in scene z-order.
+    instances: Vec<canvas::QuadInstance>,
+    /// Font system and glyph caches for the HUD readout.
+    text: TextEngine,
+    /// The CPU-raster readout surface, sized once the scale factor is known.
+    hud: Option<HudSurface>,
+    /// Keyboard modifiers as of the last `ModifiersChanged`.
+    modifiers: ModifiersState,
     /// Arguments a second launch forwarded here; phase 05+ opens them.
     forwarded_paths: Vec<String>,
 }
 
 impl App {
     fn new(plan: WindowPlan) -> Self {
+        // A placeholder dev scene with the eight pipeline-test items; phase 03
+        // replaces both with real decoded images.
+        let mut scene = Scene::new(SceneId::from_bytes(*b"rizref-dev-scene"));
+        let instances = canvas::placeholder_items();
+        let mut scene_rects = SceneRectTracker::new();
+        let mut placeholder_ids = Vec::with_capacity(instances.len());
+        for (index, instance) in instances.iter().enumerate() {
+            let id = ItemId::from_raw(index as u64 + 1);
+            scene.push(id);
+            scene_rects.merge(id, instance.world_rect());
+            placeholder_ids.push(id);
+        }
+
+        // The camera survives restarts through the dev dump (phase 06 moves it
+        // into the .rizref container); without one, the default view.
+        let camera = dev_state::load().unwrap_or_default();
         Self {
+            view: ViewState::new(camera, DVec2::new(plan.size.width, plan.size.height)),
             plan,
             window: None,
             renderer: None,
+            scene,
+            scene_rects,
+            placeholder_ids,
+            instances,
+            text: TextEngine::new(),
+            hud: None,
+            modifiers: ModifiersState::default(),
             forwarded_paths: Vec::new(),
         }
     }
@@ -333,6 +392,69 @@ impl App {
     /// `CloseRequested` is the one and only place that will ask.
     fn should_confirm_close(&self) -> bool {
         false
+    }
+
+    /// Asks for one more frame; the loop draws only when something changed.
+    fn redraw(&self) {
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Applies a resolved command with the current scene rect and redraws.
+    fn apply(&mut self, command: Command) {
+        self.view.apply_command(command, self.scene_rects.rect());
+        self.redraw();
+    }
+
+    /// Scales a wheel command's notch count by the event delta and applies it.
+    fn apply_wheel(&mut self, command: Option<Command>, notches: i32) {
+        let Some(mut command) = command else {
+            return;
+        };
+        if notches == 0 {
+            return;
+        }
+        match &mut command {
+            Command::ZoomNotch(count) | Command::RotateNotch(count) => *count *= notches,
+            _ => {}
+        }
+        self.apply(command);
+    }
+
+    /// The HUD readout line: zoom percentage, rotation, cursor world position.
+    fn readout_text(&self) -> String {
+        let zoom = self.view.camera.zoom * 100.0;
+        let zoom = if (zoom - zoom.round()).abs() < 0.05 {
+            format!("{}", zoom.round() as i64)
+        } else {
+            format!("{zoom:.1}")
+        };
+        let rotation = self.view.camera.rotation.to_degrees();
+        if self.view.has_cursor() {
+            let world = self.view.cursor_world();
+            format!(
+                "{zoom}% · {rotation:.0}° · ({:.1}, {:.1})",
+                world.x, world.y
+            )
+        } else {
+            format!("{zoom}% · {rotation:.0}°")
+        }
+    }
+
+    /// Rasterises the readout into the HUD surface and returns the upload.
+    fn render_hud(&mut self, text: &str) -> Option<(Vec<u8>, u32, u32)> {
+        let hud = self.hud.as_mut()?;
+        hud.draw_readout(text, &mut self.text);
+        let bytes = hud.straight_rgba();
+        Some((bytes, hud.width(), hud.height()))
+    }
+
+    /// (Re)creates the HUD surface for the current scale factor.
+    fn rebuild_hud(&mut self, scale: f64) {
+        let width = ((READOUT_WIDTH * scale).round() as u32).max(1);
+        let height = ((READOUT_HEIGHT * scale).round() as u32).max(1);
+        self.hud = HudSurface::new(width, height);
     }
 }
 
@@ -358,9 +480,15 @@ impl ApplicationHandler<AppEvent> for App {
         };
 
         let size = window.inner_size();
+        let scale = window.scale_factor();
+        self.view.set_viewport(DVec2::new(
+            size.width as f64 / scale,
+            size.height as f64 / scale,
+        ));
+        self.rebuild_hud(scale);
         match GpuSurface::new(window.clone(), (size.width, size.height)) {
             Some(renderer) => {
-                tracing::info!(?size, "window ready");
+                tracing::info!(?size, scale, "window ready");
                 self.renderer = Some(renderer);
                 self.window = Some(window);
                 self.window.as_ref().expect("just set").request_redraw();
@@ -395,18 +523,121 @@ impl ApplicationHandler<AppEvent> for App {
                     .as_mut()
                     .expect("a resized window has a renderer")
                     .resize(size.width, size.height);
+                let scale = window.scale_factor();
+                self.view.set_viewport(DVec2::new(
+                    size.width as f64 / scale,
+                    size.height as f64 / scale,
+                ));
                 window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // winit follows this with `Resized`, which reconfigures the
-                // swapchain; nothing else to do but note it.
+                // swapchain and the view; the HUD surface rescales here.
                 tracing::debug!(scale_factor, "scale factor changed");
+                self.rebuild_hud(scale_factor);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = window.scale_factor();
+                let logical = DVec2::new(position.x / scale, position.y / scale);
+                let previous = self.view.cursor_position();
+                self.view.set_cursor(logical);
+                if self.view.pan_active()
+                    && let Some(previous) = previous
+                {
+                    self.view.drag_pan(logical - previous);
+                }
+                self.redraw();
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                let button = match button {
+                    MouseButton::Left => InputButton::Left,
+                    MouseButton::Middle => InputButton::Middle,
+                    _ => return,
+                };
+                if let Some(command) = input::resolve(&Trigger::Button {
+                    button,
+                    pressed,
+                    space_held: self.view.space_held(),
+                }) {
+                    self.apply(command);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => match delta {
+                MouseScrollDelta::LineDelta(_, y) => {
+                    // Mouse wheels: one notch per detent. Alt turns the view,
+                    // everything else zooms (instant with ctrl, per the view).
+                    let notches = y.round() as i32;
+                    let alt = self.modifiers.alt_key();
+                    let command = input::resolve(&Trigger::Wheel { alt });
+                    self.apply_wheel(command, notches);
+                }
+                MouseScrollDelta::PixelDelta(delta) => {
+                    // Trackpad two-finger scroll: pan by the pixel delta.
+                    let scale = window.scale_factor();
+                    let logical: LogicalPosition<f64> = delta.to_logical(scale);
+                    self.view.scroll_pan(DVec2::new(logical.x, logical.y));
+                    self.redraw();
+                }
+            },
+            WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state == ElementState::Pressed;
+                match &event.logical_key {
+                    Key::Named(NamedKey::Space) => self.view.set_space_held(pressed),
+                    key => {
+                        if !pressed {
+                            return;
+                        }
+                        let bound = match key {
+                            Key::Character(text) => match text.as_str() {
+                                "0" => Some(InputKey::Digit0),
+                                "1" => Some(InputKey::Digit1),
+                                "2" => Some(InputKey::Digit2),
+                                "f" | "F" => Some(InputKey::F),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(key) = bound
+                            && let Some(command) = input::resolve(&Trigger::Key { key, pressed })
+                        {
+                            self.apply(command);
+                        }
+                    }
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+                self.view.set_ctrl_held(modifiers.state().control_key());
             }
             WindowEvent::RedrawRequested => {
+                // Advance the zoom animation first: this frame shows the new
+                // state, and if it is still running the next frame is queued.
+                // The HUD and the frame params are gathered before the
+                // renderer is taken mutably, so the borrows never overlap.
+                let animating = self.view.advance(Instant::now());
+                let text = self.readout_text();
+                let hud_layer = self.render_hud(&text);
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
-                match renderer.render() {
+                let hud = match &hud_layer {
+                    Some((bytes, width, height)) => HudUpload::Layer {
+                        bytes,
+                        width: *width,
+                        height: *height,
+                    },
+                    None => HudUpload::None,
+                };
+                let params = FrameParams {
+                    camera: &self.view.camera,
+                    viewport: self.view.viewport(),
+                    physical_scale: window.scale_factor(),
+                    scene_rect: self.scene_rects.rect(),
+                    items: &self.instances,
+                    hud,
+                };
+                match renderer.render(&params) {
                     Ok(()) | Err(FrameError::NeedsReconfigure) => {}
                     Err(FrameError::Fatal(why)) => {
                         // Log and stop: retrying into a lost surface would
@@ -415,12 +646,18 @@ impl ApplicationHandler<AppEvent> for App {
                         tracing::error!(%why, "render failed; window will stay as-is");
                     }
                 }
+                if animating {
+                    window.request_redraw();
+                }
             }
             WindowEvent::CloseRequested => {
                 if self.should_confirm_close() {
                     // Phase 05 asks "save changes?" here. Nothing can be dirty
                     // yet, so the stub never routes through this branch.
                 }
+                // Dev-only checkpoint of the view transform; phase 06 folds
+                // this into the .rizref container and deletes the module.
+                dev_state::store(&self.view.camera);
                 tracing::info!("close requested; exiting");
                 event_loop.exit();
             }

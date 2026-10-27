@@ -13,6 +13,12 @@ rizref-core = { path = "../rizref-core" }
 rizref-format = { path = "../rizref-format" }
 rizref-codecs = { path = "../rizref-codecs" }
 
+# Camera f64 types for the view state and the canvas uniforms.
+glam.workspace = true
+# Dev-only view-transform checkpoint (phase 06 replaces it with the container).
+serde.workspace = true
+serde_json.workspace = true
+
 winit.workspace = true
 wgpu.workspace = true
 pollster.workspace = true

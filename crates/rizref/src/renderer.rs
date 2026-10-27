@@ -2,15 +2,18 @@
 //!
 //! Backend selection is written down in one place and visible in the logs,
 //! because "which backend did it pick?" is the first question in every
-//! rendering bug report. The surface, the clear pass and the frame pacing are
-//! here; the item pipeline and everything that draws content arrive with the
-//! canvas in phase 02.
+//! rendering bug report. The surface owns the canvas pipelines (see
+//! [`crate::canvas`]); `render` executes one frame from a [`FrameParams`]:
+//! background, items, HUD.
 
 use std::sync::Arc;
 
+use glam::DVec2;
+use rizref_core::{Camera, Rect};
 use winit::window::Window;
 
 use crate::app::CANVAS_BACKGROUND;
+use crate::canvas::{Canvas, HudUpload, QuadInstance};
 
 /// Backends this build tries, in preference order.
 ///
@@ -79,13 +82,42 @@ impl std::fmt::Display for FrameError {
     }
 }
 
-/// The window's GPU surface: adapter, device, queue and swapchain in one
-/// place, with a single `render` that clears the board.
+/// The window's GPU surface: adapter, device, queue, swapchain and the canvas
+/// pipelines in one place, with a single `render` that draws a whole frame.
 pub struct GpuSurface {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    canvas: Canvas,
+}
+
+/// Everything one frame needs, gathered by the caller and consumed by
+/// [`GpuSurface::render`].
+#[derive(Debug, Clone, Copy)]
+pub struct FrameParams<'a> {
+    /// The view transform to draw with.
+    pub camera: &'a Camera,
+    /// Viewport size in logical pixels.
+    pub viewport: DVec2,
+    /// Device pixels per logical pixel.
+    pub physical_scale: f64,
+    /// The tracked board bounding box, `None` for an empty board.
+    pub scene_rect: Option<Rect>,
+    /// Item quads in z-order (last drawn on top).
+    pub items: &'a [QuadInstance],
+    /// The CPU-raster HUD readout, if any.
+    pub hud: HudUpload<'a>,
+}
+
+impl FrameParams<'_> {
+    /// The HUD texture size the globals need, `(0, 0)` when there is no HUD.
+    pub fn hud_size(&self) -> (f32, f32) {
+        match self.hud {
+            HudUpload::None => (0.0, 0.0),
+            HudUpload::Layer { width, height, .. } => (width as f32, height as f32),
+        }
+    }
 }
 
 impl GpuSurface {
@@ -153,11 +185,14 @@ impl GpuSurface {
             "surface configured"
         );
 
+        let canvas = Canvas::new(&device, &queue, config.format);
+
         Some(Self {
             surface,
             device,
             queue,
             config,
+            canvas,
         })
     }
 
@@ -172,17 +207,21 @@ impl GpuSurface {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Renders one frame: acquire, clear to the board color, present.
+    /// Renders one frame: acquire, draw the canvas, present.
     ///
-    /// Occlusion and timeout are normal (a minimized window owes no frame) and
-    /// return `Ok`. Outdated reconfigures and requests another redraw through
-    /// the error; lost/validated surfaces are fatal and logged by the caller.
-    pub fn render(&mut self) -> Result<(), FrameError> {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+    /// The frame span and the present span carry the timings the acceptance
+    /// checks read (`RIZREF_LOG=debug` shows them per frame). Occlusion and
+    /// timeout are normal (a minimized window owes no frame) and return `Ok`.
+    /// Outdated reconfigures and requests another redraw through the error;
+    /// lost/validated surfaces are fatal and logged by the caller.
+    pub fn render(&mut self, frame: &FrameParams) -> Result<(), FrameError> {
+        let _frame_span = tracing::debug_span!("frame").entered();
+        let acquired = self.surface.get_current_texture();
+        let frame_texture = match acquired {
+            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
                 tracing::debug!("suboptimal swapchain; presenting anyway");
-                frame
+                texture
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
@@ -199,19 +238,29 @@ impl GpuSurface {
             }
         };
 
+        self.canvas.set_globals(
+            &self.queue,
+            frame.camera,
+            frame.viewport,
+            frame.physical_scale,
+            frame.scene_rect,
+            frame.hud_size(),
+        );
+        self.canvas
+            .set_items(&self.device, &self.queue, frame.items);
+        self.canvas.set_hud(&self.device, &self.queue, frame.hud);
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rizref-clear"),
+                label: Some("rizref-frame"),
             });
-        let view = frame
+        let view = frame_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        // The borrow ends before `finish` moves the encoder; the pass borrows
-        // the view and the clear color only.
         {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("rizref-clear-pass"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rizref-canvas-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -223,10 +272,16 @@ impl GpuSurface {
                 })],
                 ..Default::default()
             });
+            self.canvas.draw_background(&mut pass);
+            self.canvas.draw_items(&mut pass);
+            self.canvas.draw_hud(&mut pass);
         }
 
-        self.queue.submit(Some(encoder.finish()));
-        self.queue.present(frame);
+        {
+            let _present_span = tracing::debug_span!("present").entered();
+            self.queue.submit(Some(encoder.finish()));
+            self.queue.present(frame_texture);
+        }
         Ok(())
     }
 }
