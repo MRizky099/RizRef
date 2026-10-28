@@ -14,6 +14,7 @@ use winit::window::Window;
 
 use crate::app::CANVAS_BACKGROUND;
 use crate::canvas::{Canvas, HudUpload, ItemQuad};
+use crate::overlay::OverlayVertex;
 use crate::textures::{MAX_TEXTURE_SIDE, TextureCache};
 
 /// Backends this build tries, in preference order.
@@ -108,6 +109,8 @@ pub struct FrameParams<'a> {
     pub scene_rect: Option<Rect>,
     /// Item quads in z-order (last drawn on top), each naming its texture.
     pub items: &'a [ItemQuad],
+    /// Screen-space overlay triangles (outlines, handles, guides, marquee).
+    pub overlay: &'a [OverlayVertex],
     /// The CPU-raster HUD readout, if any.
     pub hud: HudUpload<'a>,
 }
@@ -306,6 +309,8 @@ impl GpuSurface {
             .collect();
         self.canvas
             .set_items(&self.device, &self.queue, frame.items);
+        self.canvas
+            .set_overlay(&self.device, &self.queue, frame.overlay);
         self.canvas.set_hud(&self.device, &self.queue, frame.hud);
 
         let mut encoder = self
@@ -332,6 +337,7 @@ impl GpuSurface {
             });
             self.canvas.draw_background(&mut pass);
             self.canvas.draw_items(&mut pass, &bind_groups);
+            self.canvas.draw_overlay(&mut pass);
             self.canvas.draw_hud(&mut pass);
         }
 

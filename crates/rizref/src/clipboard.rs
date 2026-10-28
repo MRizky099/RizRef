@@ -59,6 +59,15 @@ pub fn read() -> Result<ClipboardContent, String> {
     })
 }
 
+/// Reads plain text from the clipboard, for pasting into a note.
+pub fn read_text() -> Result<String, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("cannot open the clipboard: {error}"))?;
+    clipboard
+        .get_text()
+        .map_err(|error| format!("the clipboard holds no text: {error}"))
+}
+
 /// Encodes raw clipboard RGBA as PNG.
 fn png_from_rgba(width: u32, height: u32, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     let image = ImageBuffer::from_rgba(width, height, bytes)

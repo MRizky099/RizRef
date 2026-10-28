@@ -188,6 +188,35 @@ fn fs_items(in: ItemOut) -> @location(0) vec4f {
 }
 
 // ---------------------------------------------------------------------------
+// Overlay: screen-space coloured triangles for outlines, handles, guides and
+// the marquee. Positions are already in logical viewport pixels; the CPU builds
+// them so handle sizes and line widths stay constant at every zoom.
+// ---------------------------------------------------------------------------
+
+struct OverlayIn {
+    @location(0) pos: vec2f,
+    @location(1) color: vec4f,
+}
+
+struct OverlayOut {
+    @builtin(position) clip: vec4f,
+    @location(0) color: vec4f,
+}
+
+@vertex
+fn vs_overlay(in: OverlayIn) -> OverlayOut {
+    var out: OverlayOut;
+    out.clip = screen_to_clip(in.pos);
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_overlay(in: OverlayOut) -> @location(0) vec4f {
+    return in.color;
+}
+
+// ---------------------------------------------------------------------------
 // HUD: a small screen-space quad at the bottom-left, sampling the CPU-raster
 // readout uploaded each frame. Everything here is in device pixels.
 // ---------------------------------------------------------------------------

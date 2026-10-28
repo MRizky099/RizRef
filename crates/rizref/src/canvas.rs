@@ -1,12 +1,14 @@
 //! The canvas pipelines: the GPU half of the infinite board.
 //!
-//! Three pipelines share one uniform block of per-frame globals:
+//! Four pipelines share one uniform block of per-frame globals:
 //!
 //! * **background** — one full-screen triangle whose fragment shader derives
 //!   the world position per pixel and draws the grid, the origin cross and the
 //!   dashed scene-rect border;
 //! * **items** — one instanced quad pipeline over a texture array; draw order
 //!   is the instance order, which is the scene z-order;
+//! * **overlay** — screen-space coloured triangles for selection outlines,
+//!   handles, guides and the marquee, built on the CPU in logical pixels;
 //! * **hud** — a small screen-space quad sampling the CPU-raster readout.
 //!
 //! The camera math is f64 on the CPU; the uniform narrows to f32 at draw time
@@ -16,10 +18,15 @@
 use glam::DVec2;
 use rizref_core::{AssetId, Camera, Rect};
 
+use crate::overlay::OverlayVertex;
+
 const SHADER: &str = include_str!("shaders/canvas.wgsl");
 
 /// GPU capacity of the instance buffer when it is first created.
 const INITIAL_INSTANCE_CAPACITY: usize = 256;
+
+/// GPU capacity of the overlay vertex buffer when it is first created.
+const INITIAL_OVERLAY_CAPACITY: usize = 4096;
 
 /// Side length in uniform bytes of the `Globals` block.
 const GLOBALS_SIZE: u64 = 64;
@@ -201,11 +208,15 @@ pub struct Canvas {
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     item_count: u32,
+    overlay_buffer: wgpu::Buffer,
+    overlay_capacity: usize,
+    overlay_count: u32,
     hud_texture: Option<wgpu::Texture>,
     hud_bind_group: Option<wgpu::BindGroup>,
     hud_texture_size: (u32, u32),
     background_pipeline: wgpu::RenderPipeline,
     item_pipeline: wgpu::RenderPipeline,
+    overlay_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
 }
 
@@ -356,6 +367,23 @@ impl Canvas {
             })
         };
 
+        let overlay_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: 24,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 8,
+                    shader_location: 1,
+                },
+            ],
+        };
+
         let background_pipeline = make_pipeline(
             "rizref-background-pipeline",
             "vs_background",
@@ -373,6 +401,15 @@ impl Canvas {
             &[Some(item_vertex_layout.clone())],
             wgpu::BlendState::ALPHA_BLENDING,
             wgpu::PrimitiveTopology::TriangleStrip,
+        );
+        let overlay_pipeline = make_pipeline(
+            "rizref-overlay-pipeline",
+            "vs_overlay",
+            "fs_overlay",
+            None,
+            &[Some(overlay_vertex_layout)],
+            wgpu::BlendState::ALPHA_BLENDING,
+            wgpu::PrimitiveTopology::TriangleList,
         );
         let hud_pipeline = make_pipeline(
             "rizref-hud-pipeline",
@@ -406,6 +443,13 @@ impl Canvas {
             mapped_at_creation: false,
         });
 
+        let overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rizref-overlay"),
+            size: INITIAL_OVERLAY_CAPACITY as u64 * 24,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             globals_buffer,
             globals_bind_group,
@@ -413,11 +457,15 @@ impl Canvas {
             instance_buffer,
             instance_capacity: INITIAL_INSTANCE_CAPACITY,
             item_count: 0,
+            overlay_buffer,
+            overlay_capacity: INITIAL_OVERLAY_CAPACITY,
+            overlay_count: 0,
             hud_texture: None,
             hud_bind_group: None,
             hud_texture_size: (0, 0),
             background_pipeline,
             item_pipeline,
+            overlay_pipeline,
             hud_pipeline,
         }
     }
@@ -462,6 +510,31 @@ impl Canvas {
         }
         queue.write_buffer(&self.instance_buffer, 0, &bytes);
         self.item_count = items.len() as u32;
+    }
+
+    /// Uploads the frame's overlay triangles, growing the buffer if needed.
+    pub fn set_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[OverlayVertex],
+    ) {
+        let bytes: Vec<u8> = vertices.iter().flat_map(OverlayVertex::bytes).collect();
+        if bytes.is_empty() {
+            self.overlay_count = 0;
+            return;
+        }
+        if bytes.len() > self.overlay_capacity * 24 {
+            self.overlay_capacity = self.overlay_capacity.max(vertices.len()) * 2;
+            self.overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rizref-overlay"),
+                size: self.overlay_capacity as u64 * 24,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&self.overlay_buffer, 0, &bytes);
+        self.overlay_count = vertices.len() as u32;
     }
 
     /// Uploads the CPU-raster HUD readout as straight-alpha RGBA bytes, or
@@ -589,6 +662,17 @@ impl Canvas {
         }
     }
 
+    /// Draws the screen-space overlay: outlines, handles, guides, marquee.
+    pub fn draw_overlay<'r>(&self, pass: &mut wgpu::RenderPass<'r>) {
+        if self.overlay_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.overlay_pipeline);
+        pass.set_bind_group(0, &self.globals_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.overlay_buffer.slice(..));
+        pass.draw(0..self.overlay_count, 0..1);
+    }
+
     /// Draws the HUD readout quad, when one was uploaded.
     pub fn draw_hud<'r>(&self, pass: &mut wgpu::RenderPass<'r>) {
         let Some(bind_group) = self.hud_bind_group.as_ref() else {
@@ -676,6 +760,15 @@ mod tests {
     }
 
     #[test]
+    fn an_overlay_vertex_packs_to_its_24_bytes() {
+        let vertex = crate::overlay::OverlayVertex {
+            pos: [10.0, 20.0],
+            color: [1.0, 0.5, 0.25, 0.75],
+        };
+        assert_eq!(vertex.bytes().len(), 24);
+    }
+
+    #[test]
     fn the_world_rect_is_the_quad_and_grows_with_rotation() {
         fn assert_corner(actual: glam::Vec2, expected: glam::Vec2) {
             assert!(
@@ -758,6 +851,24 @@ mod tests {
         }];
         canvas.set_items(&device, &queue, &items);
         canvas.set_hud(&device, &queue, super::HudUpload::None);
+        canvas.set_overlay(
+            &device,
+            &queue,
+            &[
+                crate::overlay::OverlayVertex {
+                    pos: [10.0, 10.0],
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+                crate::overlay::OverlayVertex {
+                    pos: [40.0, 10.0],
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+                crate::overlay::OverlayVertex {
+                    pos: [10.0, 40.0],
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+            ],
+        );
 
         let bind_groups = [textures.bind_group(asset)];
         let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -794,6 +905,7 @@ mod tests {
             });
             canvas.draw_background(&mut pass);
             canvas.draw_items(&mut pass, &bind_groups);
+            canvas.draw_overlay(&mut pass);
             canvas.draw_hud(&mut pass);
         }
         queue.submit(Some(encoder.finish()));

@@ -260,6 +260,8 @@ impl ViewState {
                 self.camera.set_rotation(0.0);
                 self.refresh_cursor_world();
             }
+            // Item commands are dispatched by the board, never routed here.
+            _ => {}
         }
     }
 

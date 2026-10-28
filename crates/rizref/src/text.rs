@@ -9,7 +9,7 @@
 //! the tiny-skia CPU layer; the real text pipeline (layout, notes, menus)
 //! arrives with the UI phases.
 
-use cosmic_text::{Attrs, Buffer, Color, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Buffer, Color, Editor, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use tiny_skia::Pixmap;
 
 /// Owns the font database, the shaping cache and the glyph raster cache.
@@ -88,6 +88,131 @@ impl TextEngine {
                 );
             },
         );
+    }
+
+    /// Draws wrapped text into a rectangle starting at `x`, `y`.
+    ///
+    /// Used for note text when the note is not being edited: a word-wrapped
+    /// buffer shaped to the note's text width, clipped to the pixmap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_block(
+        &mut self,
+        pixmap: &mut Pixmap,
+        text: &str,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        font_size: f32,
+        color: [u8; 4],
+    ) {
+        let metrics = Metrics::new(font_size, (font_size * 1.4).ceil());
+        let mut buffer = Buffer::new(&mut self.fonts, metrics);
+        buffer.set_wrap(Wrap::Word);
+        buffer.set_size(Some(width.max(1.0)), Some(height.max(1.0)));
+        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+        self.draw_buffer(pixmap, &mut buffer, x, y, color);
+    }
+
+    /// Draws a shaped buffer at `x`, `y`, blending into the pixmap.
+    fn draw_buffer(
+        &mut self,
+        pixmap: &mut Pixmap,
+        buffer: &mut Buffer,
+        x: f32,
+        y: f32,
+        color: [u8; 4],
+    ) {
+        let tint = Color::rgba(color[0], color[1], color[2], color[3]);
+        let offset_x = x as i32;
+        let offset_y = y as i32;
+        let width = pixmap.width() as i32;
+        let height = pixmap.height() as i32;
+        buffer.draw(
+            &mut self.fonts,
+            &mut self.swash,
+            tint,
+            |gx, gy, _, _, pixel| {
+                let px = offset_x + gx;
+                let py = offset_y + gy;
+                if px < 0 || py < 0 || px >= width || py >= height {
+                    return;
+                }
+                blend_premultiplied(
+                    pixmap.data_mut(),
+                    (py as usize * width as usize + px as usize) * 4,
+                    pixel.r(),
+                    pixel.g(),
+                    pixel.b(),
+                    pixel.a(),
+                );
+            },
+        );
+    }
+
+    /// Draws a note edit session, including its cursor and selection.
+    ///
+    /// The editor owns the buffer and its caret; this method supplies the font
+    /// system and glyph cache and blends the result into the note's pixmap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_editor(
+        &mut self,
+        pixmap: &mut Pixmap,
+        editor: &mut Editor<'static>,
+        x: f32,
+        y: f32,
+        text_color: [u8; 4],
+        cursor_color: [u8; 4],
+        selection_color: [u8; 4],
+        selected_text_color: [u8; 4],
+    ) {
+        let offset_x = x as i32;
+        let offset_y = y as i32;
+        let width = pixmap.width() as i32;
+        let height = pixmap.height() as i32;
+        editor.draw(
+            &mut self.fonts,
+            &mut self.swash,
+            Color::rgba(text_color[0], text_color[1], text_color[2], text_color[3]),
+            Color::rgba(
+                cursor_color[0],
+                cursor_color[1],
+                cursor_color[2],
+                cursor_color[3],
+            ),
+            Color::rgba(
+                selection_color[0],
+                selection_color[1],
+                selection_color[2],
+                selection_color[3],
+            ),
+            Color::rgba(
+                selected_text_color[0],
+                selected_text_color[1],
+                selected_text_color[2],
+                selected_text_color[3],
+            ),
+            |gx, gy, _, _, pixel| {
+                let px = offset_x + gx;
+                let py = offset_y + gy;
+                if px < 0 || py < 0 || px >= width || py >= height {
+                    return;
+                }
+                blend_premultiplied(
+                    pixmap.data_mut(),
+                    (py as usize * width as usize + px as usize) * 4,
+                    pixel.r(),
+                    pixel.g(),
+                    pixel.b(),
+                    pixel.a(),
+                );
+            },
+        );
+    }
+
+    /// The font system, for callers that drive a cosmic-text [`Editor`].
+    pub fn font_system_mut(&mut self) -> &mut FontSystem {
+        &mut self.fonts
     }
 }
 

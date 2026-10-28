@@ -17,10 +17,12 @@ gh issue list --repo MRizky099/RizRef --state open
 
 Phase 00 (workspace, dependency policy, lint/CI policy, budgets), phase 01 (window,
 Vulkan→DX12 surface, on-demand pacing, single instance, logs), phase 02 (f64 camera,
-pan/zoom/rotate, grid, quad + HUD pipelines) and phase 03 (worker-thread image import
+pan/zoom/rotate, grid, quad + HUD pipelines), phase 03 (worker-thread image import
 with EXIF-aware decoding, BLAKE3 asset dedup, previews, an OLE drop target that also
 accepts virtual files such as Outlook attachments, clipboard paste, Ctrl+O and per-item
-sRGB textures) have landed. The workspace builds, tests and lints clean.
+sRGB textures) and phase 04 (select/marquee, move/scale/rotate/flip, snapping with smart
+guides, arrange/align/distribute, groups, notes and a coalescing undo history) have
+landed. The workspace builds, tests and lints clean.
 
 ## Design principles
 

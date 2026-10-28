@@ -64,6 +64,41 @@ impl Selection {
         self.items.insert(item);
     }
 
+    /// Replaces the selection with `items`.
+    pub fn set_all(&mut self, items: impl IntoIterator<Item = ItemId>) {
+        self.items = items.into_iter().collect();
+    }
+
+    /// Adds every item in `items`.
+    pub fn insert_all(&mut self, items: impl IntoIterator<Item = ItemId>) {
+        self.items.extend(items);
+    }
+
+    /// Shift-click semantics on a whole group: selects every member when any
+    /// member is not selected, otherwise deselects them all.
+    ///
+    /// Returns whether the members are selected afterwards.
+    pub fn toggle_all(&mut self, items: impl IntoIterator<Item = ItemId>) -> bool {
+        let members: BTreeSet<ItemId> = items.into_iter().collect();
+        if members.iter().all(|item| self.items.contains(item)) {
+            for item in &members {
+                self.items.remove(item);
+            }
+            false
+        } else {
+            self.items.extend(members);
+            true
+        }
+    }
+
+    /// Drops every selected item for which `keep` returns `false`.
+    ///
+    /// Used after deletes, undo and redo: the selection must never hold ids the
+    /// board no longer has.
+    pub fn retain(&mut self, mut keep: impl FnMut(ItemId) -> bool) {
+        self.items.retain(|item| keep(*item));
+    }
+
     /// Empties the selection.
     pub fn clear(&mut self) {
         self.items.clear();
@@ -155,5 +190,30 @@ mod tests {
 
         selection.clear();
         assert!(selection.is_empty());
+    }
+
+    #[test]
+    fn toggle_all_works_on_a_whole_group() {
+        let mut selection: Selection = [id(1)].into_iter().collect();
+
+        assert!(selection.toggle_all([id(2), id(3)]));
+        assert_eq!(selection.len(), 3);
+
+        assert!(
+            !selection.toggle_all([id(2), id(3)]),
+            "a fully selected group deselects as a unit"
+        );
+        assert_eq!(selection.iter().collect::<Vec<_>>(), vec![id(1)]);
+    }
+
+    #[test]
+    fn set_all_replaces_and_retain_prunes() {
+        let mut selection: Selection = [id(1), id(2), id(3)].into_iter().collect();
+
+        selection.retain(|item| item != id(2));
+        assert_eq!(selection.iter().collect::<Vec<_>>(), vec![id(1), id(3)]);
+
+        selection.set_all([id(8), id(9)]);
+        assert_eq!(selection.iter().collect::<Vec<_>>(), vec![id(8), id(9)]);
     }
 }

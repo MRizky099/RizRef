@@ -10,26 +10,31 @@
 //! 5. run the event loop until the window closes.
 //!
 //! Frame pacing lives here as much as in the renderer: the loop redraws only
-//! when something changed (resize, an explicit request), never on a timer, so
-//! an idle board costs no CPU — a reference viewer sits in the background for
-//! hours while its user paints elsewhere.
+//! when something changed (resize, a gesture, an import, an animation), never
+//! on a timer, so an idle board costs no CPU — a reference viewer sits in the
+//! background for hours while its user paints elsewhere.
+//!
+//! The editing rules themselves live in [`crate::board`]. This module translates
+//! window events into board calls, owns the note editor and the note textures,
+//! and draws whatever the board reports.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glam::{DVec2, Vec2};
-use rizref_core::{Asset, AssetId, Rect, Scene, SceneId, SceneRectTracker, Selection};
+use rizref_core::{Asset, AssetId, Item, ItemBody, ItemId, Rect, Scene, SceneId, Selection};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
+use crate::board::{Board, CursorHint, Modifiers, ViewInfo};
 use crate::canvas::{HudUpload, ItemQuad, QuadInstance};
 use crate::clipboard::{self, ClipboardContent};
 use crate::dev_state;
@@ -37,6 +42,8 @@ use crate::hud::HudSurface;
 use crate::import::{ImportOutcome, ImportRequest, Importer};
 use crate::input::{self, Button as InputButton, Command, Key as InputKey, Trigger};
 use crate::memory::DecodeCache;
+use crate::note::{self, NoteSession};
+use crate::overlay::{self, OverlayState, OverlayVertex};
 use crate::placement;
 use crate::platform::{
     self, DropEvent, DropRegistration, SingleInstance, forward_args_to_primary,
@@ -44,7 +51,7 @@ use crate::platform::{
 };
 use crate::renderer::{FrameError, FrameParams, GpuSurface};
 use crate::text::TextEngine;
-use crate::view::ViewState;
+use crate::view::{FRAME_PADDING, ViewState};
 
 /// The window RizRef opens.
 ///
@@ -75,14 +82,21 @@ impl Default for WindowPlan {
 /// and a pure-black surround makes mid-tone artwork look washed out.
 pub const CANVAS_BACKGROUND: [u8; 4] = [24, 24, 28, 255];
 
-/// Readout surface width in logical pixels; the upload scales with the DPI.
-const READOUT_WIDTH: f64 = 420.0;
+/// Readout surface width in logical pixels.
+/// Readout surface width in logical pixels.
+///
+/// Narrow enough for the 600 px default window with its 14 px margin, and wide
+/// enough for the zoom readout plus a selection size.
+const READOUT_WIDTH: f64 = 560.0;
 
 /// Readout surface height in logical pixels.
 const READOUT_HEIGHT: f64 = 40.0;
 
 /// How many daily log files to keep when pruning at startup.
 const LOG_FILES_KEPT: usize = 14;
+
+/// Double-click window for zoom-to-item and note editing.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Version string used by `--version` and the summary line.
 pub fn version_line() -> String {
@@ -194,6 +208,14 @@ fn print_help() {
     println!("    --check-dialogs       open the native file dialog and print the chosen paths");
     println!();
     println!("A second launch hands its FILE arguments to the running instance and exits.");
+    println!();
+    println!("CANVAS: middle-drag or space+drag pans, the wheel zooms, alt+wheel turns the view.");
+    println!("ITEMS:  click/shift-click selects, drag moves, handles scale and rotate.");
+    println!("        ctrl+A all, ctrl+D duplicate, del delete, ctrl+Z/Y undo/redo,");
+    println!("        ctrl+G / ctrl+shift+G group and ungroup, pgup/pgdn/home/end order,");
+    println!("        3/4/5/6 arrange (grid/hierarchy/spread/stack), N adds a note,");
+    println!("        ctrl+shift+arrows align, ctrl+shift+,/. distribute,");
+    println!("        shift+H/V flip, ctrl+shift+W/H match size, ctrl+shift+R reset.");
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +355,16 @@ enum AppEvent {
     Dropped(Box<DropEvent>),
 }
 
-/// Everything the event loop owns: the window, its surface, the canvas state
+/// One note's resident texture.
+#[derive(Debug, Clone, Copy)]
+struct NoteTexture {
+    /// Content-addressed texture id.
+    id: AssetId,
+    /// World size the texture was rendered for.
+    world_size: Vec2,
+}
+
+/// Everything the event loop owns: the window, its surface, the board state
 /// and the view the user looks through.
 struct App {
     /// The OLE drop registration. Declared first so it is dropped — and the
@@ -346,9 +377,8 @@ struct App {
     renderer: Option<GpuSurface>,
     /// The camera, the active gesture and the zoom animation.
     view: ViewState,
-    /// The board: items, their z-order and the shared assets they show.
-    scene: Scene,
-    scene_rects: SceneRectTracker,
+    /// The board: items, selection, groups and the undo history.
+    board: Board,
     /// Full-resolution decoded bitmaps under the memory cap.
     decode_cache: DecodeCache,
     /// The import worker pool, `None` only if no thread could start.
@@ -356,18 +386,26 @@ struct App {
     /// Paths from the command line or a second launch, imported once the
     /// window and its camera exist.
     pending_paths: Vec<String>,
-    /// Font system and glyph caches for the HUD readout.
+    /// Font system and glyph caches for the HUD and notes.
     text: TextEngine,
     /// The CPU-raster readout surface, sized once the scale factor is known.
     hud: Option<HudSurface>,
     /// Keyboard modifiers as of the last `ModifiersChanged`.
     modifiers: ModifiersState,
-    /// Items the user has picked; an animated item that is selected freezes.
-    selection: Selection,
     /// Playback clocks for the animated assets on the board.
     playbacks: HashMap<AssetId, Playback>,
     /// When the next animation frame is due, for the event loop's timer.
     next_frame_at: Option<Instant>,
+    /// The active note edit session, if any.
+    note_session: Option<NoteSession>,
+    /// Resident note textures.
+    note_textures: HashMap<ItemId, NoteTexture>,
+    /// Notes whose texture must be re-rendered on the next frame.
+    dirty_notes: BTreeSet<ItemId>,
+    /// The last click, for double-click detection.
+    last_click: Option<(Instant, Option<ItemId>)>,
+    /// The cursor currently set on the window.
+    cursor_icon: Option<CursorIcon>,
 }
 
 /// One asset's place in its animation.
@@ -403,23 +441,26 @@ impl App {
             plan,
             window: None,
             renderer: None,
-            scene,
-            scene_rects: SceneRectTracker::new(),
+            board: Board::new(scene),
             decode_cache: DecodeCache::with_default_cap(),
             importer: Some(importer),
             pending_paths: Vec::new(),
             text: TextEngine::new(),
             hud: None,
             modifiers: ModifiersState::default(),
-            selection: Selection::new(),
             playbacks: HashMap::new(),
             next_frame_at: None,
+            note_session: None,
+            note_textures: HashMap::new(),
+            dirty_notes: BTreeSet::new(),
+            last_click: None,
+            cursor_icon: None,
         }
     }
 
     /// Whether closing needs a confirmation dialog.
     ///
-    /// Always `false` today: nothing in this phase can be lost. Phase 05
+    /// Always `false` today: the dev board is not saved anywhere yet. Phase 05
     /// replaces the body with the dirty-scene check — the call site in
     /// `CloseRequested` is the one and only place that will ask.
     fn should_confirm_close(&self) -> bool {
@@ -433,10 +474,152 @@ impl App {
         }
     }
 
+    /// The keyboard modifiers as the board sees them.
+    fn current_mods(&self) -> Modifiers {
+        Modifiers {
+            shift: self.modifiers.shift_key(),
+            ctrl: self.modifiers.control_key(),
+            alt: self.modifiers.alt_key(),
+        }
+    }
+
+    /// The current view, for board calls.
+    fn view_info(&self) -> ViewInfo<'_> {
+        ViewInfo {
+            camera: &self.view.camera,
+            viewport: self.view.viewport(),
+        }
+    }
+
+    /// Drains the board's effects into the note-texture bookkeeping and asks
+    /// for a redraw.
+    fn after_board(&mut self) {
+        let effects = self.board.take_effects();
+        if effects.is_empty() {
+            return;
+        }
+        for id in &effects.content {
+            self.dirty_notes.insert(*id);
+        }
+        if effects.structural() {
+            self.note_textures
+                .retain(|id, _| self.board.scene().contains(*id));
+        }
+        self.redraw();
+    }
+
     /// Applies a resolved command with the current scene rect and redraws.
     fn apply(&mut self, command: Command) {
-        self.view.apply_command(command, self.scene_rects.rect());
-        self.redraw();
+        use Command::{
+            AlignBottom, AlignLeft, AlignRight, AlignTop, ArrangeGrid, ArrangeHierarchy,
+            ArrangeSpread, ArrangeStack, CreateNote, DeleteSelection, Deselect,
+            DistributeHorizontal, DistributeVertical, DuplicateSelection, FitContent,
+            FlipHorizontal, FlipVertical, GroupSelection, LowerSelection, LowerToBottom,
+            MatchHeight, MatchWidth, RaiseSelection, RaiseToTop, Redo, ResetRotation,
+            ResetTransform, SelectAll, Undo, UngroupSelection, ZoomHundred,
+        };
+
+        if matches!(
+            command,
+            Command::BeginPan(_)
+                | Command::EndPan
+                | Command::ZoomNotch(_)
+                | Command::RotateNotch(_)
+                | FitContent
+                | ZoomHundred
+                | ResetRotation
+        ) {
+            self.view.apply_command(command, self.board.scene_rect());
+            self.redraw();
+            return;
+        }
+
+        // Any non-view shortcut while a note is being edited ends the edit
+        // first, so the text becomes an undo step before the command runs.
+        self.commit_note_edit();
+
+        let changed = match command {
+            Undo => {
+                if let Some(label) = self.board.undo() {
+                    tracing::debug!(%label, "undo");
+                }
+                true
+            }
+            Redo => {
+                if let Some(label) = self.board.redo() {
+                    tracing::debug!(%label, "redo");
+                }
+                true
+            }
+            SelectAll => {
+                self.board.select_all();
+                true
+            }
+            Deselect => {
+                self.board.clear_selection();
+                true
+            }
+            DuplicateSelection => {
+                let view = ViewInfo {
+                    camera: &self.view.camera,
+                    viewport: self.view.viewport(),
+                };
+                self.board.duplicate_selection(view);
+                true
+            }
+            DeleteSelection => self.board.delete_selection(),
+            Command::Nudge { dx, dy, pixels } => {
+                let view = ViewInfo {
+                    camera: &self.view.camera,
+                    viewport: self.view.viewport(),
+                };
+                self.board.nudge(dx, dy, pixels, view)
+            }
+            FlipHorizontal => self.board.flip(true),
+            FlipVertical => self.board.flip(false),
+            ResetTransform => self.board.reset_transform(),
+            MatchWidth => self.board.match_size(rizref_core::SizeAxis::Width),
+            MatchHeight => self.board.match_size(rizref_core::SizeAxis::Height),
+            GroupSelection => self.board.group_selection(),
+            UngroupSelection => self.board.ungroup_selection(),
+            RaiseSelection => self.board.raise_selection(),
+            LowerSelection => self.board.lower_selection(),
+            RaiseToTop => self.board.front_selection(),
+            LowerToBottom => self.board.back_selection(),
+            ArrangeGrid => self
+                .board
+                .arrange_selection(rizref_core::ArrangeMode::Grid { columns: None }),
+            ArrangeHierarchy => self
+                .board
+                .arrange_selection(rizref_core::ArrangeMode::Hierarchy),
+            ArrangeSpread => self
+                .board
+                .arrange_selection(rizref_core::ArrangeMode::Spread),
+            ArrangeStack => self
+                .board
+                .arrange_selection(rizref_core::ArrangeMode::Stack),
+            AlignLeft => self.board.align_selection(rizref_core::Align::Left),
+            AlignRight => self.board.align_selection(rizref_core::Align::Right),
+            AlignTop => self.board.align_selection(rizref_core::Align::Top),
+            AlignBottom => self.board.align_selection(rizref_core::Align::Bottom),
+            DistributeHorizontal => self
+                .board
+                .distribute_selection(rizref_core::Orientation::Horizontal),
+            DistributeVertical => self
+                .board
+                .distribute_selection(rizref_core::Orientation::Vertical),
+            CreateNote => {
+                let id = self.board.create_note(self.drop_world());
+                self.begin_note_edit(id);
+                true
+            }
+            _ => false,
+        };
+
+        if changed {
+            self.after_board();
+            self.redraw();
+        }
     }
 
     /// Scales a wheel command's notch count by the event delta and applies it.
@@ -454,7 +637,7 @@ impl App {
         self.apply(command);
     }
 
-    /// The HUD readout line: zoom percentage, rotation, cursor world position.
+    /// The HUD readout line: zoom, rotation, cursor, selection size.
     fn readout_text(&self) -> String {
         let zoom = self.view.camera.zoom * 100.0;
         let zoom = if (zoom - zoom.round()).abs() < 0.05 {
@@ -463,18 +646,35 @@ impl App {
             format!("{zoom:.1}")
         };
         let rotation = self.view.camera.rotation.to_degrees();
-        let animation = self
-            .selected_animation_note()
-            .map(|note| format!(" · {note}"))
-            .unwrap_or_default();
+        let mut notes = Vec::new();
+        if let Some(note) = self.selected_animation_note() {
+            notes.push(note);
+        }
+        let selection = self.board.selection();
+        if !selection.is_empty() {
+            match self.board.selection_bounds() {
+                Some(bounds) => notes.push(format!(
+                    "{} selected · {:.0} × {:.0}",
+                    selection.len(),
+                    bounds.width(),
+                    bounds.height()
+                )),
+                None => notes.push(format!("{} selected", selection.len())),
+            }
+        }
+        let extra = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", notes.join(" · "))
+        };
         if self.view.has_cursor() {
             let world = self.view.cursor_world();
             format!(
-                "{zoom}% · {rotation:.0}° · ({:.1}, {:.1}){animation}",
+                "{zoom}% · {rotation:.0}° · ({:.1}, {:.1}){extra}",
                 world.x, world.y
             )
         } else {
-            format!("{zoom}% · {rotation:.0}°{animation}")
+            format!("{zoom}% · {rotation:.0}°{extra}")
         }
     }
 
@@ -644,7 +844,7 @@ impl App {
             asset = asset.with_animation(animation);
         }
         let encoded_len = asset.encoded().len();
-        let (asset_id, was_new) = self.scene.insert_asset(asset);
+        let (asset_id, was_new) = self.board.scene_mut().insert_asset(asset);
         if was_new {
             tracing::info!(
                 asset = %asset_id,
@@ -660,10 +860,11 @@ impl App {
         }
 
         let occupied: Vec<Rect> = self
-            .scene
+            .board
+            .scene()
             .items()
             .iter()
-            .map(rizref_core::ImageItem::world_rect)
+            .map(Item::world_rect)
             .collect();
         let center = placement::find_spot(
             outcome.drop_world,
@@ -671,16 +872,15 @@ impl App {
             &occupied,
             placement::ITEM_GAP,
         );
-        let Some(item_id) = self
-            .scene
-            .insert_image(asset_id, center, Vec2::new(width, height))
+        let Some(item_id) =
+            self.board
+                .scene_mut()
+                .insert_image(asset_id, center, Vec2::new(width, height))
         else {
             tracing::error!(asset = %asset_id, "asset vanished between intern and insert");
             return;
         };
-        if let Some(item) = self.scene.item(item_id) {
-            self.scene_rects.merge(item_id, item.world_rect());
-        }
+        self.board.refresh_rects();
 
         let pixels = Arc::new(imported.image);
         let full_bytes = (pixels.width() as u64) * (pixels.height() as u64) * 4;
@@ -716,21 +916,87 @@ impl App {
         self.redraw();
     }
 
-    /// Builds this frame's drawable items in scene z-order.
-    fn build_items(&self) -> Vec<ItemQuad> {
-        self.scene
+    /// Renders any note whose content or size changed, and uploads it.
+    fn ensure_note_textures(&mut self) {
+        if self.renderer.is_none() {
+            return;
+        }
+        let active = self.note_session.as_ref().map(NoteSession::item);
+        let gesture = self.board.is_gesture_active();
+        let notes: Vec<(ItemId, String, Vec2)> = self
+            .board
+            .scene()
             .items()
             .iter()
-            .map(|item| {
+            .filter_map(|item| {
+                item.text()
+                    .map(|text| (item.id(), text.to_owned(), item.size()))
+            })
+            .collect();
+
+        for (id, text, size) in notes {
+            let wanted = note::texture_id(&text, size);
+            let current = self.note_textures.get(&id).copied();
+            let resident = self
+                .renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.has_texture(wanted));
+            let stale = current.is_none_or(|entry| entry.id != wanted || entry.world_size != size)
+                || self.dirty_notes.contains(&id)
+                || !resident;
+            if !stale {
+                continue;
+            }
+            // During a drag a note keeps its existing texture stretched; it is
+            // re-rendered once at the final size instead of every mouse move.
+            if gesture && active != Some(id) && current.is_some() {
+                continue;
+            }
+
+            let session = self
+                .note_session
+                .as_mut()
+                .filter(|session| session.item() == id);
+            let Some(image) = note::render(&mut self.text, &text, size, session) else {
+                continue;
+            };
+            self.dirty_notes.remove(&id);
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.upload_texture(wanted, &image, false);
+            }
+            self.note_textures.insert(
+                id,
+                NoteTexture {
+                    id: wanted,
+                    world_size: size,
+                },
+            );
+        }
+    }
+
+    /// Builds this frame's drawable items in scene z-order.
+    fn build_items(&self) -> Vec<ItemQuad> {
+        self.board
+            .scene()
+            .items()
+            .iter()
+            .filter_map(|item| {
+                let asset = match item.body() {
+                    ItemBody::Image { asset } => *asset,
+                    ItemBody::Note { .. } => self.note_textures.get(&item.id())?.id,
+                };
                 let center = item.center();
                 let size = item.size();
                 let mut instance =
                     QuadInstance::new([center.x, center.y], [size.x, size.y], item.rotation());
+                instance.uv = match (item.flip_x(), item.flip_y()) {
+                    (false, false) => [0.0, 0.0, 1.0, 1.0],
+                    (true, false) => [1.0, 0.0, 0.0, 1.0],
+                    (false, true) => [0.0, 1.0, 1.0, 0.0],
+                    (true, true) => [1.0, 1.0, 0.0, 0.0],
+                };
                 instance.tint = [1.0, 1.0, 1.0, item.opacity()];
-                ItemQuad {
-                    instance,
-                    asset: item.asset(),
-                }
+                Some(ItemQuad { instance, asset })
             })
             .collect()
     }
@@ -744,7 +1010,7 @@ impl App {
         for item in items {
             renderer.touch_texture(item.asset);
             if !renderer.has_texture(item.asset) {
-                if let Some(asset) = self.scene.asset(item.asset) {
+                if let Some(asset) = self.board.scene().asset(item.asset) {
                     renderer.upload_texture(item.asset, asset.preview().image(), true);
                 }
             } else if renderer.texture_is_preview(item.asset)
@@ -755,34 +1021,18 @@ impl App {
         }
     }
 
-    /// Selects the topmost item under the cursor, or clears the selection.
-    ///
-    /// This is the minimum selection phase 04 builds on, and it is what makes
-    /// "freeze the animation" meaningful: whatever is selected stops playing so
-    /// its current frame can be studied.
-    fn select_at_cursor(&mut self) {
-        let Some(cursor) = self.view.cursor_position() else {
-            return;
+    /// Builds the frame's overlay triangles.
+    fn build_overlay(&self) -> Vec<OverlayVertex> {
+        let state = OverlayState {
+            camera: &self.view.camera,
+            viewport: self.view.viewport(),
+            scene: self.board.scene(),
+            selection: self.board.selection(),
+            hover: self.board.hover(),
+            marquee: self.board.marquee(),
+            guides: self.board.guides(),
         };
-        let world = self
-            .view
-            .camera
-            .screen_to_world(cursor, self.view.viewport())
-            .as_vec2();
-        // Topmost first: the last item in z-order is drawn on top.
-        let hit = self
-            .scene
-            .items()
-            .iter()
-            .rev()
-            .find(|item| item.hit_test(world))
-            .map(rizref_core::ImageItem::id);
-
-        match hit {
-            Some(id) => self.selection.set_single(id),
-            None => self.selection.clear(),
-        }
-        self.redraw();
+        overlay::build(&state)
     }
 
     /// Advances every playing animation to `now`, returning when the next frame
@@ -794,8 +1044,8 @@ impl App {
     fn advance_animations(&mut self, now: Instant) -> Option<Instant> {
         let visible = self.view.camera.visible_world_rect(self.view.viewport());
         let (uploads, next) = tick_animations(
-            &self.scene,
-            &self.selection,
+            self.board.scene(),
+            self.board.selection(),
             &mut self.playbacks,
             visible,
             now,
@@ -805,7 +1055,8 @@ impl App {
             && let Some(renderer) = self.renderer.as_mut()
         {
             for (asset, frame) in uploads {
-                if let Some(animation) = self.scene.asset(asset).and_then(Asset::animation) {
+                if let Some(animation) = self.board.scene().asset(asset).and_then(Asset::animation)
+                {
                     renderer.upload_texture(asset, animation.frame(frame).image(), false);
                 }
             }
@@ -817,15 +1068,263 @@ impl App {
 
     /// The HUD note for a frozen animation, when one is selected.
     fn selected_animation_note(&self) -> Option<String> {
-        let id = self.selection.iter().next()?;
-        let item = self.scene.item(id)?;
-        let asset = self.scene.asset(item.asset())?;
+        let id = self.board.selection().iter().next()?;
+        let item = self.board.scene().item(id)?;
+        let asset = self.board.scene().asset(item.asset()?)?;
         let animation = asset.animation()?;
         let frame = self
             .playbacks
-            .get(&item.asset())
+            .get(&item.asset()?)
             .map_or(0, |playback| playback.frame);
         Some(format!("GIF frozen {}/{}", frame + 1, animation.len()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Notes
+    // -----------------------------------------------------------------------
+
+    /// Starts editing `id` and selects it.
+    fn begin_note_edit(&mut self, id: ItemId) {
+        let Some(item) = self.board.scene().item(id) else {
+            return;
+        };
+        self.note_session = NoteSession::begin(&mut self.text, item);
+        if self.note_session.is_some() {
+            // The space bar types a space while editing; make sure a pan
+            // armed before the double-click does not stay held.
+            self.view.set_space_held(false);
+            self.board.select_only(id);
+            self.dirty_notes.insert(id);
+            self.redraw();
+        }
+    }
+
+    /// Ends the edit session, committing the text as one undo step.
+    fn commit_note_edit(&mut self) {
+        let Some(session) = self.note_session.take() else {
+            return;
+        };
+        let id = session.item();
+        let original = session.original().to_owned();
+        let text = session.text();
+        self.board.commit_note_text(id, &original, &text);
+        self.dirty_notes.insert(id);
+        self.after_board();
+    }
+
+    /// Copies the editor's text into the scene so the live preview updates.
+    fn sync_note_text(&mut self) {
+        let Some(session) = self.note_session.as_ref() else {
+            return;
+        };
+        let id = session.item();
+        let text = session.text();
+        self.board.set_note_text_live(id, &text);
+        self.dirty_notes.insert(id);
+        self.after_board();
+    }
+
+    /// Applies one editor action and redraws.
+    fn note_action(&mut self, action: cosmic_text::Action) {
+        let Some(session) = self.note_session.as_mut() else {
+            return;
+        };
+        session.action(&mut self.text, action);
+        self.sync_note_text();
+    }
+
+    /// Inserts text at the caret.
+    fn note_insert(&mut self, text: &str) {
+        let Some(session) = self.note_session.as_mut() else {
+            return;
+        };
+        session.insert_text(&mut self.text, text);
+        self.sync_note_text();
+    }
+
+    /// Places the caret at a world point inside the edited note.
+    fn note_click(&mut self, world: Vec2) {
+        let Some(session) = self.note_session.as_mut() else {
+            return;
+        };
+        let Some(item) = self.board.scene().item(session.item()) else {
+            return;
+        };
+        let local = item.transform().to_local(world);
+        // A mirrored note shows mirrored text, so the caret's horizontal and
+        // vertical position has to be mirrored back into the texture.
+        let local = Vec2::new(
+            if item.flip_x() { -local.x } else { local.x },
+            if item.flip_y() { -local.y } else { local.y },
+        );
+        let pixels_per_world = session.pixels_per_world();
+        let x = (local.x + item.size().x * 0.5 - note::NOTE_PADDING) * pixels_per_world;
+        let y = (local.y + item.size().y * 0.5 - note::NOTE_PADDING) * pixels_per_world;
+        session.click(&mut self.text, x, y);
+        self.sync_note_text();
+    }
+
+    /// Routes one key event to the note editor. Returns whether it consumed it.
+    fn handle_note_key(&mut self, event: &KeyEvent, pressed: bool) -> bool {
+        use cosmic_text::{Action, Motion};
+        if !pressed {
+            return false;
+        }
+        let ctrl = self.modifiers.control_key();
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.commit_note_edit();
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.note_action(Action::Backspace);
+                true
+            }
+            Key::Named(NamedKey::Delete) => {
+                self.note_action(Action::Delete);
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.note_action(Action::Enter);
+                true
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.note_action(Action::Motion(Motion::Left));
+                true
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                self.note_action(Action::Motion(Motion::Right));
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.note_action(Action::Motion(Motion::Up));
+                true
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.note_action(Action::Motion(Motion::Down));
+                true
+            }
+            Key::Named(NamedKey::Home) => {
+                self.note_action(Action::Motion(Motion::Home));
+                true
+            }
+            Key::Named(NamedKey::End) => {
+                self.note_action(Action::Motion(Motion::End));
+                true
+            }
+            Key::Character(text) if ctrl => {
+                match text.to_ascii_lowercase().as_str() {
+                    "a" => {
+                        if let Some(session) = self.note_session.as_mut() {
+                            session.select_all();
+                            let id = session.item();
+                            self.dirty_notes.insert(id);
+                            self.redraw();
+                        }
+                    }
+                    "v" => {
+                        if let Ok(text) = clipboard::read_text() {
+                            self.note_insert(&text);
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Key::Character(_) => {
+                if let Some(text) = &event.text {
+                    self.note_insert(text);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cursor
+    // -----------------------------------------------------------------------
+
+    /// Updates the window cursor icon from the board's hint.
+    fn update_cursor_icon(&mut self, window: &Window, screen: DVec2) {
+        let hint = if self.note_session.is_some() {
+            CursorHint::Text
+        } else {
+            self.board
+                .cursor(screen, self.view_info(), self.current_mods())
+        };
+        let icon = match hint {
+            CursorHint::Default => CursorIcon::Default,
+            CursorHint::Move => CursorIcon::Move,
+            CursorHint::Grab => CursorIcon::Grab,
+            CursorHint::Grabbing => CursorIcon::Grabbing,
+            CursorHint::ResizeEw => CursorIcon::EwResize,
+            CursorHint::ResizeNs => CursorIcon::NsResize,
+            CursorHint::ResizeNwSe => CursorIcon::NwseResize,
+            CursorHint::ResizeNeSw => CursorIcon::NeswResize,
+            CursorHint::Rotate => CursorIcon::Crosshair,
+            CursorHint::Text => CursorIcon::Text,
+            CursorHint::Crosshair => CursorIcon::Crosshair,
+        };
+        if self.cursor_icon != Some(icon) {
+            window.set_cursor(icon);
+            self.cursor_icon = Some(icon);
+        }
+    }
+
+    /// Handles a plain left press: note editing, double-click, then selection.
+    fn left_press(&mut self, window: &Window) {
+        let Some(screen) = self.view.cursor_position() else {
+            return;
+        };
+        let world = self
+            .view
+            .camera
+            .screen_to_world(screen, self.view.viewport())
+            .as_vec2();
+        let item = self.board.item_at(world);
+
+        let now = Instant::now();
+        let double_click = self.last_click.is_some_and(|(then, last)| {
+            last == item && item.is_some() && now.duration_since(then) < DOUBLE_CLICK
+        });
+        self.last_click = Some((now, item));
+
+        if let Some(session_item) = self.note_session.as_ref().map(NoteSession::item) {
+            if item == Some(session_item) {
+                self.note_click(world);
+                return;
+            }
+            self.commit_note_edit();
+        }
+
+        if double_click && let Some(id) = item {
+            if self.board.scene().item(id).is_some_and(Item::is_note) {
+                self.begin_note_edit(id);
+                self.note_click(world);
+                return;
+            }
+            if let Some(item) = self.board.scene().item(id) {
+                let rect = item.world_rect();
+                self.view
+                    .camera
+                    .frame(rect, self.view.viewport(), FRAME_PADDING);
+                self.board.select_only(id);
+                self.redraw();
+                return;
+            }
+        }
+
+        let mods = self.current_mods();
+        let view = ViewInfo {
+            camera: &self.view.camera,
+            viewport: self.view.viewport(),
+        };
+        if self.board.pointer_down(screen, view, mods) {
+            self.after_board();
+        }
+        self.update_cursor_icon(window, screen);
+        self.redraw();
     }
 }
 
@@ -922,12 +1421,26 @@ impl ApplicationHandler<AppEvent> for App {
                 let logical = DVec2::new(position.x / scale, position.y / scale);
                 let previous = self.view.cursor_position();
                 self.view.set_cursor(logical);
-                if self.view.pan_active()
-                    && let Some(previous) = previous
-                {
-                    self.view.drag_pan(logical - previous);
+                if self.view.pan_active() {
+                    if let Some(previous) = previous {
+                        self.view.drag_pan(logical - previous);
+                    }
+                } else {
+                    let view = ViewInfo {
+                        camera: &self.view.camera,
+                        viewport: self.view.viewport(),
+                    };
+                    if self.board.pointer_move(logical, view, self.current_mods()) {
+                        self.after_board();
+                    }
                 }
+                self.update_cursor_icon(&window, logical);
                 self.redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if self.board.pointer_leave() {
+                    self.redraw();
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
@@ -942,11 +1455,27 @@ impl ApplicationHandler<AppEvent> for App {
                     space_held: self.view.space_held(),
                 }) {
                     self.apply(command);
-                } else if button == InputButton::Left && pressed && !self.view.space_held() {
-                    // Plain left click: pick the item under the cursor. Phase 04
-                    // replaces this with drag-select, but the selection it sets
-                    // already means something (it freezes an animation).
-                    self.select_at_cursor();
+                    return;
+                }
+                if button == InputButton::Left {
+                    if pressed {
+                        if !self.view.space_held() {
+                            self.left_press(&window);
+                        }
+                    } else if let Some(screen) = self.view.cursor_position() {
+                        let view = ViewInfo {
+                            camera: &self.view.camera,
+                            viewport: self.view.viewport(),
+                        };
+                        if self.board.pointer_up(screen, view, self.current_mods()) {
+                            // A drag/scale/rotate is not the first half of a
+                            // double-click on the item it ended over.
+                            self.last_click = None;
+                            self.after_board();
+                        }
+                        self.update_cursor_icon(&window, screen);
+                        self.redraw();
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => match delta {
@@ -968,43 +1497,42 @@ impl ApplicationHandler<AppEvent> for App {
             },
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
-                match &event.logical_key {
-                    Key::Named(NamedKey::Space) => self.view.set_space_held(pressed),
-                    key => {
-                        if !pressed {
+                if self.note_session.is_some() {
+                    if self.handle_note_key(&event, pressed) {
+                        self.redraw();
+                    }
+                    return;
+                }
+                if matches!(&event.logical_key, Key::Named(NamedKey::Space)) {
+                    self.view.set_space_held(pressed);
+                    return;
+                }
+                if !pressed {
+                    return;
+                }
+                if self.modifiers.control_key()
+                    && let Key::Character(text) = &event.logical_key
+                {
+                    match text.to_ascii_lowercase().as_str() {
+                        "v" => {
+                            self.paste();
                             return;
                         }
-                        if self.modifiers.control_key()
-                            && let Key::Character(text) = key
-                        {
-                            match text.as_str().to_ascii_lowercase().as_str() {
-                                "v" => {
-                                    self.paste();
-                                    return;
-                                }
-                                "o" => {
-                                    self.open_images();
-                                    return;
-                                }
-                                _ => {}
-                            }
+                        "o" => {
+                            self.open_images();
+                            return;
                         }
-                        let bound = match key {
-                            Key::Character(text) => match text.as_str() {
-                                "0" => Some(InputKey::Digit0),
-                                "1" => Some(InputKey::Digit1),
-                                "2" => Some(InputKey::Digit2),
-                                "f" | "F" => Some(InputKey::F),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        if let Some(key) = bound
-                            && let Some(command) = input::resolve(&Trigger::Key { key, pressed })
-                        {
-                            self.apply(command);
-                        }
+                        _ => {}
                     }
+                }
+                if let Some(key) = input_key(&event.logical_key)
+                    && let Some(command) = input::resolve(&Trigger::Key {
+                        key,
+                        pressed,
+                        mods: self.current_mods(),
+                    })
+                {
+                    self.apply(command);
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -1029,8 +1557,10 @@ impl ApplicationHandler<AppEvent> for App {
                 // renderer is taken mutably, so the borrows never overlap.
                 let animating = self.view.advance(Instant::now());
                 let _next_frame = self.advance_animations(Instant::now());
+                self.ensure_note_textures();
                 let items = self.build_items();
                 self.ensure_textures(&items);
+                let overlay = self.build_overlay();
                 let text = self.readout_text();
                 let hud_layer = self.render_hud(&text);
                 let Some(renderer) = self.renderer.as_mut() else {
@@ -1048,8 +1578,9 @@ impl ApplicationHandler<AppEvent> for App {
                     camera: &self.view.camera,
                     viewport: self.view.viewport(),
                     physical_scale: window.scale_factor(),
-                    scene_rect: self.scene_rects.rect(),
+                    scene_rect: self.board.scene_rect(),
                     items: &items,
+                    overlay: &overlay,
                     hud,
                 };
                 match renderer.render(&params) {
@@ -1066,9 +1597,9 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::CloseRequested => {
+                self.commit_note_edit();
                 if self.should_confirm_close() {
-                    // Phase 05 asks "save changes?" here. Nothing can be dirty
-                    // yet, so the stub never routes through this branch.
+                    // Phase 05 asks "save changes?" here.
                 }
                 // Dev-only checkpoint of the view transform; phase 06 folds
                 // this into the .rizref container and deletes the module.
@@ -1114,6 +1645,50 @@ impl ApplicationHandler<AppEvent> for App {
     }
 }
 
+/// Maps a winit logical key to the input table's vocabulary.
+fn input_key(key: &Key) -> Option<InputKey> {
+    match key {
+        Key::Character(text) => match text.to_ascii_lowercase().as_str() {
+            "0" => Some(InputKey::Digit0),
+            "1" => Some(InputKey::Digit1),
+            "2" => Some(InputKey::Digit2),
+            "3" => Some(InputKey::Digit3),
+            "4" => Some(InputKey::Digit4),
+            "5" => Some(InputKey::Digit5),
+            "6" => Some(InputKey::Digit6),
+            "a" => Some(InputKey::A),
+            "d" => Some(InputKey::D),
+            "f" => Some(InputKey::F),
+            "g" => Some(InputKey::G),
+            "h" => Some(InputKey::H),
+            "n" => Some(InputKey::N),
+            "r" => Some(InputKey::R),
+            "v" => Some(InputKey::V),
+            "w" => Some(InputKey::W),
+            "y" => Some(InputKey::Y),
+            "z" => Some(InputKey::Z),
+            "," => Some(InputKey::Comma),
+            "." => Some(InputKey::Period),
+            _ => None,
+        },
+        Key::Named(named) => match named {
+            NamedKey::ArrowLeft => Some(InputKey::Left),
+            NamedKey::ArrowRight => Some(InputKey::Right),
+            NamedKey::ArrowUp => Some(InputKey::Up),
+            NamedKey::ArrowDown => Some(InputKey::Down),
+            NamedKey::PageUp => Some(InputKey::PageUp),
+            NamedKey::PageDown => Some(InputKey::PageDown),
+            NamedKey::Home => Some(InputKey::Home),
+            NamedKey::End => Some(InputKey::End),
+            NamedKey::Delete => Some(InputKey::Delete),
+            NamedKey::Backspace => Some(InputKey::Backspace),
+            NamedKey::Escape => Some(InputKey::Escape),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Whether a path is worth handing to the import worker.
 ///
 /// The decoder sniffs magic, not names, so an extensionless file is submitted;
@@ -1141,7 +1716,10 @@ fn tick_animations(
     let mut next: Option<Instant> = None;
 
     for item in scene.items() {
-        let Some(asset) = scene.asset(item.asset()) else {
+        let Some(asset_id) = item.asset() else {
+            continue;
+        };
+        let Some(asset) = scene.asset(asset_id) else {
             continue;
         };
         let Some(animation) = asset.animation() else {
@@ -1153,7 +1731,7 @@ fn tick_animations(
             continue;
         }
 
-        let playback = playbacks.entry(item.asset()).or_insert(Playback {
+        let playback = playbacks.entry(asset_id).or_insert(Playback {
             frame: 0,
             next_at: now,
         });
@@ -1161,7 +1739,7 @@ fn tick_animations(
             let frame = (playback.frame + 1) % animation.len();
             playback.frame = frame;
             playback.next_at = now + animation.delay_after(frame);
-            uploads.push((item.asset(), frame));
+            uploads.push((asset_id, frame));
         }
         next = Some(next.map_or(playback.next_at, |soonest| soonest.min(playback.next_at)));
     }
@@ -1281,19 +1859,19 @@ fn check_dialogs() {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANVAS_BACKGROUND, LOG_FILES_KEPT, Playback, WindowPlan, looks_like_image, parse_args,
-        stale_logs, tick_animations, version_line,
+        CANVAS_BACKGROUND, LOG_FILES_KEPT, Playback, WindowPlan, input_key, looks_like_image,
+        parse_args, stale_logs, tick_animations, version_line,
     };
     use glam::Vec2;
     use rizref_codecs::ImageBuffer;
     use rizref_core::{
-        Animation, AnimationFrame, Asset, AssetId, ImageItem, ItemId, Rect, Scene, SceneId,
-        Selection,
+        Animation, AnimationFrame, Asset, AssetId, Item, ItemId, Rect, Scene, SceneId, Selection,
     };
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use winit::keyboard::{Key, NamedKey};
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(std::string::ToString::to_string).collect()
@@ -1393,6 +1971,19 @@ mod tests {
 
         let remove = stale_logs(&names, 0);
         assert_eq!(remove, ["rizref.log.2026-10-24".to_owned()]);
+    }
+
+    #[test]
+    fn logical_keys_map_to_the_input_table() {
+        assert_eq!(
+            input_key(&Key::Character("Z".into())),
+            Some(super::InputKey::Z)
+        );
+        assert_eq!(
+            input_key(&Key::Named(NamedKey::ArrowLeft)),
+            Some(super::InputKey::Left)
+        );
+        assert_eq!(input_key(&Key::Named(NamedKey::Tab)), None);
     }
 
     /// A scene with one animated item at the origin, 10 x 10 world units.
@@ -1547,12 +2138,30 @@ mod tests {
     }
 
     #[test]
+    fn notes_never_get_a_playback_clock() {
+        let mut scene = Scene::new(SceneId::from_bytes([5; 16]));
+        scene.insert_note("a note", Vec2::ZERO, Vec2::splat(10.0));
+        let mut playbacks = HashMap::new();
+
+        let (uploads, next) = tick_animations(
+            &scene,
+            &Selection::new(),
+            &mut playbacks,
+            visible(),
+            Instant::now(),
+        );
+
+        assert!(uploads.is_empty());
+        assert_eq!(next, None);
+        assert!(playbacks.is_empty());
+    }
+
+    #[test]
     fn a_plain_click_selects_the_topmost_item_under_the_cursor() {
         let (mut scene, asset, first) = animated_scene();
         let second = scene
             .insert_image(asset, Vec2::ZERO, Vec2::splat(10.0))
             .expect("inserted");
-        let mut selection = Selection::new();
 
         // Both items cover the origin; the later one is drawn on top.
         let hit = scene
@@ -1560,11 +2169,10 @@ mod tests {
             .iter()
             .rev()
             .find(|item| item.hit_test(Vec2::ZERO))
-            .map(ImageItem::id)
+            .map(Item::id)
             .expect("something is under the cursor");
-        selection.set_single(hit);
 
         assert_eq!(hit, second);
-        assert!(!selection.contains(first));
+        assert_ne!(hit, first);
     }
 }
