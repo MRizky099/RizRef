@@ -25,7 +25,7 @@ jobs:
     name: rustfmt
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -36,7 +36,7 @@ jobs:
     name: clippy
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -50,7 +50,7 @@ jobs:
     name: test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the workspace
@@ -101,10 +101,12 @@ jobs:
       # inherited by the `cargo build` child process cargo-fuzz spawns.
       RUSTUP_TOOLCHAIN: nightly
       RUST_BACKTRACE: "1"
-      # Ten minutes on the nightly soak, one minute on a pull request.
-      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '60' }}
+      # Ten minutes per target on the schedule and on a manual dispatch (both are
+      # the phase-03 soak, and a dispatch is how it gets re-run before a release);
+      # one minute on a pull request.
+      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '60' || '600' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
