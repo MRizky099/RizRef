@@ -4,8 +4,8 @@ Summary of what each delivery phase landed. One section per phase; newest at the
 
 ## Phase 04 — Items & Manipulation (done)
 
-Implemented 2026-10-29; opened as PR #16 (branch `feat/phase-04-items-and-manipulation`,
-closes issue #5).
+Merged 2026-10-29 in PR #16 (branch `feat/phase-04-items-and-manipulation`,
+merge commit `f1c5724`). Closes issue #5.
 
 - `rizref-core`: `Transform` (centre/size/rotation, oriented hit-test, exact
   separating-axis rectangle test), a unified `Item` with `ItemBody::Image`/`Note` and
