@@ -129,11 +129,13 @@ cargo fmt --all                # formatting
 cargo clippy --workspace --all-targets -- -D warnings   # lint policy, as CI runs it
 ```
 
-Fuzzing lives in the workspace-excluded `fuzz/` crate and needs nightly:
+Fuzzing lives in the workspace-excluded `fuzz/` crate and needs nightly. CI runs one
+matrix job per codec family: 60 s per target on a pull request, 600 s per target on the
+nightly schedule (the phase-03 acceptance soak). Locally:
 
 ```bash
 cargo install cargo-fuzz
-cargo fuzz run decode_any -- -max_total_time=600   # 10-minute acceptance soak
+cargo +nightly fuzz run decode_any -- -max_total_time=600
 ```
 
 Lints are workspace-wide (`[workspace.lints]`): `unsafe_code` is denied in every crate,

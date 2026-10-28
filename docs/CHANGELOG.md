@@ -8,7 +8,8 @@ Summary of what each delivery phase landed. One section per phase; newest at the
   allocation; EXIF orientation baked in for JPEG and WebP; committed fixture suite
   (palette/16-bit PNG, baseline/progressive/grayscale JPEG, lossy+lossless WebP,
   animated GIF, BMP/TGA/PNM/QOI, multi-size ICO); malformed-input sweep; `fuzz/`
-  crate with one target per codec family and a short CI fuzz job.
+  crate with one target per codec family, a per-target CI matrix on nightly and a
+  scheduled ten-minute soak per target.
 - `rizref-core`: content-addressed `Asset`/`AssetStore` (BLAKE3 of the original
   bytes), `ImageItem` with oriented hit-testing, `Scene` now holds items and assets,
   box-filter previews that never upscale, and a 512 px preview per asset.
