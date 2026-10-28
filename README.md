@@ -70,7 +70,7 @@ between crates. These are the pinned versions:
 | PNG | `png` | 0.18.1 | pure Rust |
 | JPEG | `zune-jpeg` / `jpeg-encoder` | 0.5.15 / 0.7.1 | decode / encode |
 | WebP | `image-webp` | 0.2.4 | lossy + lossless decode, lossless encode |
-| GIF | `gif` | 0.14.2 | first frame only |
+| GIF | `gif` | 0.14.2 | every frame, composed and timed (animated on the board) |
 | BMP, TGA, PNM, QOI | `image` | 0.25.10 | `default-features = false`; only those four backends |
 | ICO | `ico` | 0.6.0 | largest embedded image wins |
 | Clipboard | `arboard` | 3.7.0 | OS FFI only |
@@ -112,10 +112,14 @@ Two deliberate exclusions, both recorded rather than hidden:
   (`tiny-skia`, already a dependency), not OpenGL. Revisiting this means either accepting
   `glutin_wgl_sys` as an FFI-only exception or building the CPU path — both are recorded
   options, not lost work.
-- **HEIF/HEIC/AVIF are recognised but not decoded.** No mature pure-Rust decoder exists
-  today. Such a file is identified by its signature and reported as unsupported, instead
-  of being misreported as corrupt. JPEG, PNG, WebP, GIF, BMP, ICO, TGA, PNM and QOI cover
-  the overwhelming majority of reference art.
+- **HEIF/HEIC is decoded through the operating system, not in Rust.** No mature pure-Rust
+  decoder exists, so `rizref-codecs` keeps reporting it as unsupported while the
+  application bridges it to Windows Imaging Component
+  (`crates/rizref/src/platform/heif.rs`). WIC decodes HEVC-coded HEIF when the free
+  **HEIF Image Extensions** package is installed — it ships with Windows 11 and installs
+  from the Store on Windows 10 — and the failure mode is a message naming that package
+  rather than "corrupt file". The bridge lives with the other platform glue, so the
+  codec crate's dependency set is unchanged; AVIF remains recognised but undecoded.
 
 ## Building
 

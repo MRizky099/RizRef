@@ -24,6 +24,19 @@ Summary of what each delivery phase landed. One section per phase; newest at the
   Outlook attachments, entries of a compressed folder), not just `CF_HDROP` paths.
   Registration degrades to winit's handler when OLE cannot initialise; descriptor
   parsing is unit-tested against the packed Win32 layout.
+- `rizref-codecs`: `decode_gif_animation` returns every GIF frame already composed onto
+  a canvas — offsets, transparency and `Background` disposal applied — under frame and
+  pixel budgets, with a 20 ms floor on zero-delay frames.
+- `rizref-core`: `Animation`/`AnimationFrame` answer "which frame is due at time t?"
+  (looping, no clock of its own), and `Asset::with_animation` keeps the first frame as the
+  still image so previews, export and the file format are unchanged.
+- `rizref`: animated GIFs play on a one-shot `ControlFlow::WaitUntil` timer, re-uploading
+  only the current frame; **a selected item freezes** and the HUD reports the frame. A
+  plain left click now selects the topmost item (the seed phase 04 builds on).
+- `rizref`: **HEIC/HEIF** is bridged to Windows Imaging Component
+  (`platform/heif.rs`), which reuses the HEIF Image Extension instead of bundling an
+  HEVC decoder; a missing extension is reported as a package to install. The bridge is
+  covered by a test that drives it with a PNG, so CI does not need the extension.
 - Renderer: placeholder quads deleted; items draw from real per-item
   `RGBA8UnormSrgb` textures with a 512 MB LRU budget, 4096 px display cap,
   preview-first fallback and re-upload when visible again.

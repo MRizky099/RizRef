@@ -31,6 +31,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod animation;
 pub mod buffer;
 pub mod decode;
 pub mod encode;
@@ -38,6 +39,9 @@ pub mod error;
 mod exif;
 pub mod sniff;
 
+pub use animation::{
+    AnimationFrame, MAX_FRAMES, MAX_TOTAL_PIXELS, MIN_FRAME_DELAY, decode_gif_animation,
+};
 pub use buffer::ImageBuffer;
 pub use decode::{DecodeLimits, decode, decode_as, decode_as_with_limits, decode_with_limits};
 pub use encode::{encode_jpeg, encode_png};
