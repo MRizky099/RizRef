@@ -4,6 +4,9 @@ Summary of what each delivery phase landed. One section per phase; newest at the
 
 ## Phase 03 — Image Pipeline (done)
 
+Merged 2026-10-29 in PR #14 (decode, drop, paste, cache) and PR #15 (HEIC in Rust,
+AVIF through the OS codec, animated GIFs). Closes issues #4 and #13.
+
 - `rizref-codecs`: `DecodeLimits` (100 MP default) enforced from headers before
   allocation; EXIF orientation baked in for JPEG and WebP; committed fixture suite
   (palette/16-bit PNG, baseline/progressive/grayscale JPEG, lossy+lossless WebP,
