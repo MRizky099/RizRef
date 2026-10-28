@@ -14,6 +14,9 @@ members = [
     "crates/rizref-format",
     "crates/rizref-codecs",
 ]
+# The fuzz crate needs a nightly toolchain and its own pinned dependencies; it
+# is built by the dedicated CI job, never by `cargo test --workspace`.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -68,6 +71,9 @@ image = { version = "0.25.10", default-features = false, features = [
 
 # --- window, GPU, clipboard, dialogs: rizref (bin) -------------------------
 winit = "0.30.13"
+# The import worker pool: std threads coordinated by bounded/unbounded MPMC
+# channels. Pure Rust, no async runtime.
+crossbeam-channel = "0.5.17"
 # Backend order: Vulkan -> DX12 (see README.md); the Metal and WebGPU backends are
 # switched off deliberately, and the GL fallback is dropped by decision rather than
 # left ambiguous.
@@ -103,23 +109,34 @@ tracing-appender = "0.2.3"
 # futures even on native; pollster is the smallest pure-Rust executor (no
 # runtime, no dependencies).
 pollster = "0.4.0"
-# Reserved for the phase-01 FFI glue (single-instance mutex, Win32 message box,
-# COM dialogs, IDropTarget). Declared here so no crate has to guess a version.
-# Phase 01 links it for: named mutex + named pipe (single instance), the
-# message box (panic reporting). Pipes and file I/O need their own features.
+# The Windows FFI surface, in one place so no crate has to guess a version:
+# the single-instance mutex and args pipe, the panic message box, the native
+# dialogs, and the OLE drop target (`IDropTarget`, CF_HDROP plus virtual files).
+# The GDI/StructuredStorage/SystemServices/DataExchange/Memory features exist for
+# the COM pieces: STGMEDIUM and ReleaseStgMedium, the IDropTarget vtable,
+# RegisterClipboardFormatW and the HGLOBAL payloads.
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
     "Win32_System_IO",
+    "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Pipes",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# The `#[implement]` macro expands to absolute `::windows_core::` paths, so a
+# crate that implements a COM interface names the support crate directly. Pure
+# Rust, no C, and version-locked to the `windows` release above.
+windows-core = "0.62.2"
 
 # ---------------------------------------------------------------------------
 # Lint policy. Members opt in with `[lints] workspace = true`.

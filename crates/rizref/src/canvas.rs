@@ -14,15 +14,9 @@
 //! shader sees small numbers again before precision can matter.
 
 use glam::DVec2;
-use rizref_core::{Camera, Rect};
+use rizref_core::{AssetId, Camera, Rect};
 
 const SHADER: &str = include_str!("shaders/canvas.wgsl");
-
-/// Layers in the item texture array (and the placeholder item count modulo).
-const TEXTURE_LAYERS: u32 = 8;
-
-/// Side length in pixels of one texture-array layer.
-const TEXTURE_SIZE: u32 = 64;
 
 /// GPU capacity of the instance buffer when it is first created.
 const INITIAL_INSTANCE_CAPACITY: usize = 256;
@@ -125,9 +119,7 @@ pub struct QuadInstance {
     pub size: [f32; 2],
     /// Item rotation in radians.
     pub rotation: f32,
-    /// Texture-array layer.
-    pub texture: f32,
-    /// UV rect (min.xy, max.xy) inside the layer.
+    /// UV rect (min.xy, max.xy) inside the item texture.
     pub uv: [f32; 4],
     /// RGBA tint, straight alpha, 1.0 = unmodified.
     pub tint: [f32; 4],
@@ -135,12 +127,11 @@ pub struct QuadInstance {
 
 impl QuadInstance {
     /// An opaque full-UV untinted quad.
-    pub fn new(center: [f32; 2], size: [f32; 2], rotation: f32, texture: u32) -> Self {
+    pub fn new(center: [f32; 2], size: [f32; 2], rotation: f32) -> Self {
         Self {
             center,
             size,
             rotation,
-            texture: texture as f32,
             uv: [0.0, 0.0, 1.0, 1.0],
             tint: [1.0, 1.0, 1.0, 1.0],
         }
@@ -154,7 +145,7 @@ impl QuadInstance {
             self.size[0],
             self.size[1],
             self.rotation,
-            self.texture,
+            0.0,
             0.0,
             0.0,
             self.uv[0],
@@ -170,6 +161,7 @@ impl QuadInstance {
 
     /// The axis-aligned world rect the rotated quad sweeps out — what the
     /// scene-rect tracker consumes.
+    #[cfg(test)]
     pub fn world_rect(&self) -> Rect {
         let (sin, cos) = self.rotation.sin_cos();
         let (half_w, half_h) = (self.size[0] * 0.5, self.size[1] * 0.5);
@@ -182,6 +174,15 @@ impl QuadInstance {
     }
 }
 
+/// One drawable item: its transform and the texture it samples.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ItemQuad {
+    /// Geometry and tint for the instanced vertex buffer.
+    pub instance: QuadInstance,
+    /// The asset whose GPU texture this item samples.
+    pub asset: AssetId,
+}
+
 /// Packs 16 f32 values into the 64 bytes the uniform and instance layouts
 /// expect (native-endian, 4-byte stride).
 fn pack_floats(floats: &[f32; 16]) -> [u8; 64] {
@@ -192,77 +193,11 @@ fn pack_floats(floats: &[f32; 16]) -> [u8; 64] {
     bytes
 }
 
-/// The eight placeholder items that exercise the transform pipeline until the
-/// image pipeline lands in phase 03 (temporary test asset, removed then).
-///
-/// A loose two-row arrangement with mixed sizes, small rotations and both
-/// opaque and translucent textures: enough to see pan, zoom, rotate, the
-/// draw order, and the checkerboard behind translucent pixels.
-pub fn placeholder_items() -> Vec<QuadInstance> {
-    const LAYOUT: [([f32; 2], [f32; 2], f32); 8] = [
-        ([-450.0, -160.0], [300.0, 200.0], 0.0),
-        ([0.0, -180.0], [360.0, 240.0], 0.10),
-        ([450.0, -160.0], [300.0, 200.0], -0.08),
-        ([860.0, -120.0], [220.0, 220.0], 0.05),
-        ([-380.0, 160.0], [260.0, 260.0], -0.12),
-        ([0.0, 200.0], [420.0, 180.0], 0.0),
-        ([480.0, 180.0], [280.0, 210.0], 0.20),
-        ([850.0, 200.0], [200.0, 140.0], -0.05),
-    ];
-    LAYOUT
-        .iter()
-        .enumerate()
-        .map(|(index, &(center, size, rotation))| {
-            QuadInstance::new(
-                center,
-                size,
-                rotation,
-                (index % TEXTURE_LAYERS as usize) as u32,
-            )
-        })
-        .collect()
-}
-
-/// Procedural placeholder texture: a diagonal gradient in one hue per layer.
-/// Every third layer is translucent so the checkerboard shows through.
-fn placeholder_texture_bytes(layer: u32) -> Vec<u8> {
-    let hue = layer as f32 / TEXTURE_LAYERS as f32;
-    let alpha = if layer % 3 == 2 { 150u8 } else { 255u8 };
-    // (alpha chosen above)
-    let (r, g, b) = hue_to_rgb(hue);
-    let mut bytes = Vec::with_capacity((TEXTURE_SIZE * TEXTURE_SIZE * 4) as usize);
-    for y in 0..TEXTURE_SIZE {
-        for x in 0..TEXTURE_SIZE {
-            let t = (x + y) as f32 / (2.0 * TEXTURE_SIZE as f32 - 2.0);
-            let shade = 0.35 + 0.65 * t;
-            bytes.push((f32::from(r) * shade) as u8);
-            bytes.push((f32::from(g) * shade) as u8);
-            bytes.push((f32::from(b) * shade) as u8);
-            bytes.push(alpha);
-        }
-    }
-    bytes
-}
-
-/// A hue in `[0, 1)` as sRGB bytes, spread around the wheel for the layers.
-fn hue_to_rgb(hue: f32) -> (u8, u8, u8) {
-    let sector = (hue * 6.0) % 6.0;
-    let (r, g, b) = match sector as u32 {
-        0 => (1.0, sector.fract(), 0.0),
-        1 => (1.0 - sector.fract(), 1.0, 0.0),
-        2 => (0.0, 1.0, sector.fract()),
-        3 => (0.0, 1.0 - sector.fract(), 1.0),
-        4 => (sector.fract(), 0.0, 1.0),
-        _ => (1.0, 0.0, 1.0 - sector.fract()),
-    };
-    ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
-}
-
 /// Everything the GPU needs to draw the board.
 pub struct Canvas {
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
-    texture_bind_group: wgpu::BindGroup,
+    texture_layout: wgpu::BindGroupLayout,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     item_count: u32,
@@ -279,8 +214,8 @@ impl Canvas {
     /// so the CPU pixels need no swizzling for whichever swapchain picked.
     const HUD_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-    /// Creates the pipelines, the placeholder texture array and the buffers.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+    /// Creates the pipelines and the instance buffer.
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rizref-canvas-shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -310,7 +245,7 @@ impl Canvas {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
@@ -464,73 +399,6 @@ impl Canvas {
             }],
         });
 
-        // The placeholder texture array. Phase 03 replaces the contents with
-        // decoded images; the array shape (D2 array + filtering sampler) is
-        // already the real thing.
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("rizref-item-textures"),
-            size: wgpu::Extent3d {
-                width: TEXTURE_SIZE,
-                height: TEXTURE_SIZE,
-                depth_or_array_layers: TEXTURE_LAYERS,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("rizref-item-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        for layer in 0..TEXTURE_LAYERS {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: 0,
-                        y: 0,
-                        z: layer,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &placeholder_texture_bytes(layer),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(TEXTURE_SIZE * 4),
-                    rows_per_image: Some(TEXTURE_SIZE),
-                },
-                wgpu::Extent3d {
-                    width: TEXTURE_SIZE,
-                    height: TEXTURE_SIZE,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rizref-item-texture-bind-group"),
-            layout: &texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rizref-instances"),
             size: INITIAL_INSTANCE_CAPACITY as u64 * 64,
@@ -541,7 +409,7 @@ impl Canvas {
         Self {
             globals_buffer,
             globals_bind_group,
-            texture_bind_group,
+            texture_layout,
             instance_buffer,
             instance_capacity: INITIAL_INSTANCE_CAPACITY,
             item_count: 0,
@@ -552,6 +420,11 @@ impl Canvas {
             item_pipeline,
             hud_pipeline,
         }
+    }
+
+    /// The bind group layout every item texture must use.
+    pub fn item_texture_layout(&self) -> wgpu::BindGroupLayout {
+        self.texture_layout.clone()
     }
 
     /// Updates the per-frame globals from the camera and scene rect.
@@ -573,13 +446,11 @@ impl Canvas {
     }
 
     /// Uploads the frame's item instances, growing the buffer if needed.
-    pub fn set_items(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        items: &[QuadInstance],
-    ) {
-        let bytes: Vec<u8> = items.iter().flat_map(|item| item.bytes()).collect();
+    pub fn set_items(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, items: &[ItemQuad]) {
+        let bytes: Vec<u8> = items
+            .iter()
+            .flat_map(|item| item.instance.bytes())
+            .collect();
         if bytes.len() > self.instance_capacity * 64 {
             self.instance_capacity = self.instance_capacity.max(items.len()) * 2;
             self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -690,15 +561,32 @@ impl Canvas {
     }
 
     /// Draws the item instances in scene z-order.
-    pub fn draw_items<'r>(&self, pass: &mut wgpu::RenderPass<'r>) {
+    ///
+    /// `bind_groups` is parallel to the uploaded instances. An item without a
+    /// resident texture is skipped for this frame rather than sampling an
+    /// unrelated layer; the next frame uploads its preview.
+    pub fn draw_items<'r>(
+        &self,
+        pass: &mut wgpu::RenderPass<'r>,
+        bind_groups: &[Option<&wgpu::BindGroup>],
+    ) {
         if self.item_count == 0 {
             return;
         }
         pass.set_pipeline(&self.item_pipeline);
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
-        pass.set_bind_group(1, &self.texture_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..4, 0..self.item_count);
+        for (index, bind_group) in bind_groups
+            .iter()
+            .enumerate()
+            .take(self.item_count as usize)
+        {
+            let Some(bind_group) = bind_group else {
+                continue;
+            };
+            pass.set_bind_group(1, *bind_group, &[]);
+            pass.draw(0..4, index as u32..index as u32 + 1);
+        }
     }
 
     /// Draws the HUD readout quad, when one was uploaded.
@@ -731,9 +619,7 @@ pub enum HudUpload<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Canvas, Globals, QuadInstance, hue_to_rgb, placeholder_items, placeholder_texture_bytes,
-    };
+    use super::{Canvas, Globals, ItemQuad, QuadInstance};
     use glam::DVec2;
     use rizref_core::{Camera, Rect};
 
@@ -785,7 +671,7 @@ mod tests {
 
     #[test]
     fn an_instance_packs_to_its_64_bytes() {
-        let item = QuadInstance::new([1.0, 2.0], [3.0, 4.0], 0.5, 7);
+        let item = QuadInstance::new([1.0, 2.0], [3.0, 4.0], 0.5);
         assert_eq!(item.bytes().len(), 64);
     }
 
@@ -798,50 +684,24 @@ mod tests {
             );
         }
 
-        let unrotated = QuadInstance::new([0.0, 0.0], [10.0, 4.0], 0.0, 0);
+        let unrotated = QuadInstance::new([0.0, 0.0], [10.0, 4.0], 0.0);
         let rect = unrotated.world_rect();
         assert_corner(rect.min, glam::Vec2::new(-5.0, -2.0));
         assert_corner(rect.max(), glam::Vec2::new(5.0, 2.0));
 
         // A quarter turn swaps the extents (f32 pi/2 is not exact, hence the
         // tolerance rather than equality).
-        let quarter = QuadInstance::new([0.0, 0.0], [10.0, 4.0], std::f32::consts::FRAC_PI_2, 0);
+        let quarter = QuadInstance::new([0.0, 0.0], [10.0, 4.0], std::f32::consts::FRAC_PI_2);
         let rect = quarter.world_rect();
         assert_corner(rect.min, glam::Vec2::new(-2.0, -5.0));
         assert_corner(rect.max(), glam::Vec2::new(2.0, 5.0));
     }
 
-    #[test]
-    fn the_placeholder_set_has_eight_items_with_valid_layers() {
-        let items = placeholder_items();
-        assert_eq!(items.len(), 8);
-        assert!(items.iter().all(|item| item.texture >= 0.0));
-        assert!(items.iter().any(|item| item.rotation != 0.0));
-    }
-
-    #[test]
-    fn the_placeholder_textures_are_sized_and_opaque_or_translucent() {
-        for layer in 0..8u32 {
-            let bytes = placeholder_texture_bytes(layer);
-            assert_eq!(bytes.len(), 64 * 64 * 4);
-            let alpha = bytes[3];
-            assert!(alpha == 255 || alpha == 150, "layer {layer} alpha {alpha}");
-        }
-    }
-
-    #[test]
-    fn hues_span_the_wheel() {
-        let (r, g, b) = hue_to_rgb(0.0);
-        assert_eq!((r, g, b), (255, 0, 0));
-        let (r, g, b) = hue_to_rgb(1.0 / 3.0);
-        assert_eq!((r, g, b), (0, 255, 0));
-    }
-
     /// Renders one offscreen frame through every pipeline.
     ///
     /// This is the only test that exercises the GPU: it compiles the WGSL,
-    /// validates the bind group layouts against it, and runs all three draw
-    /// paths with the placeholder content. Machines with no usable adapter
+    /// validates the bind group layouts against it, uploads one real item
+    /// texture, and runs all three draw paths. Machines with no usable adapter
     /// (CI runners without Vulkan/DX12) skip it rather than fail it.
     #[test]
     fn the_pipelines_render_an_offscreen_frame() {
@@ -869,7 +729,7 @@ mod tests {
             };
 
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let mut canvas = Canvas::new(&device, &queue, format);
+        let mut canvas = Canvas::new(&device, format);
         canvas.set_globals(
             &queue,
             &Camera::default(),
@@ -878,10 +738,28 @@ mod tests {
             None,
             (0.0, 0.0),
         );
-        let items = placeholder_items();
+
+        let asset = rizref_core::AssetId::from_checksum([7; 32]);
+        let mut textures = crate::textures::TextureCache::new(
+            &device,
+            canvas.item_texture_layout(),
+            crate::textures::MAX_TEXTURE_SIDE,
+        );
+        textures.upload(
+            &device,
+            &queue,
+            asset,
+            &rizref_codecs::ImageBuffer::filled(16, 16, [200, 30, 40, 255]),
+            false,
+        );
+        let items = [ItemQuad {
+            instance: QuadInstance::new([0.0, 0.0], [100.0, 100.0], 0.0),
+            asset,
+        }];
         canvas.set_items(&device, &queue, &items);
         canvas.set_hud(&device, &queue, super::HudUpload::None);
 
+        let bind_groups = [textures.bind_group(asset)];
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rizref-canvas-test-target"),
             size: wgpu::Extent3d {
@@ -915,7 +793,7 @@ mod tests {
                 ..Default::default()
             });
             canvas.draw_background(&mut pass);
-            canvas.draw_items(&mut pass);
+            canvas.draw_items(&mut pass, &bind_groups);
             canvas.draw_hud(&mut pass);
         }
         queue.submit(Some(encoder.finish()));

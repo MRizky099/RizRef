@@ -2,7 +2,15 @@ name: CI
 
 on:
   push:
+    # Feature branches are covered by their pull request; running both would
+    # double every check and the fuzz matrix with it.
+    branches: [main]
   pull_request:
+  # The phase-03 acceptance soak: ten minutes of fuzzing per codec family.
+  # Pull requests get a short run so review stays fast.
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 # A push that fixes a lint failure should not queue behind the run it fixes.
 concurrency:
@@ -17,7 +25,7 @@ jobs:
     name: rustfmt
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -28,7 +36,7 @@ jobs:
     name: clippy
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -42,7 +50,7 @@ jobs:
     name: test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the workspace
@@ -69,3 +77,51 @@ jobs:
             printf '::error::dependency tree contains native bindings that are not accepted: %s\n' "$unexpected"
             exit 1
           fi
+
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One crashing target must not hide the state of the others.
+      fail-fast: false
+      matrix:
+        target:
+          - decode_any
+          - decode_png
+          - decode_jpeg
+          - decode_gif
+          - decode_webp
+          - decode_plain
+          - decode_ico
+    env:
+      # The workspace pins stable in `rust-toolchain.toml`, and that directory
+      # override beats the toolchain installed above — which is why fuzzing used
+      # to fail with "the option `Z` is only accepted on the nightly compiler".
+      # `RUSTUP_TOOLCHAIN` outranks the file and, unlike `cargo +nightly`, is
+      # inherited by the `cargo build` child process cargo-fuzz spawns.
+      RUSTUP_TOOLCHAIN: nightly
+      RUST_BACKTRACE: "1"
+      # Ten minutes per target on the schedule and on a manual dispatch (both are
+      # the phase-03 soak, and a dispatch is how it gets re-run before a release);
+      # one minute on a pull request.
+      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '60' || '600' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # cargo-fuzz builds inside `fuzz/`, not the workspace root.
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_SECONDS }} -print_final_stats=1
+      # A crash writes its reproducer here; without the upload the only copy is
+      # in the runner that gets torn down.
+      - name: Keep crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

@@ -2,7 +2,11 @@
 
 use std::fmt::{self, Write as _};
 
+use glam::Vec2;
 use serde::{Deserialize, Serialize};
+
+use crate::asset::{Asset, AssetId, AssetStore};
+use crate::item::ImageItem;
 
 /// Identity of a board: 16 raw bytes rendered as 32 lowercase hex digits.
 ///
@@ -99,19 +103,26 @@ impl fmt::Display for ItemId {
     }
 }
 
-/// A board: the ordered set of items the user arranged.
+/// A board: the ordered set of items the user arranged, plus the assets they
+/// show.
 ///
-/// Phase 00 keeps the identity and the z-order only — the item payload (source
-/// bytes, transform, group membership, note text) arrives with the canvas and
-/// manipulation phases. Keeping `items` as an ordered list rather than a map is
-/// deliberate: z-order *is* the iteration order, and a board is small enough
-/// (hundreds of items) that a linear scan beats a second index.
+/// `items` is an ordered list rather than a map on purpose: z-order *is* the
+/// iteration order, and a board is small enough (hundreds of items) that a
+/// linear scan beats a second index. Assets are content-addressed and shared;
+/// several items can point at the same one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
     /// Identity of the board, written verbatim into the `.rizref` header.
     pub id: SceneId,
-    /// Item ids in z-order; the last entry is drawn on top.
-    pub items: Vec<ItemId>,
+    /// Items in z-order; the last entry is drawn on top.
+    pub items: Vec<ImageItem>,
+    /// The next raw item id handed out.
+    #[serde(default = "Scene::first_item_raw")]
+    next_item: u64,
+    /// Content-addressed originals. Phase 06 gives them their on-disk chunk
+    /// form; the in-memory map is what every item resolves through.
+    #[serde(skip)]
+    assets: AssetStore,
 }
 
 impl Scene {
@@ -120,7 +131,14 @@ impl Scene {
         Self {
             id,
             items: Vec::new(),
+            next_item: Self::first_item_raw(),
+            assets: AssetStore::new(),
         }
+    }
+
+    /// First raw item id a new scene hands out.
+    const fn first_item_raw() -> u64 {
+        1
     }
 
     /// Number of items on the board.
@@ -135,11 +153,74 @@ impl Scene {
 
     /// Whether `item` is on the board.
     pub fn contains(&self, item: ItemId) -> bool {
-        self.items.contains(&item)
+        self.items.iter().any(|entry| entry.id() == item)
     }
 
-    /// Adds an item on top of the stack.
-    pub fn push(&mut self, item: ItemId) {
+    /// The items in z-order.
+    pub fn items(&self) -> &[ImageItem] {
+        &self.items
+    }
+
+    /// The item with `id`, if present.
+    pub fn item(&self, id: ItemId) -> Option<&ImageItem> {
+        self.items.iter().find(|item| item.id() == id)
+    }
+
+    /// The item with `id` for mutation, if present.
+    pub fn item_mut(&mut self, id: ItemId) -> Option<&mut ImageItem> {
+        self.items.iter_mut().find(|item| item.id() == id)
+    }
+
+    /// The stored assets.
+    pub fn assets(&self) -> &AssetStore {
+        &self.assets
+    }
+
+    /// The asset with `id`, if present.
+    pub fn asset(&self, id: AssetId) -> Option<&Asset> {
+        self.assets.get(id)
+    }
+
+    /// Stores `asset` unless an equal one is present, returning its id and
+    /// whether this call inserted it.
+    pub fn insert_asset(&mut self, asset: Asset) -> (AssetId, bool) {
+        self.assets.intern(asset)
+    }
+
+    /// Adds an item on top of the stack, returning its id.
+    ///
+    /// Returns `None` when `asset` is not in the scene: an item pointing at
+    /// nothing would draw as a hole and fail every later save, so the model
+    /// refuses it rather than repairing it at render time. The caller is
+    /// responsible for updating any [`SceneRectTracker`] it keeps.
+    ///
+    /// [`SceneRectTracker`]: crate::SceneRectTracker
+    pub fn insert_image(&mut self, asset: AssetId, center: Vec2, size: Vec2) -> Option<ItemId> {
+        if !self.assets.contains(asset) {
+            return None;
+        }
+        // A deserialised scene may not know its high-water mark; never reuse an
+        // id that an existing item already holds.
+        let highest = self
+            .items
+            .iter()
+            .map(|item| item.id().raw())
+            .max()
+            .unwrap_or(0);
+        self.next_item = self.next_item.max(highest + 1);
+
+        let id = ItemId::from_raw(self.next_item);
+        self.next_item += 1;
+        self.items.push(ImageItem::new(id, asset, center, size));
+        Some(id)
+    }
+
+    /// Adds a fully built item on top of the stack.
+    ///
+    /// Used by undo/redo, which restores an item with its original id and
+    /// transform, and by tests that need exact control over the payload.
+    pub fn push(&mut self, item: ImageItem) {
+        self.next_item = self.next_item.max(item.id().raw() + 1);
         self.items.push(item);
     }
 
@@ -148,7 +229,7 @@ impl Scene {
     /// The position is returned rather than ignored because undo has to put the
     /// item back where it was, not on top.
     pub fn remove(&mut self, item: ItemId) -> Option<usize> {
-        let position = self.items.iter().position(|entry| *entry == item)?;
+        let position = self.items.iter().position(|entry| entry.id() == item)?;
         self.items.remove(position);
         Some(position)
     }
@@ -157,9 +238,25 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::{ItemId, Scene, SceneId};
+    use crate::asset::{Asset, AssetId};
+    use crate::item::ImageItem;
+    use glam::Vec2;
+    use rizref_codecs::{ImageBuffer, ImageFormat};
+    use std::sync::Arc;
 
     fn scene_id() -> SceneId {
         SceneId::from_bytes([0xab; SceneId::BYTE_LEN])
+    }
+
+    fn insert_asset(scene: &mut Scene, bytes: &[u8]) -> AssetId {
+        let image = ImageBuffer::filled(4, 3, [1, 2, 3, 255]);
+        let asset = Asset::from_decoded(
+            Arc::from(bytes),
+            ImageFormat::Png,
+            &image,
+            ImageBuffer::filled(2, 1, [1, 2, 3, 255]),
+        );
+        scene.insert_asset(asset).0
     }
 
     #[test]
@@ -205,31 +302,73 @@ mod tests {
     #[test]
     fn items_keep_their_z_order() {
         let mut scene = Scene::new(scene_id());
-        let (bottom, top) = (ItemId::from_raw(1), ItemId::from_raw(2));
-
-        scene.push(bottom);
-        scene.push(top);
+        let asset = insert_asset(&mut scene, b"shared");
+        let bottom = scene
+            .insert_image(asset, Vec2::new(1.0, 2.0), Vec2::new(10.0, 10.0))
+            .expect("asset is stored");
+        let top = scene
+            .insert_image(asset, Vec2::new(30.0, 2.0), Vec2::new(10.0, 10.0))
+            .expect("asset is stored");
 
         assert_eq!(scene.len(), 2);
         assert!(!scene.is_empty());
-        assert_eq!(scene.items, vec![bottom, top]);
+        assert_eq!(
+            scene.items.iter().map(ImageItem::id).collect::<Vec<_>>(),
+            vec![bottom, top]
+        );
         assert!(scene.contains(bottom) && scene.contains(top));
+        assert_eq!(
+            scene.item(top).expect("top item").center(),
+            Vec2::new(30.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn two_items_can_share_one_asset() {
+        let mut scene = Scene::new(scene_id());
+        let asset = insert_asset(&mut scene, b"one original");
+
+        let first = scene
+            .insert_image(asset, Vec2::ZERO, Vec2::splat(4.0))
+            .expect("first");
+        let second = scene
+            .insert_image(asset, Vec2::splat(10.0), Vec2::splat(4.0))
+            .expect("second");
+
+        assert_ne!(first, second);
+        assert_eq!(scene.len(), 2);
+        assert_eq!(scene.assets().len(), 1, "one asset, two items");
+    }
+
+    #[test]
+    fn inserting_an_unknown_asset_is_refused() {
+        let mut scene = Scene::new(scene_id());
+        let missing = AssetId::from_checksum([9; 32]);
+
+        assert_eq!(
+            scene.insert_image(missing, Vec2::ZERO, Vec2::splat(1.0)),
+            None
+        );
+        assert!(scene.is_empty());
     }
 
     #[test]
     fn remove_reports_the_z_position_it_took_away() {
         let mut scene = Scene::new(scene_id());
-        let items = [
-            ItemId::from_raw(1),
-            ItemId::from_raw(2),
-            ItemId::from_raw(3),
-        ];
-        for item in items {
-            scene.push(item);
-        }
+        let asset = insert_asset(&mut scene, b"three items");
+        let items: Vec<ItemId> = (0..3)
+            .map(|index| {
+                scene
+                    .insert_image(asset, Vec2::splat(index as f32 * 10.0), Vec2::splat(4.0))
+                    .expect("asset is stored")
+            })
+            .collect();
 
         assert_eq!(scene.remove(items[1]), Some(1));
-        assert_eq!(scene.items, vec![items[0], items[2]]);
+        assert_eq!(
+            scene.items.iter().map(ImageItem::id).collect::<Vec<_>>(),
+            vec![items[0], items[2]]
+        );
         assert_eq!(scene.remove(items[1]), None, "removing twice is a no-op");
         assert!(!scene.contains(items[1]));
     }

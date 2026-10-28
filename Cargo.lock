@@ -1836,6 +1836,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "cosmic-text",
+ "crossbeam-channel",
  "glam",
  "pollster",
  "rfd",
@@ -1850,6 +1851,7 @@ dependencies = [
  "tracing-subscriber",
  "wgpu",
  "windows",
+ "windows-core",
  "winit",
 ]
 
@@ -1870,7 +1872,9 @@ dependencies = [
 name = "rizref-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "glam",
+ "rizref-codecs",
  "serde",
 ]
 

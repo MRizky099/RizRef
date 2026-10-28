@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 winit.workspace = true
+crossbeam-channel.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 tiny-skia.workspace = true
@@ -30,3 +31,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 windows.workspace = true
+windows-core.workspace = true

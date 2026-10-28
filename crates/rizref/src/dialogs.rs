@@ -9,8 +9,8 @@
 //! formats that are recognised but not decodable (HEIC) deliberately left out so
 //! the dialog cannot offer a file the loader will refuse.
 //!
-//! Phase 00 exposes the dialog as a diagnostic; the real "Open images" and
-//! "Export" commands arrive with the UI in phase 05.
+//! Phase 03 wires the image dialog to Ctrl+O; board open/save and export
+//! dialogs arrive with the UI in phase 05.
 
 use std::path::PathBuf;
 
