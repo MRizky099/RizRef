@@ -1883,6 +1883,7 @@ dependencies = [
  "glam",
  "rizref-codecs",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

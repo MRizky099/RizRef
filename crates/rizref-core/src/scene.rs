@@ -1,12 +1,14 @@
 //! The scene model: what a board contains and how it is identified.
 
+use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
 
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::asset::{Asset, AssetId, AssetStore};
-use crate::item::ImageItem;
+use crate::group::{Group, GroupChild, GroupId, Groups};
+use crate::item::Item;
 
 /// Identity of a board: 16 raw bytes rendered as 32 lowercase hex digits.
 ///
@@ -104,21 +106,31 @@ impl fmt::Display for ItemId {
 }
 
 /// A board: the ordered set of items the user arranged, plus the assets they
-/// show.
+/// show and the groups that tie items together.
 ///
 /// `items` is an ordered list rather than a map on purpose: z-order *is* the
 /// iteration order, and a board is small enough (hundreds of items) that a
 /// linear scan beats a second index. Assets are content-addressed and shared;
-/// several items can point at the same one.
+/// several items can point at the same one. Groups are a separate tree and do
+/// not affect draw order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
     /// Identity of the board, written verbatim into the `.rizref` header.
     pub id: SceneId,
     /// Items in z-order; the last entry is drawn on top.
-    pub items: Vec<ImageItem>,
-    /// The next raw item id handed out.
-    #[serde(default = "Scene::first_item_raw")]
+    pub items: Vec<Item>,
+    /// Group membership. Recursive from day one; the v1 interface creates one
+    /// level.
+    #[serde(default)]
+    groups: Groups,
+    /// The next raw item id handed out. Not serialised: it is a session
+    /// high-water mark, and leaving it out is what lets undo-all reproduce the
+    /// saved bytes exactly. A loaded scene re-derives it from the items it has.
+    #[serde(skip)]
     next_item: u64,
+    /// The next raw group id handed out, likewise not serialised.
+    #[serde(skip)]
+    next_group: u64,
     /// Content-addressed originals. Phase 06 gives them their on-disk chunk
     /// form; the in-memory map is what every item resolves through.
     #[serde(skip)]
@@ -131,13 +143,15 @@ impl Scene {
         Self {
             id,
             items: Vec::new(),
-            next_item: Self::first_item_raw(),
+            groups: Groups::new(),
+            next_item: Self::first_id(),
+            next_group: Self::first_id(),
             assets: AssetStore::new(),
         }
     }
 
-    /// First raw item id a new scene hands out.
-    const fn first_item_raw() -> u64 {
+    /// First raw id a new scene hands out.
+    const fn first_id() -> u64 {
         1
     }
 
@@ -157,18 +171,28 @@ impl Scene {
     }
 
     /// The items in z-order.
-    pub fn items(&self) -> &[ImageItem] {
+    pub fn items(&self) -> &[Item] {
         &self.items
     }
 
+    /// The items in z-order, for mutation.
+    pub fn items_mut(&mut self) -> &mut [Item] {
+        &mut self.items
+    }
+
     /// The item with `id`, if present.
-    pub fn item(&self, id: ItemId) -> Option<&ImageItem> {
+    pub fn item(&self, id: ItemId) -> Option<&Item> {
         self.items.iter().find(|item| item.id() == id)
     }
 
     /// The item with `id` for mutation, if present.
-    pub fn item_mut(&mut self, id: ItemId) -> Option<&mut ImageItem> {
+    pub fn item_mut(&mut self, id: ItemId) -> Option<&mut Item> {
         self.items.iter_mut().find(|item| item.id() == id)
+    }
+
+    /// The z-position of `id`, if present.
+    pub fn position(&self, id: ItemId) -> Option<usize> {
+        self.items.iter().position(|item| item.id() == id)
     }
 
     /// The stored assets.
@@ -187,7 +211,24 @@ impl Scene {
         self.assets.intern(asset)
     }
 
-    /// Adds an item on top of the stack, returning its id.
+    /// Allocates the next item id, keeping a session high-water mark.
+    ///
+    /// A deserialised scene may not know its high-water mark; never reuse an id
+    /// that an existing item already holds.
+    pub fn allocate_item_id(&mut self) -> ItemId {
+        let highest = self
+            .items
+            .iter()
+            .map(|item| item.id().raw())
+            .max()
+            .unwrap_or(0);
+        self.next_item = self.next_item.max(highest + 1);
+        let id = ItemId::from_raw(self.next_item);
+        self.next_item += 1;
+        id
+    }
+
+    /// Adds an image item on top of the stack, returning its id.
     ///
     /// Returns `None` when `asset` is not in the scene: an item pointing at
     /// nothing would draw as a hole and fail every later save, so the model
@@ -199,29 +240,28 @@ impl Scene {
         if !self.assets.contains(asset) {
             return None;
         }
-        // A deserialised scene may not know its high-water mark; never reuse an
-        // id that an existing item already holds.
-        let highest = self
-            .items
-            .iter()
-            .map(|item| item.id().raw())
-            .max()
-            .unwrap_or(0);
-        self.next_item = self.next_item.max(highest + 1);
-
-        let id = ItemId::from_raw(self.next_item);
-        self.next_item += 1;
-        self.items.push(ImageItem::new(id, asset, center, size));
+        let id = self.allocate_item_id();
+        self.items.push(Item::image(id, asset, center, size));
         Some(id)
     }
 
-    /// Adds a fully built item on top of the stack.
-    ///
-    /// Used by undo/redo, which restores an item with its original id and
-    /// transform, and by tests that need exact control over the payload.
-    pub fn push(&mut self, item: ImageItem) {
+    /// Adds a note on top of the stack, returning its id.
+    pub fn insert_note(&mut self, text: impl Into<String>, center: Vec2, size: Vec2) -> ItemId {
+        let id = self.allocate_item_id();
+        self.items.push(Item::note(id, text, center, size));
+        id
+    }
+
+    /// Inserts a fully built item at `index` (clamped), as undo and redo do.
+    pub fn insert_item_at(&mut self, index: usize, item: Item) {
         self.next_item = self.next_item.max(item.id().raw() + 1);
-        self.items.push(item);
+        let index = index.min(self.items.len());
+        self.items.insert(index, item);
+    }
+
+    /// Removes the item at `index`, returning it.
+    pub fn remove_at(&mut self, index: usize) -> Option<Item> {
+        (index < self.items.len()).then(|| self.items.remove(index))
     }
 
     /// Removes `item`, returning the z-position it had.
@@ -229,9 +269,129 @@ impl Scene {
     /// The position is returned rather than ignored because undo has to put the
     /// item back where it was, not on top.
     pub fn remove(&mut self, item: ItemId) -> Option<usize> {
-        let position = self.items.iter().position(|entry| entry.id() == item)?;
+        let position = self.position(item)?;
         self.items.remove(position);
         Some(position)
+    }
+
+    /// Reorders the items to match `order`.
+    ///
+    /// Ids missing from `order` keep their relative order after the listed
+    /// ones, so a stale order can never drop items from the board.
+    pub fn reorder(&mut self, order: &[ItemId]) {
+        let mut remaining = std::mem::take(&mut self.items);
+        let mut ordered = Vec::with_capacity(remaining.len());
+        for id in order {
+            if let Some(index) = remaining.iter().position(|item| item.id() == *id) {
+                ordered.push(remaining.remove(index));
+            }
+        }
+        ordered.append(&mut remaining);
+        self.items = ordered;
+    }
+
+    /// The group tree.
+    pub fn groups(&self) -> &Groups {
+        &self.groups
+    }
+
+    /// The group tree for mutation, through the commands' helpers.
+    pub fn groups_mut(&mut self) -> &mut Groups {
+        &mut self.groups
+    }
+
+    /// The group with `id`, if present.
+    pub fn group(&self, id: GroupId) -> Option<&Group> {
+        self.groups.get(id)
+    }
+
+    /// Allocates the next group id.
+    pub fn allocate_group_id(&mut self) -> GroupId {
+        let highest = self
+            .groups
+            .iter()
+            .map(|group| group.id().raw())
+            .max()
+            .unwrap_or(0);
+        self.next_group = self.next_group.max(highest + 1);
+        let id = GroupId::from_raw(self.next_group);
+        self.next_group += 1;
+        id
+    }
+
+    /// Inserts a group node, keeping the id high-water mark.
+    pub fn insert_group(&mut self, group: Group) {
+        self.next_group = self.next_group.max(group.id().raw() + 1);
+        self.groups.insert(group);
+    }
+
+    /// Removes the group node, leaving its children parentless.
+    pub fn remove_group(&mut self, id: GroupId) -> Option<Group> {
+        self.groups.remove(id)
+    }
+
+    /// Creates a group and detaches its children from their previous parents.
+    ///
+    /// Returns the memberships that were removed, in detach order: undo walks
+    /// them in reverse, which restores the original child indices even when two
+    /// members shared a parent.
+    pub fn attach_group(
+        &mut self,
+        id: GroupId,
+        children: Vec<GroupChild>,
+    ) -> Vec<(GroupId, usize, GroupChild)> {
+        let mut seen = BTreeSet::new();
+        let mut detached = Vec::new();
+        let mut members = Vec::new();
+        for child in children {
+            if !seen.insert(child) {
+                continue;
+            }
+            if let Some((parent, index)) = self.groups.detach(child) {
+                detached.push((parent, index, child));
+            }
+            members.push(child);
+        }
+        self.insert_group(Group::new(id, members));
+        detached
+    }
+
+    /// Removes `child` from its parent, returning the parent and slot.
+    pub fn detach_child(&mut self, child: GroupChild) -> Option<(GroupId, usize)> {
+        self.groups.detach(child)
+    }
+
+    /// Adds `child` to `parent` at `index` (clamped).
+    pub fn attach_child(
+        &mut self,
+        parent: Option<GroupId>,
+        child: GroupChild,
+        index: Option<usize>,
+    ) {
+        self.groups.attach(parent, child, index);
+    }
+
+    /// The leaf items under `group`.
+    pub fn group_leaves(&self, group: GroupId) -> Vec<ItemId> {
+        self.groups.leaves(group)
+    }
+
+    /// The items a click on `item` should select: the whole outermost group,
+    /// or the item itself when it is not grouped.
+    pub fn expand_item(&self, item: ItemId) -> BTreeSet<ItemId> {
+        match self.groups.top_group_of_item(item) {
+            Some(group) => self.groups.leaves(group).into_iter().collect(),
+            None => std::iter::once(item).collect(),
+        }
+    }
+
+    /// Expands a set of item ids to whole groups.
+    pub fn expand_selection(&self, items: impl IntoIterator<Item = ItemId>) -> BTreeSet<ItemId> {
+        let mut out = BTreeSet::new();
+        for item in items {
+            out.extend(self.expand_item(item));
+        }
+        out
     }
 }
 
@@ -239,7 +399,8 @@ impl Scene {
 mod tests {
     use super::{ItemId, Scene, SceneId};
     use crate::asset::{Asset, AssetId};
-    use crate::item::ImageItem;
+    use crate::group::{GroupChild, GroupId};
+    use crate::item::Item;
     use glam::Vec2;
     use rizref_codecs::{ImageBuffer, ImageFormat};
     use std::sync::Arc;
@@ -297,6 +458,7 @@ mod tests {
         assert!(scene.is_empty());
         assert_eq!(scene.len(), 0);
         assert_eq!(scene.id, scene_id());
+        assert!(scene.groups().is_empty());
     }
 
     #[test]
@@ -313,7 +475,7 @@ mod tests {
         assert_eq!(scene.len(), 2);
         assert!(!scene.is_empty());
         assert_eq!(
-            scene.items.iter().map(ImageItem::id).collect::<Vec<_>>(),
+            scene.items.iter().map(Item::id).collect::<Vec<_>>(),
             vec![bottom, top]
         );
         assert!(scene.contains(bottom) && scene.contains(top));
@@ -366,10 +528,143 @@ mod tests {
 
         assert_eq!(scene.remove(items[1]), Some(1));
         assert_eq!(
-            scene.items.iter().map(ImageItem::id).collect::<Vec<_>>(),
+            scene.items.iter().map(Item::id).collect::<Vec<_>>(),
             vec![items[0], items[2]]
         );
         assert_eq!(scene.remove(items[1]), None, "removing twice is a no-op");
         assert!(!scene.contains(items[1]));
+    }
+
+    #[test]
+    fn notes_are_items_without_assets() {
+        let mut scene = Scene::new(scene_id());
+
+        let note = scene.insert_note("study this", Vec2::ZERO, Vec2::splat(100.0));
+
+        assert!(scene.item(note).expect("note").is_note());
+        assert_eq!(scene.item(note).expect("note").text(), Some("study this"));
+        assert!(scene.assets().is_empty());
+    }
+
+    #[test]
+    fn inserting_at_a_position_restores_z_order() {
+        let mut scene = Scene::new(scene_id());
+        let asset = insert_asset(&mut scene, b"three items");
+        let ids: Vec<ItemId> = (0..3)
+            .map(|index| {
+                scene
+                    .insert_image(asset, Vec2::splat(index as f32), Vec2::splat(4.0))
+                    .expect("asset is stored")
+            })
+            .collect();
+
+        let removed = scene.remove_at(1).expect("the middle item");
+        assert_eq!(removed.id(), ids[1]);
+        scene.insert_item_at(1, removed);
+        assert_eq!(
+            scene.items.iter().map(Item::id).collect::<Vec<_>>(),
+            ids,
+            "the item is back in the middle, not on top"
+        );
+    }
+
+    #[test]
+    fn reorder_puts_listed_ids_first_and_keeps_the_rest() {
+        let mut scene = Scene::new(scene_id());
+        let asset = insert_asset(&mut scene, b"three items");
+        let ids: Vec<ItemId> = (0..3)
+            .map(|index| {
+                scene
+                    .insert_image(asset, Vec2::splat(index as f32), Vec2::splat(4.0))
+                    .expect("asset is stored")
+            })
+            .collect();
+
+        scene.reorder(&[ids[2], ids[0]]);
+
+        assert_eq!(
+            scene.items.iter().map(Item::id).collect::<Vec<_>>(),
+            vec![ids[2], ids[0], ids[1]]
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_grouped_item_expands_to_the_group() {
+        let mut scene = Scene::new(scene_id());
+        let a = scene.insert_note("a", Vec2::ZERO, Vec2::splat(10.0));
+        let b = scene.insert_note("b", Vec2::splat(20.0), Vec2::splat(10.0));
+        let c = scene.insert_note("c", Vec2::splat(40.0), Vec2::splat(10.0));
+        let group = scene.allocate_group_id();
+        scene.attach_group(group, vec![GroupChild::Item(a), GroupChild::Item(b)]);
+
+        let expanded = scene.expand_item(b);
+        assert_eq!(expanded, [a, b].into_iter().collect());
+        assert_eq!(scene.expand_item(c), [c].into_iter().collect());
+    }
+
+    #[test]
+    fn attaching_a_group_detaches_members_from_their_previous_parents() {
+        let mut scene = Scene::new(scene_id());
+        let a = scene.insert_note("a", Vec2::ZERO, Vec2::splat(10.0));
+        let b = scene.insert_note("b", Vec2::splat(20.0), Vec2::splat(10.0));
+        let first = scene.allocate_group_id();
+        scene.attach_group(first, vec![GroupChild::Item(a), GroupChild::Item(b)]);
+
+        let second = scene.allocate_group_id();
+        let detached = scene.attach_group(second, vec![GroupChild::Item(b)]);
+
+        assert_eq!(detached.len(), 1);
+        assert_eq!(scene.group_leaves(first), vec![a], "b left its old group");
+        assert_eq!(scene.group_leaves(second), vec![b]);
+        assert_eq!(
+            scene.groups().top_group_of_item(b),
+            Some(second),
+            "and belongs to the new one"
+        );
+    }
+
+    #[test]
+    fn group_ids_are_not_serialised_so_undo_can_be_byte_identical() {
+        let mut scene = Scene::new(scene_id());
+        scene.insert_note("a", Vec2::ZERO, Vec2::splat(10.0));
+        let before = serde_json::to_vec(&scene).expect("serialises");
+
+        let id = scene.allocate_item_id();
+        scene.push_note_with_id(id);
+        let after = serde_json::to_vec(&scene).expect("serialises");
+        assert_ne!(before, after);
+
+        scene.remove(id);
+        assert_eq!(
+            serde_json::to_vec(&scene).expect("serialises"),
+            before,
+            "removing the item restores the serialised bytes"
+        );
+    }
+
+    impl Scene {
+        /// Test helper: push a note with an explicit id.
+        fn push_note_with_id(&mut self, id: ItemId) {
+            self.insert_item_at(
+                self.items.len(),
+                Item::note(id, "x", Vec2::ZERO, Vec2::splat(10.0)),
+            );
+        }
+    }
+
+    #[test]
+    fn a_nested_group_walk_is_bounded() {
+        let mut scene = Scene::new(scene_id());
+        let item = scene.insert_note("a", Vec2::ZERO, Vec2::splat(10.0));
+        let inner = scene.allocate_group_id();
+        scene.attach_group(inner, vec![GroupChild::Item(item)]);
+        let outer = scene.allocate_group_id();
+        scene.attach_group(outer, vec![GroupChild::Group(inner)]);
+
+        assert_eq!(scene.group_leaves(outer), vec![item]);
+        assert_eq!(
+            scene.groups().top_group_of_item(item),
+            Some(GroupId::from_raw(outer.raw()))
+        );
     }
 }

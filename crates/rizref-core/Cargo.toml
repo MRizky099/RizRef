@@ -15,6 +15,10 @@ serde.workspace = true
 # Content identity for assets: the checksum of the original encoded bytes.
 blake3.workspace = true
 
+[dev-dependencies]
+# The undo acceptance check compares serialised scene bytes.
+serde_json.workspace = true
+
 # `harness = false`: stable Rust has no `#[bench]`, so the target is a small
 # program that prints its own timings. `test = false` keeps `cargo test` from
 # running those timings as a unit test.

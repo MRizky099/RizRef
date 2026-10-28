@@ -2,6 +2,43 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Phase 04 — Items & Manipulation (done)
+
+Implemented 2026-10-29; opened as PR #16 (branch `feat/phase-04-items-and-manipulation`,
+closes issue #5).
+
+- `rizref-core`: `Transform` (centre/size/rotation, oriented hit-test, exact
+  separating-axis rectangle test), a unified `Item` with `ItemBody::Image`/`Note` and
+  UV-mirror flips, `Groups` (exclusive parentage, recursive with a depth guard),
+  `Snapping` with guides and screen-pixel tolerance, and pure `arrange`/`align`/
+  `distribute`/`match_size` functions.
+- `rizref-core`: one command stack for every mutation — `SetTransforms`, `AddItems`,
+  `RemoveItems`, `ReorderItems`, `SetNoteText`, `AddGroup`, `DissolveGroup` — each
+  returning `Effects` (geometry/content/added/removed/order/groups). History depth
+  200; key-repeat nudges coalesce inside 100 ms, gestures stay discrete. Undo-all
+  reproduces the serialised scene byte-for-byte (session high-water marks are not
+  serialised).
+- `rizref`: new `Board` controller — click/shift-click selection with group expansion,
+  marquee (exact against rotated items), move, eight-handle scale (centre pivot,
+  `alt` = opposite corner, `shift` = aspect), rotate (15° steps), flips, nudges,
+  duplicate/delete, z-order, grouping, arrange/align/distribute, note creation and
+  text commits. The scripted 20-item acceptance test drives it through synthetic
+  pointer events and checks exact geometry through undo and redo.
+- `rizref`: screen-space overlay pipeline (a fourth pass in `canvas.wgsl`) for item
+  outlines, hover, the selection frame, handles, rotate handle, marquee and smart
+  guides. Handles stay 9 px and guides 1 px at 5% and 3200% zoom.
+- `rizref`: notes — cosmic-text `Editor` sessions (caret, arrows, delete/backspace,
+  Enter, Ctrl+A, text paste), rounded-card rasterisation through tiny-skia, and
+  content-addressed textures so identical notes share one GPU texture. `N` creates a
+  note; double-click edits; Escape or clicking outside commits one undo step.
+- `rizref`: HUD readout now includes the selection count and bounding size; the cursor
+  switches between move/grab/resize/rotate/text/crosshair; the input table gained the
+  item shortcuts (`ctrl+A/D/G/Z/Y`, `del`, arrows, `pgup/pgdn/home/end`, `shift+H/V`,
+  `ctrl+shift+W/H/R`, `3/4/5/6`, `ctrl+shift+arrows`, `ctrl+shift+,/.`).
+- Verification: 393 workspace tests, clippy and rustfmt clean; the offscreen GPU test
+  renders the overlay pipeline; an 8-second smoke launch creates the window and
+  Vulkan surface without a validation error.
+
 ## Phase 03 — Image Pipeline (done)
 
 Merged 2026-10-29 in PR #14 (decode, drop, paste, cache) and PR #15 (HEIC in Rust,
