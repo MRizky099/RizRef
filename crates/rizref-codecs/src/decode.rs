@@ -815,6 +815,64 @@ mod tests {
             .expect("a 32-bit entry indexes no palette");
     }
 
+    /// Wraps one entry in the smallest legal `ICONDIR`.
+    fn ico_file(entry: &[u8], width: u8, height: u8, bits: u16) -> Vec<u8> {
+        let mut file = vec![0, 0, 1, 0, 1, 0];
+        file.extend_from_slice(&[width, height, 0, 0]);
+        file.extend_from_slice(&1_u16.to_le_bytes());
+        file.extend_from_slice(&bits.to_le_bytes());
+        file.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        file.extend_from_slice(&22_u32.to_le_bytes());
+        file.extend_from_slice(entry);
+        file
+    }
+
+    /// Deterministic pseudo-random source, so the sweep is reproducible.
+    fn next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    #[test]
+    fn a_generated_ico_sweep_never_panics() {
+        // A miniature deterministic fuzzer: the `ico` crate has several
+        // unchecked index paths, and every one the soak found is in this
+        // space. Five thousand entries run in milliseconds, so a regression
+        // shows up in `cargo test` instead of a 10-minute CI soak.
+        let depths = [1_u16, 4, 8, 16, 24, 32];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+
+        for _ in 0..20_000 {
+            let width = (next(&mut state) % 80) as i32 + 1;
+            let height = ((next(&mut state) % 20) as i32 + 1) * 2;
+            let bits = depths[(next(&mut state) % depths.len() as u64) as usize];
+            let colors_used = (next(&mut state) % 300) as u32;
+            let palette = (next(&mut state) % 300) as usize;
+            let pixel_len = (next(&mut state) % 400) as usize;
+            let mut pixels = vec![0_u8; pixel_len];
+            for byte in &mut pixels {
+                *byte = next(&mut state) as u8;
+            }
+
+            let entry = bmp_entry(width, height, bits, colors_used, palette, &pixels);
+            let file = ico_file(
+                &entry,
+                width.min(255) as u8,
+                (height / 2).min(255) as u8,
+                bits,
+            );
+
+            let outcome = std::panic::catch_unwind(|| decode(&file));
+            assert!(
+                outcome.is_ok(),
+                "decode panicked on width {width}, height {height}, bits {bits}, \
+                 colours {colors_used}, palette {palette}, {pixel_len} pixel bytes"
+            );
+        }
+    }
+
     #[test]
     fn ico_uses_the_largest_embedded_image() {
         let small = ico::IconImage::from_rgba_data(2, 2, vec![0; 2 * 2 * 4]);
