@@ -21,7 +21,7 @@ use glam::Vec2;
 use rizref_codecs::{CodecError, DecodeLimits, ImageBuffer, ImageFormat, decode_as_with_limits};
 use rizref_core::{Animation, AnimationFrame, Fitted, checksum, fit_to_side, generate_preview};
 
-use crate::platform::heif;
+use crate::platform::imaging;
 use crate::textures::MAX_TEXTURE_SIDE;
 
 /// One image to import: a path to read, or bytes already in hand.
@@ -281,25 +281,16 @@ fn import(source: &ImportSource) -> Result<ImportedImage, ImportError> {
     )
     .entered();
     let limits = DecodeLimits::default();
-    // HEIF is the one format this build cannot decode in Rust; the OS codec
-    // does it instead (see `platform::heif`).
-    let (image, animation) = if format == ImageFormat::Heif {
-        let image = heif::decode(&bytes, limits).map_err(|error| ImportError {
-            label: source.label.clone(),
-            reason: error.to_string(),
-        })?;
-        (image, None)
+    // Every format decodes in Rust except AVIF; the OS codec also stands behind
+    // HEIC when `heic-rs` declines a coding tool it does not implement.
+    let image = decode_image(&bytes, format, limits).map_err(|error| ImportError {
+        label: source.label.clone(),
+        reason: error.to_string(),
+    })?;
+    let animation = if format == ImageFormat::Gif {
+        animation_of(&bytes, limits, &source.label)
     } else {
-        let image = decode_as_with_limits(&bytes, format, limits).map_err(|error| ImportError {
-            label: source.label.clone(),
-            reason: error.to_string(),
-        })?;
-        let animation = if format == ImageFormat::Gif {
-            animation_of(&bytes, limits, &source.label)
-        } else {
-            None
-        };
-        (image, animation)
+        None
     };
 
     let checksum = checksum(&bytes);
@@ -332,6 +323,34 @@ fn import(source: &ImportSource) -> Result<ImportedImage, ImportError> {
         animation,
         checksum,
     })
+}
+
+/// Decodes one file, with the OS codec as the fallback for the ISOBMFF family.
+///
+/// `rizref-codecs` reads HEIC itself; AVIF it hands over untouched, because no
+/// pure-Rust AV1 decoder builds without an external assembler. Both fall back to
+/// Windows Imaging Component when the Rust path declines: a coding tool the
+/// young HEVC decoder does not implement yet, or the AV1 extension's codec
+/// being the only AV1 decoder on the machine.
+fn decode_image(
+    bytes: &[u8],
+    format: ImageFormat,
+    limits: DecodeLimits,
+) -> Result<ImageBuffer, CodecError> {
+    match decode_as_with_limits(bytes, format, limits) {
+        Ok(image) => Ok(image),
+        Err(error @ CodecError::Unsupported { .. })
+            if matches!(format, ImageFormat::Heif | ImageFormat::Avif) =>
+        {
+            tracing::debug!(
+                ?format,
+                reason = %error,
+                "falling back to the operating system image codec"
+            );
+            imaging::decode(bytes, limits, format)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Decodes a GIF's frames, or `None` when it is a still image.

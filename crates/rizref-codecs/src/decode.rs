@@ -82,10 +82,12 @@ pub fn decode_as_with_limits(
             decode_plain(bytes, format, limits)
         }
         ImageFormat::Ico => decode_ico(bytes, limits),
-        ImageFormat::Heif => Err(CodecError::Unsupported {
+        ImageFormat::Heif => crate::heif::decode(bytes, limits),
+        ImageFormat::Avif => Err(CodecError::Unsupported {
             format,
-            detail: "no pure-Rust decoder in this build; HEIC is an accepted gap until a \
-                     pure-Rust decoder exists"
+            detail: "AVIF is decoded by the application through the operating system codec \
+                     (`rizref::platform::heif`); this crate carries no AV1 decoder because none \
+                     builds without an external assembler"
                 .to_owned(),
         }),
     }
@@ -894,24 +896,43 @@ mod tests {
     }
 
     #[test]
-    fn a_heic_is_recognised_and_explained_rather_than_called_corrupt() {
+    fn a_heic_header_without_pictures_is_a_decode_error() {
+        // The container is recognised and handed to `heic-rs`, which finds the
+        // `ftyp` box and then nothing to decode. That is a decode failure, not
+        // "unsupported": HEIC is a format this build reads.
         let mut bytes = 24_u32.to_be_bytes().to_vec();
         bytes.extend_from_slice(b"ftypheic");
         bytes.extend_from_slice(&[0; 8]);
 
-        let error = decode(&bytes).expect_err("HEIC is not decodable yet");
+        let error = decode(&bytes).expect_err("no image item in the file");
 
         assert!(
             matches!(
                 error,
-                CodecError::Unsupported {
+                CodecError::Decode {
                     format: ImageFormat::Heif,
                     ..
                 }
             ),
             "unexpected error: {error:?}"
         );
-        assert!(error.to_string().contains("not supported yet"));
+    }
+
+    #[test]
+    fn avif_reports_that_the_application_decodes_it_through_the_os() {
+        let mut bytes = 24_u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"ftypavif");
+        bytes.extend_from_slice(&[0; 8]);
+
+        let error = decode(&bytes).expect_err("this crate carries no AV1 decoder");
+
+        match error {
+            CodecError::Unsupported { format, detail } => {
+                assert_eq!(format, ImageFormat::Avif);
+                assert!(detail.contains("operating system"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

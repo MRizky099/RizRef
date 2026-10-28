@@ -93,6 +93,7 @@ jobs:
           - decode_webp
           - decode_plain
           - decode_ico
+          - decode_heif
     env:
       # The workspace pins stable in `rust-toolchain.toml`, and that directory
       # override beats the toolchain installed above — which is why fuzzing used

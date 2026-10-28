@@ -1,15 +1,21 @@
-//! HEIF/HEIC through Windows Imaging Component.
+//! The ISOBMFF image families through Windows Imaging Component.
 //!
-//! No pure-Rust HEVC-based HEIF decoder exists, so this format is not decoded by
-//! `rizref-codecs`; it is bridged through the operating system instead. WIC
-//! decodes HEIF when the **HEIF Image Extension** is installed — it ships with
-//! Windows 11 and is a free install from the Store on Windows 10 — and WIC's
-//! HEVC support is what the Photos app itself uses.
+//! HEIC is decoded in Rust (`rizref-codecs::heif`, backed by `heic-rs`), so this
+//! bridge exists for the two cases the Rust path cannot serve:
 //!
-//! This keeps two rules intact: `rizref-codecs` stays free of C dependencies,
-//! and everything that touches the platform stays in `rizref/src/platform/`.
-//! The cost is that a machine without the extension cannot open HEIC files, so
-//! that case is reported as *install the extension*, not as a corrupt file.
+//! * **AVIF**, which shares the HEIF container but holds an AV1 codestream. No
+//!   pure-Rust AV1 decoder builds without an external assembler — `avif-decode`
+//!   pulls `rav1d` with its `asm` feature, which fails on a machine without
+//!   NASM — so AVIF is read through the OS instead.
+//! * **HEIC files that use a coding tool `heic-rs` does not implement yet**, for
+//!   which the HEVC decoder in the HEIF Image Extension is the fallback.
+//!
+//! WIC opens both containers through the same HEIF container class; what makes
+//! the pixels appear is the codec installed for the codestream inside — the
+//! **HEIF Image Extension** for HEVC and the **AV1 Video Extension** for AVIF.
+//! Both ship with Windows 11 and install free from the Store on Windows 10. When
+//! the codec is missing, WIC reports `MF_E_TOPO_CODEC_NOT_FOUND`, and that is
+//! turned into a message naming the package rather than into "corrupt file".
 //!
 //! # Threading
 //!
@@ -33,61 +39,60 @@ use windows::Win32::Graphics::Imaging::{
 use windows::Win32::System::Com::CoInitializeEx;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance};
 use windows::Win32::UI::Shell::SHCreateMemStream;
-use windows::core::GUID;
 
 /// `WINCODEC_ERR_COMPONENTNOTFOUND`: the container is known but no installed
-/// codec can decode it, which for HEIF means the extension is missing.
+/// codec can open it at all.
 const WINCODEC_ERR_COMPONENTNOTFOUND: i32 = 0x8898_2F50_u32 as i32;
 
+/// `MF_E_TOPO_CODEC_NOT_FOUND`: the container opened, the codestream inside has
+/// no installed decoder. This is what an AVIF file reports without the AV1
+/// extension, and a HEIC without the HEIF extension.
+const MF_E_TOPO_CODEC_NOT_FOUND: i32 = 0xC00D_5212_u32 as i32;
+
 /// `WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT`: the file decoded but could not be
-/// converted to 8-bit RGBA — a 10-bit or float HEIC on an older codec.
+/// converted to 8-bit RGBA.
 const WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT: i32 = 0x8898_2F30_u32 as i32;
 
-/// Message shown when the HEIF codec is not installed.
-pub const MISSING_CODEC_HINT: &str = "HEIC/HEIF needs the free \"HEIF Image Extensions\" package \
-     from the Microsoft Store on this machine";
-
-/// Whether this machine can decode HEIF through WIC.
-///
-/// Probes by asking WIC for a HEIF decoder, which fails exactly when the
-/// extension is absent. Cheap enough for a startup log line; not something to
-/// call per file.
-pub fn supported() -> bool {
-    let Some(factory) = factory() else {
-        return false;
-    };
-    // SAFETY: `CreateDecoder` only consults the installed codecs; a null vendor
-    // GUID is the documented "any vendor" request and no stream is touched.
-    unsafe { factory.CreateDecoder(&GUID_CONTAINER_FORMAT_HEIF, std::ptr::null()) }.is_ok()
+/// What to install when the codec for `format` is absent.
+fn missing_codec_hint(format: ImageFormat) -> String {
+    match format {
+        ImageFormat::Avif => "AVIF needs the free \"AV1 Video Extension\" package from the \
+                              Microsoft Store on this machine"
+            .to_owned(),
+        _ => "HEIC/HEIF needs the free \"HEIF Image Extensions\" package from the Microsoft \
+               Store on this machine"
+            .to_owned(),
+    }
 }
 
-/// Decodes a HEIF/HEIC file into the canonical RGBA buffer.
-pub fn decode(bytes: &[u8], limits: DecodeLimits) -> Result<ImageBuffer, CodecError> {
+/// Decodes an ISOBMFF image (`Heif` or `Avif`) into the canonical RGBA buffer.
+pub fn decode(
+    bytes: &[u8],
+    limits: DecodeLimits,
+    format: ImageFormat,
+) -> Result<ImageBuffer, CodecError> {
     decode_inner(bytes, limits).map_err(|error| match error {
         WicError::Hresult(hresult) => {
             let code = hresult.0;
-            if code == WINCODEC_ERR_COMPONENTNOTFOUND {
+            if code == MF_E_TOPO_CODEC_NOT_FOUND || code == WINCODEC_ERR_COMPONENTNOTFOUND {
                 CodecError::Unsupported {
-                    format: ImageFormat::Heif,
-                    detail: MISSING_CODEC_HINT.to_owned(),
+                    format,
+                    detail: missing_codec_hint(format),
                 }
             } else if code == WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT {
                 CodecError::Unsupported {
-                    format: ImageFormat::Heif,
-                    detail: "this HEIC uses a pixel format the installed codec cannot convert"
+                    format,
+                    detail: "this image uses a pixel format the installed codec cannot convert"
                         .to_owned(),
                 }
             } else {
                 CodecError::Decode {
-                    format: ImageFormat::Heif,
-                    reason: format!("WIC failed with 0x{:08x}", hresult.0),
+                    format,
+                    reason: format!("the OS image codec failed with 0x{:08x}", hresult.0),
                 }
             }
         }
-        WicError::Reason(reason) => CodecError::Decode {
-            format: ImageFormat::Heif,
-            reason,
-        },
+        WicError::Reason(reason) => CodecError::Decode { format, reason },
         WicError::TooLarge { width, height } => CodecError::TooLarge { width, height },
     })
 }
@@ -189,44 +194,38 @@ fn factory() -> Option<IWICImagingFactory> {
     }
 }
 
-/// The HEIF container GUID, re-exported under a local name for readability.
-const GUID_CONTAINER_FORMAT_HEIF: GUID =
-    windows::Win32::Graphics::Imaging::GUID_ContainerFormatHeif;
-
 #[cfg(test)]
 mod tests {
-    use super::{MISSING_CODEC_HINT, decode, decode_inner, supported};
+    use super::{decode, decode_inner, missing_codec_hint};
     use rizref_codecs::{CodecError, DecodeLimits, ImageBuffer, ImageFormat};
 
     #[test]
-    fn the_probe_answers_without_panicking() {
-        // Either answer is legitimate: CI images usually lack the HEIF
-        // extension, and a developer machine usually has it.
-        let _ = supported();
+    fn the_hint_names_the_package_for_each_family() {
+        assert!(missing_codec_hint(ImageFormat::Avif).contains("AV1 Video Extension"));
+        assert!(missing_codec_hint(ImageFormat::Heif).contains("HEIF Image Extensions"));
     }
 
     #[test]
     fn garbage_bytes_are_reported_not_panicked_on() {
-        let outcome =
-            std::panic::catch_unwind(|| decode(b"not a heif file", DecodeLimits::default()));
+        let outcome = std::panic::catch_unwind(|| {
+            decode(
+                b"not a heif file",
+                DecodeLimits::default(),
+                ImageFormat::Avif,
+            )
+        });
 
-        let result = outcome.expect("decode must not panic");
-        assert!(result.is_err(), "garbage is not an image");
+        assert!(outcome.expect("decode must not panic").is_err());
     }
 
     #[test]
-    fn the_missing_codec_message_names_the_extension() {
-        assert!(MISSING_CODEC_HINT.contains("HEIF Image Extensions"));
-        assert!(MISSING_CODEC_HINT.to_lowercase().contains("store"));
-    }
-
-    #[test]
-    fn a_heic_that_cannot_be_decoded_says_so_with_its_format() {
-        let error = decode(&[], DecodeLimits::default()).expect_err("empty input");
+    fn a_failure_carries_the_format_that_was_requested() {
+        let error =
+            decode(&[], DecodeLimits::default(), ImageFormat::Avif).expect_err("empty input");
 
         match error {
             CodecError::Decode { format, .. } | CodecError::Unsupported { format, .. } => {
-                assert_eq!(format, ImageFormat::Heif)
+                assert_eq!(format, ImageFormat::Avif)
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -236,8 +235,8 @@ mod tests {
     fn the_wic_pipeline_decodes_a_normal_image_end_to_end() {
         // The bridge is container-agnostic: WIC sniffs the stream itself, so a
         // PNG exercises the whole COM → decoder → converter → CopyPixels path
-        // even on machines without the HEIF extension. That keeps the plumbing
-        // covered when HEIC itself cannot be decoded.
+        // even on machines without the HEIF or AV1 extensions. That keeps the
+        // plumbing covered when the real formats cannot be decoded in CI.
         let original = ImageBuffer::from_rgba(
             2,
             1,

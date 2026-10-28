@@ -63,3 +63,10 @@ path = "fuzz_targets/decode_ico.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_heif"
+path = "fuzz_targets/decode_heif.rs"
+test = false
+doc = false
+bench = false

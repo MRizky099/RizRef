@@ -772,6 +772,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "heic-rs"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8883c3bfa6b4ff19a40e52a6dc051c5612cbe21bf408fc6d4875e8dfd777cb66"
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1860,6 +1866,7 @@ name = "rizref-codecs"
 version = "0.1.0"
 dependencies = [
  "gif",
+ "heic-rs",
  "ico",
  "image",
  "image-webp",

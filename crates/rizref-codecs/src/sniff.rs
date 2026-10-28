@@ -11,9 +11,9 @@
 //! caller already knows the format, which in practice means
 //! [`ImageFormat::from_extension`] on the file name.
 //!
-//! HEIF/HEIC/AVIF are recognised through their ISO-BMFF `ftyp` brand so that the
-//! answer to "why does this HEIC not open?" is a specific message instead of
-//! "unrecognised file".
+//! HEIF/HEIC and AVIF are recognised through their ISO-BMFF `ftyp` brand, which
+//! is what keeps "why does this HEIC not open?" answerable with a specific
+//! message instead of "unrecognised file".
 
 /// An image format RizRef can recognise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,13 +37,19 @@ pub enum ImageFormat {
     Qoi,
     /// Windows icon; the largest embedded image is used.
     Ico,
-    /// The HEIF/HEIC/AVIF family. Recognised, not decoded: see the crate docs.
+    /// HEIF/HEIC still images, decoded in Rust by the [`crate::heif`] module.
     Heif,
+    /// AVIF (AV1 inside the same ISOBMFF container family).
+    ///
+    /// Recognised here, but decoded by the application through the operating
+    /// system codec: no pure-Rust AV1 decoder is buildable without an external
+    /// assembler, so `rizref-codecs` does not carry one. See the crate docs.
+    Avif,
 }
 
 impl ImageFormat {
     /// Every format this build recognises.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Png,
         Self::Jpeg,
         Self::Gif,
@@ -54,6 +60,7 @@ impl ImageFormat {
         Self::Qoi,
         Self::Ico,
         Self::Heif,
+        Self::Avif,
     ];
 
     /// Human-readable name, for messages.
@@ -69,6 +76,7 @@ impl ImageFormat {
             Self::Qoi => "QOI",
             Self::Ico => "ICO",
             Self::Heif => "HEIF",
+            Self::Avif => "AVIF",
         }
     }
 
@@ -85,12 +93,16 @@ impl ImageFormat {
             Self::Qoi => "qoi",
             Self::Ico => "ico",
             Self::Heif => "heic",
+            Self::Avif => "avif",
         }
     }
 
-    /// Whether this build can decode the format.
+    /// Whether this crate can decode the format by itself.
+    ///
+    /// `false` for AVIF only: the application decodes it through the operating
+    /// system codec, which this crate deliberately does not depend on.
     pub const fn is_decodable(self) -> bool {
-        !matches!(self, Self::Heif)
+        !matches!(self, Self::Avif)
     }
 
     /// The format a file extension names.
@@ -151,11 +163,7 @@ pub fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
     if is_pnm(bytes) {
         return Some(ImageFormat::Pnm);
     }
-    if is_iso_bmff_image(bytes) {
-        return Some(ImageFormat::Heif);
-    }
-
-    None
+    iso_bmff_image(bytes)
 }
 
 /// Whether `bytes` opens with a PNM magic number followed by whitespace.
@@ -167,19 +175,23 @@ fn is_pnm(bytes: &[u8]) -> bool {
     matches!(bytes, [b'P', b'1'..=b'7', b' ' | b'\t' | b'\r' | b'\n', ..])
 }
 
-/// Whether `bytes` is an ISO base media file whose brand names an image format
-/// this build recognises but does not decode (HEIC, HEIF, AVIF).
+/// The image format of an ISO base media file, judged by its `ftyp` brand.
 ///
 /// The brand lives in the `ftyp` box: bytes 4..8 are the box type and 8..12 the
-/// major brand.
-fn is_iso_bmff_image(bytes: &[u8]) -> bool {
+/// major brand. HEIC and generic HEIF share the `mif1`/`msf1` structural brands;
+/// AVIF has its own (`avif`, `avis` for sequences), which is why the two are
+/// separate formats here even though one decoder family reads both containers.
+fn iso_bmff_image(bytes: &[u8]) -> Option<ImageFormat> {
     if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
-        return false;
+        return None;
     }
-    matches!(
-        &bytes[8..12],
-        b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"mif1" | b"msf1" | b"avif"
-    )
+    match &bytes[8..12] {
+        b"avif" | b"avis" => Some(ImageFormat::Avif),
+        b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"mif1" | b"msf1" => {
+            Some(ImageFormat::Heif)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -247,13 +259,23 @@ mod tests {
     }
 
     #[test]
-    fn heif_family_is_recognised_so_its_gap_can_be_explained() {
+    fn the_iso_bmff_family_is_split_into_heif_and_avif() {
         assert_eq!(sniff(&heic()), Some(ImageFormat::Heif));
+        assert_eq!(
+            sniff(b"\x00\x00\x00\x14ftypmif1\x00\x00\x00\x00"),
+            Some(ImageFormat::Heif)
+        );
 
         let mut avif = 20_u32.to_be_bytes().to_vec();
         avif.extend_from_slice(b"ftypavif");
         avif.extend_from_slice(b"mif1");
-        assert_eq!(sniff(&avif), Some(ImageFormat::Heif));
+        assert_eq!(sniff(&avif), Some(ImageFormat::Avif));
+
+        // A sequence brand is still AVIF: the first frame is what a board shows.
+        let mut sequence = 20_u32.to_be_bytes().to_vec();
+        sequence.extend_from_slice(b"ftypavis");
+        sequence.extend_from_slice(b"msf1");
+        assert_eq!(sniff(&sequence), Some(ImageFormat::Avif));
 
         // An MP4 shares the container but is not an image format we claim.
         let mut mp4 = 24_u32.to_be_bytes().to_vec();
@@ -337,11 +359,11 @@ mod tests {
     }
 
     #[test]
-    fn only_heif_is_known_but_undecodable() {
+    fn only_avif_needs_the_operating_system_codec() {
         for format in ImageFormat::ALL {
             assert_eq!(
                 format.is_decodable(),
-                format != ImageFormat::Heif,
+                format != ImageFormat::Avif,
                 "{format:?}"
             );
         }

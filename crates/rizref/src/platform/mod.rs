@@ -26,7 +26,7 @@
 //! this module is the point: the rest of the application stays safe Rust.
 
 pub mod drop_target;
-pub mod heif;
+pub mod imaging;
 pub mod message_box;
 pub mod single_instance;
 

@@ -73,6 +73,8 @@ between crates. These are the pinned versions:
 | GIF | `gif` | 0.14.2 | every frame, composed and timed (animated on the board) |
 | BMP, TGA, PNM, QOI | `image` | 0.25.10 | `default-features = false`; only those four backends |
 | ICO | `ico` | 0.6.0 | largest embedded image wins |
+| HEIF/HEIC | `heic-rs` | 0.1.4 | pure Rust, no `unsafe`, no build script; `parallel` off |
+| AVIF | none (OS bridge) | — | Windows codec; needs the AV1 Video Extension |
 | Clipboard | `arboard` | 3.7.0 | OS FFI only |
 | Native dialogs | `rfd` | 0.17.2 | COM `IFileDialog` FFI |
 | Import workers | `crossbeam-channel` | 0.5.17 | pure Rust, no async runtime |
@@ -112,14 +114,18 @@ Two deliberate exclusions, both recorded rather than hidden:
   (`tiny-skia`, already a dependency), not OpenGL. Revisiting this means either accepting
   `glutin_wgl_sys` as an FFI-only exception or building the CPU path — both are recorded
   options, not lost work.
-- **HEIF/HEIC is decoded through the operating system, not in Rust.** No mature pure-Rust
-  decoder exists, so `rizref-codecs` keeps reporting it as unsupported while the
-  application bridges it to Windows Imaging Component
-  (`crates/rizref/src/platform/heif.rs`). WIC decodes HEVC-coded HEIF when the free
-  **HEIF Image Extensions** package is installed — it ships with Windows 11 and installs
-  from the Store on Windows 10 — and the failure mode is a message naming that package
-  rather than "corrupt file". The bridge lives with the other platform glue, so the
-  codec crate's dependency set is unchanged; AVIF remains recognised but undecoded.
+- **HEIF/HEIC is decoded in Rust.** `heic-rs` implements the ISOBMFF container and the
+  HEVC still-picture decoder itself — grid tiles, 10-bit, `irot`/`imir` — under
+  MIT OR Apache-2.0, with `#![forbid(unsafe_code)]` and no build script. It replaced the
+  earlier OS bridge, which needed a Store package and only worked on Windows.
+- **AVIF goes through the operating system, and that is a tooling decision, not a
+  licensing one.** `image`'s AVIF support is encoder-only (decoding needs the C `dav1d`),
+  and `avif-decode` — the pure-Rust option — enables `rav1d`'s `asm` feature on x86, which
+  fails to build without NASM installed. Rather than make `cargo build` depend on an
+  assembler, AVIF is bridged to Windows Imaging Component (`platform/imaging.rs`), which
+  decodes it when the free **AV1 Video Extension** is installed. A missing codec is
+  reported as the package to install, and HEIC still has the same bridge as a fallback for
+  coding tools `heic-rs` declines.
 
 ## Building
 

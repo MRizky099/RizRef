@@ -1257,11 +1257,8 @@ fn print_startup_summary() {
         Err(reason) => println!("  clipboard:    unavailable ({reason})"),
     }
 
-    if crate::platform::heif::supported() {
-        println!("  heic:         decodable through the Windows HEIF codec");
-    } else {
-        println!("  heic:         unavailable (install the HEIF Image Extensions package)");
-    }
+    println!("  heic:         heic-rs (pure Rust; all platforms)");
+    println!("  avif:         Windows codec (needs the AV1 Video Extension)");
 }
 
 /// Opens the native image dialog once and prints what came back.
