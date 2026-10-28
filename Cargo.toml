@@ -109,10 +109,12 @@ tracing-appender = "0.2.3"
 # futures even on native; pollster is the smallest pure-Rust executor (no
 # runtime, no dependencies).
 pollster = "0.4.0"
-# Reserved for the phase-01 FFI glue (single-instance mutex, Win32 message box,
-# COM dialogs, IDropTarget). Declared here so no crate has to guess a version.
-# Phase 01 links it for: named mutex + named pipe (single instance), the
-# message box (panic reporting). Pipes and file I/O need their own features.
+# The Windows FFI surface, in one place so no crate has to guess a version:
+# the single-instance mutex and args pipe, the panic message box, the native
+# dialogs, and the OLE drop target (`IDropTarget`, CF_HDROP plus virtual files).
+# The GDI/StructuredStorage/SystemServices/DataExchange/Memory features exist for
+# the COM pieces: STGMEDIUM and ReleaseStgMedium, the IDropTarget vtable,
+# RegisterClipboardFormatW and the HGLOBAL payloads.
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

@@ -341,6 +341,7 @@ fn decode_ico(bytes: &[u8], limits: DecodeLimits) -> Result<ImageBuffer, CodecEr
         .max_by_key(|entry| u64::from(entry.width()) * u64::from(entry.height()))
         .ok_or_else(|| failed(ImageFormat::Ico, "icon contains no images"))?;
     check_limits(best.width(), best.height(), limits)?;
+    check_ico_entry(best, limits)?;
 
     let image = best
         .decode()
@@ -352,6 +353,113 @@ fn decode_ico(bytes: &[u8], limits: DecodeLimits) -> Result<ImageBuffer, CodecEr
         image.height(),
         image.rgba_data().to_vec(),
     )
+}
+
+/// Length of the `BITMAPINFOHEADER` an ICO entry starts with.
+const ICO_BMP_HEADER_LEN: usize = 40;
+
+/// Validates an entry against this crate's contract before `ico` sees it.
+///
+/// The directory's width and height are only a claim: the real dimensions live
+/// in the entry, so the megapixel cap has to be checked there too. The palette
+/// walk exists because `ico` 0.6 indexes its colour table with the raw pixel
+/// index and never clamps it — a 4-bit icon declaring a two-colour palette
+/// panics on the first pixel above colour 1 (found by the `decode_ico` fuzz
+/// target). Refusing the entry turns that into a decode error.
+fn check_ico_entry(entry: &ico::IconDirEntry, limits: DecodeLimits) -> Result<(), CodecError> {
+    let data = entry.data();
+    if let Some((width, height)) = png_dimensions(data) {
+        return check_limits(width, height, limits);
+    }
+    check_ico_bitmap(data, limits)
+}
+
+/// Validates one `BITMAPINFOHEADER` entry: real dimensions and palette indices.
+fn check_ico_bitmap(data: &[u8], limits: DecodeLimits) -> Result<(), CodecError> {
+    let Some(header) = data.get(..ICO_BMP_HEADER_LEN) else {
+        // Too short to be a bitmap: the decoder reports it.
+        return Ok(());
+    };
+    let header_len = u32::from_le_bytes(header[0..4].try_into().expect("four bytes"));
+    if header_len as usize != ICO_BMP_HEADER_LEN {
+        return Ok(());
+    }
+
+    let width = i32::from_le_bytes(header[4..8].try_into().expect("four bytes"));
+    let height = i32::from_le_bytes(header[8..12].try_into().expect("four bytes"));
+    let bits = u16::from_le_bytes(header[14..16].try_into().expect("two bytes"));
+    let colors_used = u32::from_le_bytes(header[32..36].try_into().expect("four bytes"));
+
+    // The stored height counts the colour rows and the alpha mask, hence /2.
+    // A malformed header is the decoder's to reject before it reads pixels.
+    if width <= 0 || height <= 0 || height % 2 != 0 {
+        return Ok(());
+    }
+    let pixel_height = (height / 2) as u32;
+    check_limits(width as u32, pixel_height, limits)?;
+
+    let palette_max = match bits {
+        1 => 2,
+        4 => 16,
+        8 => 256,
+        // 16-, 24- and 32-bit entries index no palette, and unknown depths are
+        // rejected by the decoder.
+        _ => return Ok(()),
+    };
+    let colors = if colors_used == 0 || colors_used > palette_max {
+        palette_max
+    } else {
+        colors_used
+    };
+    let colors = colors as usize;
+    let palette_end = ICO_BMP_HEADER_LEN + colors * 4;
+    if data.len() < palette_end {
+        // A truncated palette makes the decoder return an error; it never
+        // indexes past what it read.
+        return Ok(());
+    }
+
+    let width = width as usize;
+    let bits = bits as usize;
+    let row_bytes = (width * bits).div_ceil(8);
+    let stride = row_bytes.div_ceil(4) * 4;
+    let per_byte = 8 / bits;
+    let mask = (1_u8 << bits) - 1;
+
+    let mut offset = palette_end;
+    for _row in 0..pixel_height as usize {
+        // `ico` reads a row byte by byte and only meets the end of the data on
+        // the next read, so a *partial* row is still indexed. Scan whatever is
+        // present rather than requiring the whole row: a truncated fuzz input
+        // panicked exactly this way.
+        let available = data.len().saturating_sub(offset).min(row_bytes);
+        let row_data = &data[offset..offset + available];
+        let mut pixels = 0;
+        for &byte in row_data {
+            for sub in 0..per_byte {
+                if pixels == width {
+                    break;
+                }
+                let shift = 8 - bits * (sub + 1);
+                let index = (byte >> shift) & mask;
+                if usize::from(index) >= colors {
+                    return Err(failed(
+                        ImageFormat::Ico,
+                        format!("indexed icon uses colour {index} but its palette holds {colors}"),
+                    ));
+                }
+                pixels += 1;
+            }
+            if pixels == width {
+                break;
+            }
+        }
+        offset = offset.saturating_add(stride);
+        if offset >= data.len() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -558,6 +666,103 @@ mod tests {
             decode_as(&bytes, ImageFormat::Tga).expect("decode tga"),
             original
         );
+    }
+
+    /// Builds a `BITMAPINFOHEADER` entry for the palette and size checks.
+    fn bmp_entry(
+        width: i32,
+        height: i32,
+        bits: u16,
+        colors_used: u32,
+        palette: usize,
+        pixels: &[u8],
+    ) -> Vec<u8> {
+        let mut entry = vec![0u8; 40];
+        entry[0..4].copy_from_slice(&40_u32.to_le_bytes());
+        entry[4..8].copy_from_slice(&width.to_le_bytes());
+        entry[8..12].copy_from_slice(&height.to_le_bytes());
+        entry[14..16].copy_from_slice(&bits.to_le_bytes());
+        entry[32..36].copy_from_slice(&colors_used.to_le_bytes());
+        for _ in 0..palette {
+            entry.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        entry.extend_from_slice(pixels);
+        entry
+    }
+
+    #[test]
+    fn a_4_bit_icon_indexing_past_its_palette_is_refused() {
+        // 4 x 4 pixels at 4 bits each: two bytes a row, padded to four. Every
+        // nibble indexes colour 2, but the palette only holds two entries.
+        let entry = bmp_entry(4, 8, 4, 2, 2, &[0x22; 16]);
+
+        let error = super::check_ico_bitmap(&entry, DecodeLimits::default())
+            .expect_err("colour 2 is outside a two-colour palette");
+
+        assert!(
+            error.to_string().contains("palette holds 2"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn the_same_icon_within_its_palette_is_accepted() {
+        let entry = bmp_entry(4, 8, 4, 2, 2, &[0x11; 16]);
+
+        super::check_ico_bitmap(&entry, DecodeLimits::default()).expect("indices 1 are valid");
+    }
+
+    #[test]
+    fn a_1_bit_icon_with_a_one_colour_palette_is_refused() {
+        // The high bit is set, so the first pixel indexes colour 1.
+        let entry = bmp_entry(4, 8, 1, 1, 1, &[0x80; 4]);
+
+        assert!(super::check_ico_bitmap(&entry, DecodeLimits::default()).is_err());
+    }
+
+    #[test]
+    fn a_truncated_palette_is_left_to_the_decoder() {
+        let entry = bmp_entry(4, 8, 4, 16, 1, &[]);
+
+        super::check_ico_bitmap(&entry, DecodeLimits::default())
+            .expect("a short palette is already a decode error");
+    }
+
+    #[test]
+    fn a_partial_pixel_row_is_still_scanned_for_bad_indices() {
+        // The fuzz reproducer: a 64-pixel row whose data stops after three
+        // bytes, the last of which indexes colour 4 in a one-colour palette.
+        let entry = bmp_entry(64, 2, 4, 1, 1, &[0x00, 0x00, 0x04]);
+
+        assert!(
+            super::check_ico_bitmap(&entry, DecodeLimits::default()).is_err(),
+            "a truncated row must not skip the bytes that are present"
+        );
+    }
+
+    #[test]
+    fn a_lying_directory_size_cannot_bypass_the_megapixel_cap() {
+        // The directory claims 4 x 4; the entry itself says 20 000 x 20 000.
+        let entry = bmp_entry(20_000, 40_000, 32, 0, 0, &[]);
+
+        let error = super::check_ico_bitmap(&entry, DecodeLimits::default())
+            .expect_err("400 MP is over the default cap");
+
+        assert!(matches!(
+            error,
+            CodecError::TooLarge {
+                width: 20_000,
+                height: 20_000
+            }
+        ));
+    }
+
+    #[test]
+    fn a_true_colour_entry_needs_no_palette_walk() {
+        let entry = bmp_entry(4, 8, 32, 0, 0, &[]);
+
+        super::check_ico_bitmap(&entry, DecodeLimits::default())
+            .expect("a 32-bit entry indexes no palette");
     }
 
     #[test]

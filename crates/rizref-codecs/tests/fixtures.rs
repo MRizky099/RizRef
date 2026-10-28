@@ -170,3 +170,25 @@ fn an_over_limit_file_is_refused_without_allocating_pixels() {
 
     assert!(matches!(error, CodecError::TooLarge { .. }));
 }
+
+#[test]
+fn the_fuzzer_found_ico_palette_overflow_is_a_decode_error() {
+    // 121 bytes from the `decode_ico` fuzz target: a 4-bit icon whose palette
+    // holds two colours while its pixels use colour 2. The `ico` crate indexed
+    // its colour table unchecked and panicked before `decode_ico` validated the
+    // entry itself.
+    let bytes = fixture("malformed-ico-palette.ico");
+
+    let error = decode(&bytes).expect_err("the palette is too short");
+
+    assert!(
+        matches!(
+            error,
+            CodecError::Decode {
+                format: ImageFormat::Ico,
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+}

@@ -9,7 +9,10 @@ Summary of what each delivery phase landed. One section per phase; newest at the
   (palette/16-bit PNG, baseline/progressive/grayscale JPEG, lossy+lossless WebP,
   animated GIF, BMP/TGA/PNM/QOI, multi-size ICO); malformed-input sweep; `fuzz/`
   crate with one target per codec family, a per-target CI matrix on nightly and a
-  scheduled ten-minute soak per target.
+  scheduled ten-minute soak per target. The `decode_ico` soak found a real panic in
+  `ico` 0.6 (indexed pixels outside the declared palette); ICO entries are now
+  validated — real dimensions for the megapixel cap plus a palette-index walk —
+  before the crate runs, with the 121-byte reproducer committed as a fixture.
 - `rizref-core`: content-addressed `Asset`/`AssetStore` (BLAKE3 of the original
   bytes), `ImageItem` with oriented hit-testing, `Scene` now holds items and assets,
   box-filter previews that never upscale, and a 512 px preview per asset.
