@@ -14,13 +14,16 @@ Summary of what each delivery phase landed. One section per phase; newest at the
   bytes), `ImageItem` with oriented hit-testing, `Scene` now holds items and assets,
   box-filter previews that never upscale, and a 512 px preview per asset.
 - `rizref`: `crossbeam-channel` worker pool (`import.rs`) with trace spans and panic
-  isolation; 2 GB LRU decoded-bitmap cache; drop-point ring packing; winit file
-  drops, clipboard paste (files or bitmap) and Ctrl+O image dialog.
+  isolation; 2 GB LRU decoded-bitmap cache; drop-point ring packing; clipboard paste
+  (files or bitmap) and Ctrl+O image dialog.
+- `rizref`: OLE `IDropTarget` (`platform/drop_target.rs`) replaces winit's handler so
+  drag & drop also accepts **virtual files** (`FileGroupDescriptorW` + `FileContents`:
+  Outlook attachments, entries of a compressed folder), not just `CF_HDROP` paths.
+  Registration degrades to winit's handler when OLE cannot initialise; descriptor
+  parsing is unit-tested against the packed Win32 layout.
 - Renderer: placeholder quads deleted; items draw from real per-item
   `RGBA8UnormSrgb` textures with a 512 MB LRU budget, 4096 px display cap,
   preview-first fallback and re-upload when visible again.
-- Deferred by the kickoff's own allowance: OLE `IDropTarget` for virtual files
-  (Outlook attachments); winit's file-drop path covers Explorer and browsers.
 
 ## Phase 02 — Canvas & Viewport (done)
 

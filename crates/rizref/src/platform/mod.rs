@@ -12,10 +12,10 @@
 //! * **Logging location.** The user's local-appdata directory, queried from the
 //!   environment at runtime — never a hardcoded path.
 //!
-//! Drag-and-drop is handled through winit's file-drop events in this phase; an
-//! OLE `IDropTarget` for virtual files (Outlook attachments) is a documented
-//! stretch item, and the Explorer thumbnail provider belongs here too in later
-//! phases.
+//! Drag and drop is owned by [`drop_target`]: winit's own OLE target handles
+//! only `CF_HDROP`, so this crate registers a target that also accepts the
+//! virtual-file formats (Outlook attachments, files inside a compressed
+//! folder). The Explorer thumbnail provider belongs here too in later phases.
 //!
 //! # Unsafe code
 //!
@@ -25,8 +25,10 @@
 //! stating the invariant that makes the call sound. Keeping that confined to
 //! this module is the point: the rest of the application stays safe Rust.
 
+pub mod drop_target;
 pub mod message_box;
 pub mod single_instance;
 
+pub use drop_target::{DropEvent, Registration as DropRegistration};
 pub use message_box::alert;
 pub use single_instance::{SingleInstance, forward_args_to_primary, serve_forwarded_args};

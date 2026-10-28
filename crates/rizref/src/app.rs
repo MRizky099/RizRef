@@ -37,7 +37,10 @@ use crate::import::{ImportOutcome, ImportRequest, Importer};
 use crate::input::{self, Button as InputButton, Command, Key as InputKey, Trigger};
 use crate::memory::DecodeCache;
 use crate::placement;
-use crate::platform::{self, SingleInstance, forward_args_to_primary, serve_forwarded_args};
+use crate::platform::{
+    self, DropEvent, DropRegistration, SingleInstance, forward_args_to_primary,
+    serve_forwarded_args,
+};
 use crate::renderer::{FrameError, FrameParams, GpuSurface};
 use crate::text::TextEngine;
 use crate::view::ViewState;
@@ -325,11 +328,18 @@ enum AppEvent {
     ForwardedArgs(Vec<String>),
     /// An import worker finished one request.
     Import(Box<ImportOutcome>),
+    /// The OLE drop target received files, in client-area physical pixels.
+    Dropped(Box<DropEvent>),
 }
 
 /// Everything the event loop owns: the window, its surface, the canvas state
 /// and the view the user looks through.
 struct App {
+    /// The OLE drop registration. Declared first so it is dropped — and the
+    /// target unregistered — while the window behind it is still alive.
+    drop_target: Option<DropRegistration>,
+    /// Event-loop handle the import workers and the drop target report through.
+    proxy: EventLoopProxy<AppEvent>,
     plan: WindowPlan,
     window: Option<Arc<Window>>,
     renderer: Option<GpuSurface>,
@@ -356,8 +366,9 @@ struct App {
 impl App {
     fn new(plan: WindowPlan, proxy: EventLoopProxy<AppEvent>) -> Self {
         let scene = Scene::new(SceneId::from_bytes(*b"rizref-dev-scene"));
+        let worker_proxy = proxy.clone();
         let importer = Importer::new(move |outcome| {
-            if proxy
+            if worker_proxy
                 .send_event(AppEvent::Import(Box::new(outcome)))
                 .is_err()
             {
@@ -370,6 +381,8 @@ impl App {
         // into the .rizref container); without one, the default view.
         let camera = dev_state::load().unwrap_or_default();
         Self {
+            drop_target: None,
+            proxy,
             view: ViewState::new(camera, DVec2::new(plan.size.width, plan.size.height)),
             plan,
             window: None,
@@ -514,6 +527,63 @@ impl App {
             let drop_world = self.drop_world();
             self.import_paths(paths, drop_world);
         }
+    }
+
+    /// Registers the OLE drop target for the window.
+    ///
+    /// winit's own target understands only `CF_HDROP`; this one also reads the
+    /// virtual-file formats, so an attachment dragged out of Outlook becomes an
+    /// item. Registration replaces winit's target, which is why a failure leaves
+    /// the application without OS drag & drop rather than with a half-working
+    /// one; Ctrl+O and paste still work.
+    fn install_drop_target(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        self.drop_target = platform::drop_target::register(window, move |event| {
+            if proxy
+                .send_event(AppEvent::Dropped(Box::new(event)))
+                .is_err()
+            {
+                tracing::debug!("the event loop is gone; dropping a drop event");
+            }
+        });
+    }
+
+    /// Turns one OLE drop into import requests around the drop point.
+    fn apply_drop(&mut self, event: DropEvent) {
+        let drop_world = self.world_from_physical(event.client_physical);
+        if !event.paths.is_empty() {
+            self.import_paths(event.paths, drop_world);
+        }
+        for file in event.virtual_files {
+            if !looks_like_image(std::path::Path::new(&file.name)) {
+                tracing::info!(name = %file.name, "virtual file is not an image; skipped");
+                continue;
+            }
+            tracing::info!(
+                name = %file.name,
+                bytes = file.bytes.len(),
+                ?drop_world,
+                "virtual file dropped"
+            );
+            self.submit_import(ImportRequest::bytes(file.name, file.bytes, drop_world));
+        }
+        self.redraw();
+    }
+
+    /// Maps a client-area position in physical pixels onto the board.
+    fn world_from_physical(&self, (x, y): (f32, f32)) -> Vec2 {
+        let scale = self
+            .window
+            .as_ref()
+            .map_or(1.0, |window| window.scale_factor());
+        let logical = DVec2::new(f64::from(x) / scale, f64::from(y) / scale);
+        self.view
+            .camera
+            .screen_to_world(logical, self.view.viewport())
+            .as_vec2()
     }
 
     /// Turns one worker result into an asset, an item and a GPU texture.
@@ -687,6 +757,7 @@ impl ApplicationHandler<AppEvent> for App {
                 tracing::info!(?size, scale, "window ready");
                 self.renderer = Some(renderer);
                 self.window = Some(window);
+                self.install_drop_target();
                 self.window.as_ref().expect("just set").request_redraw();
 
                 // Command-line and forwarded paths were held until the window
@@ -909,6 +980,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.import_paths(paths, drop_world);
             }
             AppEvent::Import(outcome) => self.apply_import(*outcome),
+            AppEvent::Dropped(event) => self.apply_drop(*event),
         }
     }
 

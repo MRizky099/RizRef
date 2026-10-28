@@ -18,9 +18,9 @@ gh issue list --repo MRizky099/RizRef --state open
 Phase 00 (workspace, dependency policy, lint/CI policy, budgets), phase 01 (window,
 Vulkan→DX12 surface, on-demand pacing, single instance, logs), phase 02 (f64 camera,
 pan/zoom/rotate, grid, quad + HUD pipelines) and phase 03 (worker-thread image import
-with EXIF-aware decoding, BLAKE3 asset dedup, previews, drag & drop, clipboard paste,
-Ctrl+O and per-item sRGB textures) have landed. The workspace builds, tests and lints
-clean.
+with EXIF-aware decoding, BLAKE3 asset dedup, previews, an OLE drop target that also
+accepts virtual files such as Outlook attachments, clipboard paste, Ctrl+O and per-item
+sRGB textures) have landed. The workspace builds, tests and lints clean.
 
 ## Design principles
 
@@ -80,7 +80,8 @@ between crates. These are the pinned versions:
 | Compression | `lz4_flex` | 0.14.0 | pure Rust |asset identity and container checksums
 | Hashing | `blake3` | 1.8.7 | `features = ["pure"]` — see below |
 | Logging | `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | pure Rust |
-| Platform FFI | `windows` | 0.62.2 | declared for phase 01; not linked yet |
+| Platform FFI | `windows` | 0.62.2 | Win32/COM declarations: mutex, pipe, dialogs, OLE drop target |
+| COM support | `windows-core` | 0.62.2 | required by the `#[implement]` macro; pure Rust |
 
 ### The pure-Rust rule, and how it is checked
 
