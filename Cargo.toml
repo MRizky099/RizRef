@@ -59,6 +59,11 @@ jpeg-encoder = "0.7.1"
 image-webp = "0.2.4"
 gif = "0.14.2"
 ico = "0.6.0"
+# HEIF/HEIC in Rust: container + HEVC still-picture decoder, no C, no build
+# script, `#![forbid(unsafe_code)]`, MIT OR Apache-2.0. `parallel` is off on
+# purpose: the import pool already decodes one file per worker, and a nested
+# rayon pool inside each of them would oversubscribe the machine.
+heic-rs = { version = "0.1.4", default-features = false, features = ["std"] }
 # `default-features = false` keeps the optional AVIF/rav1e, EXR and TIFF stacks
 # out of the build; only the plain raster backends the decision table lists are
 # enabled here. WebP and ICO are covered by `image-webp` and `ico` above.
@@ -118,6 +123,7 @@ pollster = "0.4.0"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

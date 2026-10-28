@@ -1,8 +1,12 @@
 //! Fixture-driven decode tests.
 //!
-//! The files under `tests/data/` are produced by
+//! Most files under `tests/data/` are produced by
 //! `examples/make_fixtures.rs` and committed, so these tests see byte layouts
-//! written by real encoders instead of only round-tripping our own calls.
+//! written by real encoders instead of only round-tripping our own calls. The
+//! two `.heic` files are the exception: they come from the `heic-rs` test corpus
+//! (see `tests/data/README.md`), because no encoder in this workspace writes
+//! HEVC. They are the fixtures that prove the format is actually decoded, rather
+//! than only sniffed.
 
 use std::path::PathBuf;
 
@@ -39,6 +43,8 @@ fn every_committed_fixture_sniffs_as_the_format_its_name_says() {
         ("plain.ppm", ImageFormat::Pnm),
         ("plain.qoi", ImageFormat::Qoi),
         ("multi.ico", ImageFormat::Ico),
+        ("still.heic", ImageFormat::Heif),
+        ("grid.heic", ImageFormat::Heif),
     ];
 
     for (name, expected) in cases {
@@ -154,6 +160,40 @@ fn truncating_a_file_never_panics_and_reports_damage() {
             );
         }
     }
+}
+
+#[test]
+fn heic_single_item_and_grid_images_decode() {
+    // A single coded picture.
+    let still = decode(&fixture("still.heic")).expect("single-item heic");
+    assert_eq!((still.width(), still.height()), (64, 64));
+    let pixel = still.pixel(32, 32).expect("inside");
+    assert_eq!(pixel[3], 255, "HEIC without alpha is opaque");
+
+    // A 2 x 2 grid of 512 px tiles: the shape every iPhone photograph takes
+    // above 512 px on a side. Decoding it proves tile compositing, not just the
+    // single-item path.
+    let grid = decode(&fixture("grid.heic")).expect("grid heic");
+    assert_eq!((grid.width(), grid.height()), (1024, 1024));
+}
+
+#[test]
+fn the_heic_pixel_cap_is_enforced_before_decoding() {
+    let bytes = fixture("grid.heic");
+
+    let error = decode_with_limits(
+        &bytes,
+        DecodeLimits {
+            max_pixels: 1024 * 1024 - 1,
+        },
+    )
+    .expect_err("one pixel under the grid");
+
+    assert!(
+        matches!(error, CodecError::Decode { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(error.to_string().contains("pixel limit"), "{error}");
 }
 
 #[test]

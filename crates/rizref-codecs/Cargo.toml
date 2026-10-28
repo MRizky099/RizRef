@@ -16,3 +16,4 @@ image-webp.workspace = true
 gif.workspace = true
 ico.workspace = true
 image.workspace = true
+heic-rs.workspace = true

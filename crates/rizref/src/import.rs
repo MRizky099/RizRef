@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Sender, unbounded};
 use glam::Vec2;
 use rizref_codecs::{CodecError, DecodeLimits, ImageBuffer, ImageFormat, decode_as_with_limits};
-use rizref_core::{Fitted, checksum, fit_to_side, generate_preview};
+use rizref_core::{Animation, AnimationFrame, Fitted, checksum, fit_to_side, generate_preview};
 
+use crate::platform::imaging;
 use crate::textures::MAX_TEXTURE_SIDE;
 
 /// One image to import: a path to read, or bytes already in hand.
@@ -107,6 +108,8 @@ pub struct ImportedImage {
     pub display: Option<ImageBuffer>,
     /// Box-filtered thumbnail, at most 512 px on its longest side.
     pub preview: ImageBuffer,
+    /// Frames for an animated GIF, composed and timed.
+    pub animation: Option<Animation>,
     /// BLAKE3 of `encoded`, computed on the worker.
     pub checksum: [u8; 32],
 }
@@ -277,13 +280,18 @@ fn import(source: &ImportSource) -> Result<ImportedImage, ImportError> {
         bytes = bytes.len()
     )
     .entered();
-    let image =
-        decode_as_with_limits(&bytes, format, DecodeLimits::default()).map_err(|error| {
-            ImportError {
-                label: source.label.clone(),
-                reason: error.to_string(),
-            }
-        })?;
+    let limits = DecodeLimits::default();
+    // Every format decodes in Rust except AVIF; the OS codec also stands behind
+    // HEIC when `heic-rs` declines a coding tool it does not implement.
+    let image = decode_image(&bytes, format, limits).map_err(|error| ImportError {
+        label: source.label.clone(),
+        reason: error.to_string(),
+    })?;
+    let animation = if format == ImageFormat::Gif {
+        animation_of(&bytes, limits, &source.label)
+    } else {
+        None
+    };
 
     let checksum = checksum(&bytes);
 
@@ -312,8 +320,62 @@ fn import(source: &ImportSource) -> Result<ImportedImage, ImportError> {
         image,
         display,
         preview,
+        animation,
         checksum,
     })
+}
+
+/// Decodes one file, with the OS codec as the fallback for the ISOBMFF family.
+///
+/// `rizref-codecs` reads HEIC itself; AVIF it hands over untouched, because no
+/// pure-Rust AV1 decoder builds without an external assembler. Both fall back to
+/// Windows Imaging Component when the Rust path declines: a coding tool the
+/// young HEVC decoder does not implement yet, or the AV1 extension's codec
+/// being the only AV1 decoder on the machine.
+fn decode_image(
+    bytes: &[u8],
+    format: ImageFormat,
+    limits: DecodeLimits,
+) -> Result<ImageBuffer, CodecError> {
+    match decode_as_with_limits(bytes, format, limits) {
+        Ok(image) => Ok(image),
+        Err(error @ CodecError::Unsupported { .. })
+            if matches!(format, ImageFormat::Heif | ImageFormat::Avif) =>
+        {
+            tracing::debug!(
+                ?format,
+                reason = %error,
+                "falling back to the operating system image codec"
+            );
+            imaging::decode(bytes, limits, format)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Decodes a GIF's frames, or `None` when it is a still image.
+///
+/// A one-frame GIF is deliberately *not* wrapped in an animation: there is
+/// nothing to play, and treating it as animated would put a pointless clock on
+/// the frame budget.
+fn animation_of(bytes: &[u8], limits: DecodeLimits, label: &str) -> Option<Animation> {
+    match rizref_codecs::decode_gif_animation(bytes, limits) {
+        Ok(frames) if frames.len() > 1 => {
+            tracing::debug!(label, frames = frames.len(), "animated gif decoded");
+            let frames = frames
+                .into_iter()
+                .map(|frame| AnimationFrame::new(frame.image, frame.delay))
+                .collect();
+            Animation::new(frames)
+        }
+        Ok(_) => None,
+        Err(error) => {
+            // The still frame is already in hand; a failed frame walk only
+            // costs the animation, not the import.
+            tracing::warn!(label, %error, "cannot read the gif's frames; showing the first");
+            None
+        }
+    }
 }
 
 /// Sniffs the format, falling back to the extension for TGA (no signature).
@@ -322,7 +384,6 @@ fn format_for(bytes: &[u8], path: Option<&Path>) -> Option<ImageFormat> {
         path.and_then(Path::extension)
             .and_then(|extension| extension.to_str())
             .and_then(ImageFormat::from_extension)
-            .filter(|format| format.is_decodable())
     })
 }
 

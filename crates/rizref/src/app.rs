@@ -14,6 +14,7 @@
 //! an idle board costs no CPU — a reference viewer sits in the background for
 //! hours while its user paints elsewhere.
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,11 +22,11 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use glam::{DVec2, Vec2};
-use rizref_core::{Asset, Rect, Scene, SceneId, SceneRectTracker};
+use rizref_core::{Asset, AssetId, Rect, Scene, SceneId, SceneRectTracker, Selection};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
@@ -361,6 +362,21 @@ struct App {
     hud: Option<HudSurface>,
     /// Keyboard modifiers as of the last `ModifiersChanged`.
     modifiers: ModifiersState,
+    /// Items the user has picked; an animated item that is selected freezes.
+    selection: Selection,
+    /// Playback clocks for the animated assets on the board.
+    playbacks: HashMap<AssetId, Playback>,
+    /// When the next animation frame is due, for the event loop's timer.
+    next_frame_at: Option<Instant>,
+}
+
+/// One asset's place in its animation.
+#[derive(Debug, Clone, Copy)]
+struct Playback {
+    /// Frame currently uploaded to the GPU.
+    frame: usize,
+    /// When the next frame becomes due.
+    next_at: Instant,
 }
 
 impl App {
@@ -395,6 +411,9 @@ impl App {
             text: TextEngine::new(),
             hud: None,
             modifiers: ModifiersState::default(),
+            selection: Selection::new(),
+            playbacks: HashMap::new(),
+            next_frame_at: None,
         }
     }
 
@@ -444,14 +463,18 @@ impl App {
             format!("{zoom:.1}")
         };
         let rotation = self.view.camera.rotation.to_degrees();
+        let animation = self
+            .selected_animation_note()
+            .map(|note| format!(" · {note}"))
+            .unwrap_or_default();
         if self.view.has_cursor() {
             let world = self.view.cursor_world();
             format!(
-                "{zoom}% · {rotation:.0}° · ({:.1}, {:.1})",
+                "{zoom}% · {rotation:.0}° · ({:.1}, {:.1}){animation}",
                 world.x, world.y
             )
         } else {
-            format!("{zoom}% · {rotation:.0}°")
+            format!("{zoom}% · {rotation:.0}°{animation}")
         }
     }
 
@@ -604,13 +627,22 @@ impl App {
         let width = imported.image.width() as f32;
         let height = imported.image.height() as f32;
         let display = imported.display;
-        let asset = Asset::from_parts(
+        let mut asset = Asset::from_parts(
             imported.encoded,
             imported.format,
             imported.checksum,
             &imported.image,
             imported.preview,
         );
+        if let Some(animation) = imported.animation {
+            tracing::info!(
+                label = %outcome.label,
+                frames = animation.len(),
+                loop_ms = animation.total_duration().as_millis(),
+                "animated image"
+            );
+            asset = asset.with_animation(animation);
+        }
         let encoded_len = asset.encoded().len();
         let (asset_id, was_new) = self.scene.insert_asset(asset);
         if was_new {
@@ -721,6 +753,79 @@ impl App {
                 renderer.upload_texture(item.asset, &full, false);
             }
         }
+    }
+
+    /// Selects the topmost item under the cursor, or clears the selection.
+    ///
+    /// This is the minimum selection phase 04 builds on, and it is what makes
+    /// "freeze the animation" meaningful: whatever is selected stops playing so
+    /// its current frame can be studied.
+    fn select_at_cursor(&mut self) {
+        let Some(cursor) = self.view.cursor_position() else {
+            return;
+        };
+        let world = self
+            .view
+            .camera
+            .screen_to_world(cursor, self.view.viewport())
+            .as_vec2();
+        // Topmost first: the last item in z-order is drawn on top.
+        let hit = self
+            .scene
+            .items()
+            .iter()
+            .rev()
+            .find(|item| item.hit_test(world))
+            .map(rizref_core::ImageItem::id);
+
+        match hit {
+            Some(id) => self.selection.set_single(id),
+            None => self.selection.clear(),
+        }
+        self.redraw();
+    }
+
+    /// Advances every playing animation to `now`, returning when the next frame
+    /// is due.
+    ///
+    /// Only animations that are on screen and not selected play: an item
+    /// scrolled out of view costs nothing, and a selected item is frozen so its
+    /// current frame can be read.
+    fn advance_animations(&mut self, now: Instant) -> Option<Instant> {
+        let visible = self.view.camera.visible_world_rect(self.view.viewport());
+        let (uploads, next) = tick_animations(
+            &self.scene,
+            &self.selection,
+            &mut self.playbacks,
+            visible,
+            now,
+        );
+
+        if !uploads.is_empty()
+            && let Some(renderer) = self.renderer.as_mut()
+        {
+            for (asset, frame) in uploads {
+                if let Some(animation) = self.scene.asset(asset).and_then(Asset::animation) {
+                    renderer.upload_texture(asset, animation.frame(frame).image(), false);
+                }
+            }
+        }
+
+        self.next_frame_at = next;
+        next
+    }
+
+    /// The HUD note for a frozen animation, when one is selected.
+    fn selected_animation_note(&self) -> Option<String> {
+        let id = self.selection.iter().next()?;
+        let item = self.scene.item(id)?;
+        let asset = self.scene.asset(item.asset())?;
+        let animation = asset.animation()?;
+        let frame = self
+            .playbacks
+            .get(&item.asset())
+            .map_or(0, |playback| playback.frame);
+        Some(format!("GIF frozen {}/{}", frame + 1, animation.len()))
     }
 }
 
@@ -837,6 +942,11 @@ impl ApplicationHandler<AppEvent> for App {
                     space_held: self.view.space_held(),
                 }) {
                     self.apply(command);
+                } else if button == InputButton::Left && pressed && !self.view.space_held() {
+                    // Plain left click: pick the item under the cursor. Phase 04
+                    // replaces this with drag-select, but the selection it sets
+                    // already means something (it freezes an animation).
+                    self.select_at_cursor();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => match delta {
@@ -918,6 +1028,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // The HUD and the frame params are gathered before the
                 // renderer is taken mutably, so the borrows never overlap.
                 let animating = self.view.advance(Instant::now());
+                let _next_frame = self.advance_animations(Instant::now());
                 let items = self.build_items();
                 self.ensure_textures(&items);
                 let text = self.readout_text();
@@ -984,9 +1095,18 @@ impl ApplicationHandler<AppEvent> for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Deliberately empty: this is what keeps an idle board at zero CPU.
-        // Anything that needs a frame asks for one with `request_redraw`.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The board idles at zero CPU unless something is animating: a playing
+        // GIF arms a one-shot timer for its next frame, and everything else
+        // waits for an event.
+        match self.next_frame_at {
+            Some(deadline) if deadline <= Instant::now() => {
+                self.redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1003,6 +1123,50 @@ fn looks_like_image(path: &std::path::Path) -> bool {
         None => true,
         Some(extension) => rizref_codecs::ImageFormat::from_extension(extension).is_some(),
     }
+}
+
+/// Advances the animation clocks, returning the frames to upload and the next
+/// deadline.
+///
+/// Split out of [`App`] so the playback rules — freeze what is selected, skip
+/// what is off screen, loop — are testable without a window or a GPU.
+fn tick_animations(
+    scene: &Scene,
+    selection: &Selection,
+    playbacks: &mut HashMap<AssetId, Playback>,
+    visible: Rect,
+    now: Instant,
+) -> (Vec<(AssetId, usize)>, Option<Instant>) {
+    let mut uploads = Vec::new();
+    let mut next: Option<Instant> = None;
+
+    for item in scene.items() {
+        let Some(asset) = scene.asset(item.asset()) else {
+            continue;
+        };
+        let Some(animation) = asset.animation() else {
+            continue;
+        };
+        // A selected item is frozen: that is the whole point of selecting a GIF
+        // on a reference board.
+        if selection.contains(item.id()) || !item.world_rect().intersects(&visible) {
+            continue;
+        }
+
+        let playback = playbacks.entry(item.asset()).or_insert(Playback {
+            frame: 0,
+            next_at: now,
+        });
+        if now >= playback.next_at {
+            let frame = (playback.frame + 1) % animation.len();
+            playback.frame = frame;
+            playback.next_at = now + animation.delay_after(frame);
+            uploads.push((item.asset(), frame));
+        }
+        next = Some(next.map_or(playback.next_at, |soonest| soonest.min(playback.next_at)));
+    }
+
+    (uploads, next)
 }
 
 /// Runs the event loop as the primary instance.
@@ -1092,6 +1256,9 @@ fn print_startup_summary() {
         Ok(()) => println!("  clipboard:    available"),
         Err(reason) => println!("  clipboard:    unavailable ({reason})"),
     }
+
+    println!("  heic:         heic-rs (pure Rust; all platforms)");
+    println!("  avif:         Windows codec (needs the AV1 Video Extension)");
 }
 
 /// Opens the native image dialog once and prints what came back.
@@ -1114,10 +1281,19 @@ fn check_dialogs() {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANVAS_BACKGROUND, LOG_FILES_KEPT, WindowPlan, looks_like_image, parse_args, stale_logs,
-        version_line,
+        CANVAS_BACKGROUND, LOG_FILES_KEPT, Playback, WindowPlan, looks_like_image, parse_args,
+        stale_logs, tick_animations, version_line,
     };
+    use glam::Vec2;
+    use rizref_codecs::ImageBuffer;
+    use rizref_core::{
+        Animation, AnimationFrame, Asset, AssetId, ImageItem, ItemId, Rect, Scene, SceneId,
+        Selection,
+    };
+    use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(std::string::ToString::to_string).collect()
@@ -1217,5 +1393,178 @@ mod tests {
 
         let remove = stale_logs(&names, 0);
         assert_eq!(remove, ["rizref.log.2026-10-24".to_owned()]);
+    }
+
+    /// A scene with one animated item at the origin, 10 x 10 world units.
+    fn animated_scene() -> (Scene, AssetId, ItemId) {
+        let frame = |value: u8| {
+            AnimationFrame::new(
+                ImageBuffer::filled(4, 4, [value, value, value, 255]),
+                Duration::from_millis(100),
+            )
+        };
+        let animation = Animation::new(vec![frame(1), frame(2), frame(3)]).expect("three frames");
+        let still = ImageBuffer::filled(4, 4, [1, 1, 1, 255]);
+        let asset = Asset::from_decoded(
+            Arc::from(&b"animated gif"[..]),
+            rizref_codecs::ImageFormat::Gif,
+            &still,
+            still.clone(),
+        )
+        .with_animation(animation);
+
+        let mut scene = Scene::new(SceneId::from_bytes([3; 16]));
+        let asset_id = scene.insert_asset(asset).0;
+        let item = scene
+            .insert_image(asset_id, Vec2::ZERO, Vec2::splat(10.0))
+            .expect("the asset is stored");
+        (scene, asset_id, item)
+    }
+
+    fn visible() -> Rect {
+        Rect::from_min_max(Vec2::splat(-100.0), Vec2::splat(100.0))
+    }
+
+    #[test]
+    fn an_unselected_animation_advances_and_reports_its_next_deadline() {
+        let (scene, asset, _) = animated_scene();
+        let selection = Selection::new();
+        let mut playbacks = HashMap::new();
+        let now = Instant::now();
+
+        let (uploads, next) = tick_animations(&scene, &selection, &mut playbacks, visible(), now);
+
+        assert_eq!(uploads, vec![(asset, 1)], "the first tick leaves frame 0");
+        assert_eq!(next, Some(now + Duration::from_millis(100)));
+        assert_eq!(playbacks[&asset].frame, 1);
+    }
+
+    #[test]
+    fn a_selected_animation_is_frozen() {
+        let (scene, asset, item) = animated_scene();
+        let selection = Selection::from_iter([item]);
+        let mut playbacks = HashMap::new();
+        let now = Instant::now();
+        playbacks.insert(
+            asset,
+            Playback {
+                frame: 1,
+                next_at: now,
+            },
+        );
+
+        let (uploads, next) = tick_animations(&scene, &selection, &mut playbacks, visible(), now);
+
+        assert!(uploads.is_empty(), "a frozen animation must not advance");
+        assert_eq!(next, None, "and must not keep the event loop awake");
+        assert_eq!(playbacks[&asset].frame, 1, "the frame stays where it was");
+    }
+
+    #[test]
+    fn an_off_screen_animation_is_not_played() {
+        let (scene, _, _) = animated_scene();
+        let selection = Selection::new();
+        let mut playbacks = HashMap::new();
+        let away = Rect::from_min_max(Vec2::splat(1_000.0), Vec2::splat(2_000.0));
+
+        let (uploads, next) =
+            tick_animations(&scene, &selection, &mut playbacks, away, Instant::now());
+
+        assert!(uploads.is_empty());
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn playback_wraps_around_the_frame_list() {
+        let (scene, asset, _) = animated_scene();
+        let selection = Selection::new();
+        let now = Instant::now();
+        let mut playbacks = HashMap::new();
+        playbacks.insert(
+            asset,
+            Playback {
+                frame: 2,
+                next_at: now,
+            },
+        );
+
+        let (uploads, _) = tick_animations(&scene, &selection, &mut playbacks, visible(), now);
+
+        assert_eq!(
+            uploads,
+            vec![(asset, 0)],
+            "after the last frame comes the first"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_is_not_due_yet_waits() {
+        let (scene, asset, _) = animated_scene();
+        let selection = Selection::new();
+        let now = Instant::now();
+        let mut playbacks = HashMap::new();
+        playbacks.insert(
+            asset,
+            Playback {
+                frame: 1,
+                next_at: now + Duration::from_millis(50),
+            },
+        );
+
+        let (uploads, next) = tick_animations(&scene, &selection, &mut playbacks, visible(), now);
+
+        assert!(uploads.is_empty());
+        assert_eq!(next, Some(now + Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn an_item_without_an_animation_never_advances() {
+        let still = ImageBuffer::filled(4, 4, [9, 9, 9, 255]);
+        let asset = Asset::from_decoded(
+            Arc::from(&b"a still image"[..]),
+            rizref_codecs::ImageFormat::Png,
+            &still,
+            still.clone(),
+        );
+        let mut scene = Scene::new(SceneId::from_bytes([4; 16]));
+        let asset_id = scene.insert_asset(asset).0;
+        scene
+            .insert_image(asset_id, Vec2::ZERO, Vec2::splat(10.0))
+            .expect("inserted");
+        let mut playbacks = HashMap::new();
+
+        let (uploads, next) = tick_animations(
+            &scene,
+            &Selection::new(),
+            &mut playbacks,
+            visible(),
+            Instant::now(),
+        );
+
+        assert!(uploads.is_empty());
+        assert_eq!(next, None);
+        assert!(playbacks.is_empty(), "still images get no playback clock");
+    }
+
+    #[test]
+    fn a_plain_click_selects_the_topmost_item_under_the_cursor() {
+        let (mut scene, asset, first) = animated_scene();
+        let second = scene
+            .insert_image(asset, Vec2::ZERO, Vec2::splat(10.0))
+            .expect("inserted");
+        let mut selection = Selection::new();
+
+        // Both items cover the origin; the later one is drawn on top.
+        let hit = scene
+            .items()
+            .iter()
+            .rev()
+            .find(|item| item.hit_test(Vec2::ZERO))
+            .map(ImageItem::id)
+            .expect("something is under the cursor");
+        selection.set_single(hit);
+
+        assert_eq!(hit, second);
+        assert!(!selection.contains(first));
     }
 }

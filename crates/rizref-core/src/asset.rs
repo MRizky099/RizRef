@@ -14,6 +14,8 @@ use std::sync::Arc;
 use rizref_codecs::{ImageBuffer, ImageFormat};
 use serde::{Deserialize, Serialize};
 
+use crate::animation::Animation;
+
 /// The full BLAKE3 digest of `bytes`.
 pub fn checksum(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
@@ -95,6 +97,7 @@ pub struct Asset {
     pixel_width: u32,
     pixel_height: u32,
     preview: PreviewImage,
+    animation: Option<Arc<Animation>>,
 }
 
 impl Asset {
@@ -129,7 +132,18 @@ impl Asset {
             pixel_width: image.width(),
             pixel_height: image.height(),
             preview: PreviewImage::new(preview),
+            animation: None,
         }
+    }
+
+    /// Attaches an animation, as an animated GIF import does.
+    ///
+    /// The asset's still image stays the first frame, so everything that does
+    /// not know about animations — previews, the file format, exports — keeps
+    /// working unchanged.
+    pub fn with_animation(mut self, animation: Animation) -> Self {
+        self.animation = Some(Arc::new(animation));
+        self
     }
 
     /// Identity of this asset.
@@ -165,6 +179,11 @@ impl Asset {
     /// The embedded thumbnail shown while the full texture is not resident.
     pub fn preview(&self) -> &PreviewImage {
         &self.preview
+    }
+
+    /// The animation this asset plays, when it is animated.
+    pub fn animation(&self) -> Option<&Arc<Animation>> {
+        self.animation.as_ref()
     }
 }
 

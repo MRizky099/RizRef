@@ -12,6 +12,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod animation;
 pub mod asset;
 pub mod camera;
 pub mod command;
@@ -22,6 +23,7 @@ pub mod scene;
 pub mod scene_rect;
 pub mod selection;
 
+pub use animation::{Animation, AnimationFrame};
 pub use asset::{Asset, AssetId, AssetStore, PreviewImage, checksum};
 pub use camera::Camera;
 pub use command::{Command, History};
