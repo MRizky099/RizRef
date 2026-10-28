@@ -13,7 +13,8 @@ use rizref_core::{Camera, Rect};
 use winit::window::Window;
 
 use crate::app::CANVAS_BACKGROUND;
-use crate::canvas::{Canvas, HudUpload, QuadInstance};
+use crate::canvas::{Canvas, HudUpload, ItemQuad};
+use crate::textures::{MAX_TEXTURE_SIDE, TextureCache};
 
 /// Backends this build tries, in preference order.
 ///
@@ -90,6 +91,7 @@ pub struct GpuSurface {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     canvas: Canvas,
+    textures: TextureCache,
 }
 
 /// Everything one frame needs, gathered by the caller and consumed by
@@ -104,8 +106,8 @@ pub struct FrameParams<'a> {
     pub physical_scale: f64,
     /// The tracked board bounding box, `None` for an empty board.
     pub scene_rect: Option<Rect>,
-    /// Item quads in z-order (last drawn on top).
-    pub items: &'a [QuadInstance],
+    /// Item quads in z-order (last drawn on top), each naming its texture.
+    pub items: &'a [ItemQuad],
     /// The CPU-raster HUD readout, if any.
     pub hud: HudUpload<'a>,
 }
@@ -185,7 +187,17 @@ impl GpuSurface {
             "surface configured"
         );
 
-        let canvas = Canvas::new(&device, &queue, config.format);
+        let canvas = Canvas::new(&device, config.format);
+        let max_side = device
+            .limits()
+            .max_texture_dimension_2d
+            .min(MAX_TEXTURE_SIDE);
+        let textures = TextureCache::new(&device, canvas.item_texture_layout(), max_side);
+        tracing::info!(
+            max_texture_side = textures.max_side(),
+            budget_bytes = textures.budget_bytes(),
+            "item textures ready"
+        );
 
         Some(Self {
             surface,
@@ -193,6 +205,7 @@ impl GpuSurface {
             queue,
             config,
             canvas,
+            textures,
         })
     }
 
@@ -205,6 +218,42 @@ impl GpuSurface {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
+    }
+
+    /// Uploads full-resolution or preview pixels for `asset`.
+    pub fn upload_texture(
+        &mut self,
+        asset: rizref_core::AssetId,
+        image: &rizref_codecs::ImageBuffer,
+        is_preview: bool,
+    ) {
+        self.textures
+            .upload(&self.device, &self.queue, asset, image, is_preview);
+    }
+
+    /// Whether `asset` has a resident texture.
+    pub fn has_texture(&self, asset: rizref_core::AssetId) -> bool {
+        self.textures.contains(asset)
+    }
+
+    /// Whether `asset`'s resident texture is only its preview.
+    pub fn texture_is_preview(&self, asset: rizref_core::AssetId) -> bool {
+        self.textures.is_preview(asset).unwrap_or(false)
+    }
+
+    /// Marks `asset` as visible this frame for LRU purposes.
+    pub fn touch_texture(&mut self, asset: rizref_core::AssetId) {
+        self.textures.touch(asset);
+    }
+
+    /// Number of resident item textures, for diagnostics.
+    pub fn texture_count(&self) -> usize {
+        self.textures.len()
+    }
+
+    /// VRAM held by item textures, for diagnostics.
+    pub fn texture_bytes(&self) -> u64 {
+        self.textures.used_bytes()
     }
 
     /// Renders one frame: acquire, draw the canvas, present.
@@ -246,6 +295,15 @@ impl GpuSurface {
             frame.scene_rect,
             frame.hud_size(),
         );
+        for item in frame.items {
+            self.textures.touch(item.asset);
+        }
+        self.textures.trim(None);
+        let bind_groups: Vec<Option<&wgpu::BindGroup>> = frame
+            .items
+            .iter()
+            .map(|item| self.textures.bind_group(item.asset))
+            .collect();
         self.canvas
             .set_items(&self.device, &self.queue, frame.items);
         self.canvas.set_hud(&self.device, &self.queue, frame.hud);
@@ -273,7 +331,7 @@ impl GpuSurface {
                 ..Default::default()
             });
             self.canvas.draw_background(&mut pass);
-            self.canvas.draw_items(&mut pass);
+            self.canvas.draw_items(&mut pass, &bind_groups);
             self.canvas.draw_hud(&mut pass);
         }
 

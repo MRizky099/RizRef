@@ -14,6 +14,9 @@ members = [
     "crates/rizref-format",
     "crates/rizref-codecs",
 ]
+# The fuzz crate needs a nightly toolchain and its own pinned dependencies; it
+# is built by the dedicated CI job, never by `cargo test --workspace`.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -68,6 +71,9 @@ image = { version = "0.25.10", default-features = false, features = [
 
 # --- window, GPU, clipboard, dialogs: rizref (bin) -------------------------
 winit = "0.30.13"
+# The import worker pool: std threads coordinated by bounded/unbounded MPMC
+# channels. Pure Rust, no async runtime.
+crossbeam-channel = "0.5.17"
 # Backend order: Vulkan -> DX12 (see README.md); the Metal and WebGPU backends are
 # switched off deliberately, and the GL fallback is dropped by decision rather than
 # left ambiguous.

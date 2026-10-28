@@ -12,8 +12,10 @@
 //! * **Logging location.** The user's local-appdata directory, queried from the
 //!   environment at runtime — never a hardcoded path.
 //!
-//! Drag-and-drop (`IDropTarget`) and the Explorer thumbnail provider belong here
-//! too, in later phases.
+//! Drag-and-drop is handled through winit's file-drop events in this phase; an
+//! OLE `IDropTarget` for virtual files (Outlook attachments) is a documented
+//! stretch item, and the Explorer thumbnail provider belongs here too in later
+//! phases.
 //!
 //! # Unsafe code
 //!

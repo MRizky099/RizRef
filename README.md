@@ -15,9 +15,12 @@ phase:
 gh issue list --repo MRizky099/RizRef --state open
 ```
 
-Phase 00 (workspace, dependency policy, lint/CI policy, budgets) has landed: the
-workspace builds, tests and lints clean, and the binary reports what it was built
-with. The window, the GPU surface and the render loop are phase 01.
+Phase 00 (workspace, dependency policy, lint/CI policy, budgets), phase 01 (window,
+Vulkan→DX12 surface, on-demand pacing, single instance, logs), phase 02 (f64 camera,
+pan/zoom/rotate, grid, quad + HUD pipelines) and phase 03 (worker-thread image import
+with EXIF-aware decoding, BLAKE3 asset dedup, previews, drag & drop, clipboard paste,
+Ctrl+O and per-item sRGB textures) have landed. The workspace builds, tests and lints
+clean.
 
 ## Design principles
 
@@ -72,8 +75,9 @@ between crates. These are the pinned versions:
 | ICO | `ico` | 0.6.0 | largest embedded image wins |
 | Clipboard | `arboard` | 3.7.0 | OS FFI only |
 | Native dialogs | `rfd` | 0.17.2 | COM `IFileDialog` FFI |
+| Import workers | `crossbeam-channel` | 0.5.17 | pure Rust, no async runtime |
 | Serialization | `serde` / `serde_json` | 1.0.229 / 1.0.154 | pure Rust |
-| Compression | `lz4_flex` | 0.14.0 | pure Rust |
+| Compression | `lz4_flex` | 0.14.0 | pure Rust |asset identity and container checksums
 | Hashing | `blake3` | 1.8.7 | `features = ["pure"]` — see below |
 | Logging | `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | pure Rust |
 | Platform FFI | `windows` | 0.62.2 | declared for phase 01; not linked yet |
@@ -119,9 +123,17 @@ cargo build --workspace        # build every crate
 cargo run -p rizref            # print what this build contains (no window yet)
 cargo run -p rizref -- --help  # flags this build accepts
 cargo test --workspace         # run all tests
+cargo run -p rizref-codecs --example make_fixtures   # regenerate committed codec fixtures
 cargo bench -p rizref-core -p rizref-format   # skeleton benchmarks
 cargo fmt --all                # formatting
 cargo clippy --workspace --all-targets -- -D warnings   # lint policy, as CI runs it
+```
+
+Fuzzing lives in the workspace-excluded `fuzz/` crate and needs nightly:
+
+```bash
+cargo install cargo-fuzz
+cargo fuzz run decode_any -- -max_total_time=600   # 10-minute acceptance soak
 ```
 
 Lints are workspace-wide (`[workspace.lints]`): `unsafe_code` is denied in every crate,

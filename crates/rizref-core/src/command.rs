@@ -115,19 +115,28 @@ impl Default for History {
 #[cfg(test)]
 mod tests {
     use super::{Command, History};
+    use crate::asset::AssetId;
+    use crate::item::ImageItem;
     use crate::scene::{ItemId, Scene, SceneId};
+    use glam::Vec2;
 
     /// Test-only command: appends one item, remembers the z-position it occupied.
     #[derive(Debug)]
     struct AddItem {
-        item: ItemId,
+        item: ImageItem,
         position: Option<usize>,
     }
 
     impl AddItem {
         fn new(raw: u64) -> Self {
+            let id = ItemId::from_raw(raw);
             Self {
-                item: ItemId::from_raw(raw),
+                item: ImageItem::new(
+                    id,
+                    AssetId::from_checksum([raw as u8; 32]),
+                    Vec2::splat(raw as f32),
+                    Vec2::splat(4.0),
+                ),
                 position: None,
             }
         }
@@ -139,12 +148,12 @@ mod tests {
         }
 
         fn apply(&mut self, scene: &mut Scene) {
-            scene.push(self.item);
+            scene.push(self.item.clone());
             self.position = Some(scene.len() - 1);
         }
 
         fn revert(&mut self, scene: &mut Scene) {
-            let removed = scene.remove(self.item);
+            let removed = scene.remove(self.item.id());
             assert_eq!(removed, self.position, "undo must restore the z-order");
         }
     }
@@ -193,7 +202,10 @@ mod tests {
 
         assert_eq!(history.redo_len(), 0);
         assert!(!history.can_redo());
-        assert_eq!(scene.items, vec![ItemId::from_raw(2)]);
+        assert_eq!(
+            scene.items.iter().map(|item| item.id()).collect::<Vec<_>>(),
+            vec![ItemId::from_raw(2)]
+        );
     }
 
     #[test]
@@ -212,7 +224,10 @@ mod tests {
 
         // The first command fell out of the history, so its item stays on the board.
         assert!(!history.can_undo());
-        assert_eq!(scene.items, vec![ItemId::from_raw(1)]);
+        assert_eq!(
+            scene.items.iter().map(|item| item.id()).collect::<Vec<_>>(),
+            vec![ItemId::from_raw(1)]
+        );
     }
 
     #[test]

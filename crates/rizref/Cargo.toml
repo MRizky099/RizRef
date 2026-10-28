@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 winit.workspace = true
+crossbeam-channel.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 tiny-skia.workspace = true

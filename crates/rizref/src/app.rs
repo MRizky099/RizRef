@@ -20,19 +20,23 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use glam::DVec2;
-use rizref_core::{ItemId, Scene, SceneId, SceneRectTracker};
+use glam::{DVec2, Vec2};
+use rizref_core::{Asset, Rect, Scene, SceneId, SceneRectTracker};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::canvas::{self, HudUpload};
+use crate::canvas::{HudUpload, ItemQuad, QuadInstance};
+use crate::clipboard::{self, ClipboardContent};
 use crate::dev_state;
 use crate::hud::HudSurface;
+use crate::import::{ImportOutcome, ImportRequest, Importer};
 use crate::input::{self, Button as InputButton, Command, Key as InputKey, Trigger};
+use crate::memory::DecodeCache;
+use crate::placement;
 use crate::platform::{self, SingleInstance, forward_args_to_primary, serve_forwarded_args};
 use crate::renderer::{FrameError, FrameParams, GpuSurface};
 use crate::text::TextEngine;
@@ -319,6 +323,8 @@ fn install_panic_hook(log_dir: PathBuf) {
 enum AppEvent {
     /// A second launch handed its arguments to this instance.
     ForwardedArgs(Vec<String>),
+    /// An import worker finished one request.
+    Import(Box<ImportOutcome>),
 }
 
 /// Everything the event loop owns: the window, its surface, the canvas state
@@ -329,42 +335,36 @@ struct App {
     renderer: Option<GpuSurface>,
     /// The camera, the active gesture and the zoom animation.
     view: ViewState,
-    /// The board: item z-order and the tracked scene rect. Placeholder content
-    /// until the image pipeline lands in phase 03.
-    #[allow(dead_code)]
+    /// The board: items, their z-order and the shared assets they show.
     scene: Scene,
     scene_rects: SceneRectTracker,
-    /// Item ids of the placeholder items, parallel to their instances. The
-    /// scene and the ids join the manipulation phase (04); phase 02 reads only
-    /// the tracked rect and the instances.
-    #[allow(dead_code)]
-    placeholder_ids: Vec<ItemId>,
-    /// The instances the renderer draws, in scene z-order.
-    instances: Vec<canvas::QuadInstance>,
+    /// Full-resolution decoded bitmaps under the memory cap.
+    decode_cache: DecodeCache,
+    /// The import worker pool, `None` only if no thread could start.
+    importer: Option<Importer>,
+    /// Paths from the command line or a second launch, imported once the
+    /// window and its camera exist.
+    pending_paths: Vec<String>,
     /// Font system and glyph caches for the HUD readout.
     text: TextEngine,
     /// The CPU-raster readout surface, sized once the scale factor is known.
     hud: Option<HudSurface>,
     /// Keyboard modifiers as of the last `ModifiersChanged`.
     modifiers: ModifiersState,
-    /// Arguments a second launch forwarded here; phase 05+ opens them.
-    forwarded_paths: Vec<String>,
 }
 
 impl App {
-    fn new(plan: WindowPlan) -> Self {
-        // A placeholder dev scene with the eight pipeline-test items; phase 03
-        // replaces both with real decoded images.
-        let mut scene = Scene::new(SceneId::from_bytes(*b"rizref-dev-scene"));
-        let instances = canvas::placeholder_items();
-        let mut scene_rects = SceneRectTracker::new();
-        let mut placeholder_ids = Vec::with_capacity(instances.len());
-        for (index, instance) in instances.iter().enumerate() {
-            let id = ItemId::from_raw(index as u64 + 1);
-            scene.push(id);
-            scene_rects.merge(id, instance.world_rect());
-            placeholder_ids.push(id);
-        }
+    fn new(plan: WindowPlan, proxy: EventLoopProxy<AppEvent>) -> Self {
+        let scene = Scene::new(SceneId::from_bytes(*b"rizref-dev-scene"));
+        let importer = Importer::new(move |outcome| {
+            if proxy
+                .send_event(AppEvent::Import(Box::new(outcome)))
+                .is_err()
+            {
+                tracing::debug!("the event loop is gone; dropping an import result");
+            }
+        });
+        tracing::info!(workers = importer.worker_count(), "import pool started");
 
         // The camera survives restarts through the dev dump (phase 06 moves it
         // into the .rizref container); without one, the default view.
@@ -375,13 +375,13 @@ impl App {
             window: None,
             renderer: None,
             scene,
-            scene_rects,
-            placeholder_ids,
-            instances,
+            scene_rects: SceneRectTracker::new(),
+            decode_cache: DecodeCache::with_default_cap(),
+            importer: Some(importer),
+            pending_paths: Vec::new(),
             text: TextEngine::new(),
             hud: None,
             modifiers: ModifiersState::default(),
-            forwarded_paths: Vec::new(),
         }
     }
 
@@ -456,6 +456,202 @@ impl App {
         let height = ((READOUT_HEIGHT * scale).round() as u32).max(1);
         self.hud = HudSurface::new(width, height);
     }
+
+    /// The world point new items should gather around.
+    ///
+    /// The cursor when it is over the canvas, the view centre otherwise. A
+    /// dropped file carries no coordinates in winit's event, so the last known
+    /// cursor position is the drop point.
+    fn drop_world(&self) -> Vec2 {
+        if self.view.has_cursor() {
+            self.view.cursor_world().as_vec2()
+        } else {
+            self.view.camera.eye.as_vec2()
+        }
+    }
+
+    /// Submits one import request to the worker pool.
+    fn submit_import(&mut self, request: ImportRequest) {
+        let label = request.source.label.clone();
+        let drop_world = request.drop_world;
+        match self.importer.as_ref() {
+            Some(importer) if importer.submit(request) => {
+                tracing::info!(%label, ?drop_world, "import queued");
+            }
+            _ => tracing::error!(%label, "the import pool is not running"),
+        }
+    }
+
+    /// Queues every path in `paths` as an image import around `drop_world`.
+    fn import_paths(&mut self, paths: Vec<PathBuf>, drop_world: Vec2) {
+        for path in paths {
+            if looks_like_image(&path) {
+                self.submit_import(ImportRequest::path(path, drop_world));
+            } else {
+                tracing::info!(
+                    path = %path.display(),
+                    "not an image; board files are phase 05+"
+                );
+            }
+        }
+    }
+
+    /// Ctrl+V: files first, then a raw bitmap from the clipboard.
+    fn paste(&mut self) {
+        let drop_world = self.drop_world();
+        match clipboard::read() {
+            Ok(ClipboardContent::Files(paths)) => self.import_paths(paths, drop_world),
+            Ok(ClipboardContent::Image { name, png }) => {
+                self.submit_import(ImportRequest::bytes(name, png, drop_world));
+            }
+            Err(reason) => tracing::warn!(%reason, "nothing pasteable on the clipboard"),
+        }
+    }
+
+    /// Ctrl+O: the native multi-select image dialog.
+    fn open_images(&mut self) {
+        if let Some(paths) = crate::dialogs::pick_images() {
+            let drop_world = self.drop_world();
+            self.import_paths(paths, drop_world);
+        }
+    }
+
+    /// Turns one worker result into an asset, an item and a GPU texture.
+    fn apply_import(&mut self, outcome: ImportOutcome) {
+        let imported = match outcome.result {
+            Ok(imported) => imported,
+            Err(error) => {
+                tracing::warn!(
+                    label = %error.label,
+                    reason = %error.reason,
+                    latency_ms = outcome.latency.as_secs_f64() * 1000.0,
+                    "import failed"
+                );
+                return;
+            }
+        };
+
+        let width = imported.image.width() as f32;
+        let height = imported.image.height() as f32;
+        let display = imported.display;
+        let asset = Asset::from_parts(
+            imported.encoded,
+            imported.format,
+            imported.checksum,
+            &imported.image,
+            imported.preview,
+        );
+        let encoded_len = asset.encoded().len();
+        let (asset_id, was_new) = self.scene.insert_asset(asset);
+        if was_new {
+            tracing::info!(
+                asset = %asset_id,
+                bytes = encoded_len,
+                "asset interned"
+            );
+        } else {
+            tracing::info!(
+                asset = %asset_id,
+                bytes = encoded_len,
+                "asset deduplicated; adding another item"
+            );
+        }
+
+        let occupied: Vec<Rect> = self
+            .scene
+            .items()
+            .iter()
+            .map(rizref_core::ImageItem::world_rect)
+            .collect();
+        let center = placement::find_spot(
+            outcome.drop_world,
+            Vec2::new(width, height),
+            &occupied,
+            placement::ITEM_GAP,
+        );
+        let Some(item_id) = self
+            .scene
+            .insert_image(asset_id, center, Vec2::new(width, height))
+        else {
+            tracing::error!(asset = %asset_id, "asset vanished between intern and insert");
+            return;
+        };
+        if let Some(item) = self.scene.item(item_id) {
+            self.scene_rects.merge(item_id, item.world_rect());
+        }
+
+        let pixels = Arc::new(imported.image);
+        let full_bytes = (pixels.width() as u64) * (pixels.height() as u64) * 4;
+        let evicted = self.decode_cache.insert(asset_id, Arc::clone(&pixels));
+        for id in evicted {
+            tracing::debug!(asset = %id, "decoded bitmap evicted from the memory cache");
+        }
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            let upload = display.as_ref().unwrap_or(&pixels);
+            if !renderer.has_texture(asset_id) || renderer.texture_is_preview(asset_id) {
+                renderer.upload_texture(asset_id, upload, false);
+            }
+            tracing::debug!(
+                textures = renderer.texture_count(),
+                vram_bytes = renderer.texture_bytes(),
+                "texture store after import"
+            );
+        }
+
+        tracing::info!(
+            label = %outcome.label,
+            item = %item_id,
+            asset = %asset_id,
+            width = pixels.width(),
+            height = pixels.height(),
+            decoded_bytes = full_bytes,
+            cache_bytes = self.decode_cache.bytes(),
+            cache_entries = self.decode_cache.len(),
+            latency_ms = outcome.latency.as_secs_f64() * 1000.0,
+            "image placed"
+        );
+        self.redraw();
+    }
+
+    /// Builds this frame's drawable items in scene z-order.
+    fn build_items(&self) -> Vec<ItemQuad> {
+        self.scene
+            .items()
+            .iter()
+            .map(|item| {
+                let center = item.center();
+                let size = item.size();
+                let mut instance =
+                    QuadInstance::new([center.x, center.y], [size.x, size.y], item.rotation());
+                instance.tint = [1.0, 1.0, 1.0, item.opacity()];
+                ItemQuad {
+                    instance,
+                    asset: item.asset(),
+                }
+            })
+            .collect()
+    }
+
+    /// Uploads previews for items whose full texture is missing or evicted,
+    /// and upgrades a preview to the full bitmap when the cache still has it.
+    fn ensure_textures(&mut self, items: &[ItemQuad]) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        for item in items {
+            renderer.touch_texture(item.asset);
+            if !renderer.has_texture(item.asset) {
+                if let Some(asset) = self.scene.asset(item.asset) {
+                    renderer.upload_texture(item.asset, asset.preview().image(), true);
+                }
+            } else if renderer.texture_is_preview(item.asset)
+                && let Some(full) = self.decode_cache.get(item.asset)
+            {
+                renderer.upload_texture(item.asset, &full, false);
+            }
+        }
+    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -492,6 +688,15 @@ impl ApplicationHandler<AppEvent> for App {
                 self.renderer = Some(renderer);
                 self.window = Some(window);
                 self.window.as_ref().expect("just set").request_redraw();
+
+                // Command-line and forwarded paths were held until the window
+                // (and therefore the camera and viewport) existed.
+                let pending = std::mem::take(&mut self.pending_paths);
+                if !pending.is_empty() {
+                    let drop_world = self.drop_world();
+                    let paths = pending.into_iter().map(PathBuf::from).collect();
+                    self.import_paths(paths, drop_world);
+                }
             }
             None => {
                 // No GPU surface at all. The CPU raster fallback is a later
@@ -588,6 +793,21 @@ impl ApplicationHandler<AppEvent> for App {
                         if !pressed {
                             return;
                         }
+                        if self.modifiers.control_key()
+                            && let Key::Character(text) = key
+                        {
+                            match text.as_str().to_ascii_lowercase().as_str() {
+                                "v" => {
+                                    self.paste();
+                                    return;
+                                }
+                                "o" => {
+                                    self.open_images();
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
                         let bound = match key {
                             Key::Character(text) => match text.as_str() {
                                 "0" => Some(InputKey::Digit0),
@@ -610,12 +830,25 @@ impl ApplicationHandler<AppEvent> for App {
                 self.modifiers = modifiers.state();
                 self.view.set_ctrl_held(modifiers.state().control_key());
             }
+            WindowEvent::HoveredFile(path) => {
+                tracing::debug!(path = %path.display(), "file hovering; drop to import");
+            }
+            WindowEvent::HoveredFileCancelled => {
+                tracing::debug!("file drag left the window");
+            }
+            WindowEvent::DroppedFile(path) => {
+                let drop_world = self.drop_world();
+                tracing::info!(path = %path.display(), ?drop_world, "file dropped");
+                self.import_paths(vec![path], drop_world);
+            }
             WindowEvent::RedrawRequested => {
                 // Advance the zoom animation first: this frame shows the new
                 // state, and if it is still running the next frame is queued.
                 // The HUD and the frame params are gathered before the
                 // renderer is taken mutably, so the borrows never overlap.
                 let animating = self.view.advance(Instant::now());
+                let items = self.build_items();
+                self.ensure_textures(&items);
                 let text = self.readout_text();
                 let hud_layer = self.render_hud(&text);
                 let Some(renderer) = self.renderer.as_mut() else {
@@ -634,7 +867,7 @@ impl ApplicationHandler<AppEvent> for App {
                     viewport: self.view.viewport(),
                     physical_scale: window.scale_factor(),
                     scene_rect: self.scene_rects.rect(),
-                    items: &self.instances,
+                    items: &items,
                     hud,
                 };
                 match renderer.render(&params) {
@@ -669,8 +902,13 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             AppEvent::ForwardedArgs(args) => {
                 tracing::info!(count = args.len(), "accepted forwarded args");
-                self.forwarded_paths = args;
+                self.pending_paths = args;
+                let pending = std::mem::take(&mut self.pending_paths);
+                let drop_world = self.drop_world();
+                let paths = pending.into_iter().map(PathBuf::from).collect();
+                self.import_paths(paths, drop_world);
             }
+            AppEvent::Import(outcome) => self.apply_import(*outcome),
         }
     }
 
@@ -681,6 +919,17 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         // Desktop Windows does not suspend windows; nothing to release.
+    }
+}
+
+/// Whether a path is worth handing to the import worker.
+///
+/// The decoder sniffs magic, not names, so an extensionless file is submitted;
+/// a name that clearly belongs to another format (a board, a document) is not.
+fn looks_like_image(path: &std::path::Path) -> bool {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        None => true,
+        Some(extension) => rizref_codecs::ImageFormat::from_extension(extension).is_some(),
     }
 }
 
@@ -705,12 +954,13 @@ fn run_window(guard: Option<SingleInstance>, parsed: ParsedArgs) -> ExitCode {
     // The pipe server must exist before the window: a secondary that arrives
     // during startup finds it waiting instead of racing it.
     let proxy = event_loop.create_proxy();
+    let app_proxy = proxy.clone();
     serve_forwarded_args(move |args| {
         let _ = proxy.send_event(AppEvent::ForwardedArgs(args));
     });
 
-    let mut app = App::new(WindowPlan::default());
-    app.forwarded_paths = parsed.paths;
+    let mut app = App::new(WindowPlan::default(), app_proxy);
+    app.pending_paths = parsed.paths;
     match event_loop.run_app(&mut app) {
         Ok(()) => {
             tracing::info!("exited cleanly");
@@ -792,8 +1042,10 @@ fn check_dialogs() {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANVAS_BACKGROUND, LOG_FILES_KEPT, WindowPlan, parse_args, stale_logs, version_line,
+        CANVAS_BACKGROUND, LOG_FILES_KEPT, WindowPlan, looks_like_image, parse_args, stale_logs,
+        version_line,
     };
+    use std::path::Path;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(std::string::ToString::to_string).collect()
@@ -870,6 +1122,18 @@ mod tests {
             keep_all.is_empty(),
             "the configured retention prunes nothing at {LOG_FILES_KEPT}"
         );
+    }
+
+    #[test]
+    fn only_plausible_image_paths_reach_the_importer() {
+        assert!(looks_like_image(Path::new("reference.png")));
+        assert!(looks_like_image(Path::new("REFERENCE.JPG")));
+        assert!(
+            looks_like_image(Path::new("download")),
+            "extensionless files are sniffed by the worker"
+        );
+        assert!(!looks_like_image(Path::new("board.rizref")));
+        assert!(!looks_like_image(Path::new("notes.txt")));
     }
 
     #[test]

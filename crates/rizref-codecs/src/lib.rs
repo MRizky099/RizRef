@@ -35,10 +35,11 @@ pub mod buffer;
 pub mod decode;
 pub mod encode;
 pub mod error;
+mod exif;
 pub mod sniff;
 
 pub use buffer::ImageBuffer;
-pub use decode::{decode, decode_as};
+pub use decode::{DecodeLimits, decode, decode_as, decode_as_with_limits, decode_with_limits};
 pub use encode::{encode_jpeg, encode_png};
 pub use error::CodecError;
 pub use sniff::{ImageFormat, sniff};

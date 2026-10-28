@@ -69,3 +69,26 @@ jobs:
             printf '::error::dependency tree contains native bindings that are not accepted: %s\n' "$unexpected"
             exit 1
           fi
+
+  fuzz:
+    name: fuzz (short corpus)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # 30 seconds per codec family keeps a pull request honest; the phase-03
+      # acceptance soak (10 minutes per target) is run manually with
+      # `cargo fuzz run <target> -- -max_total_time=600`.
+      - name: Fuzz every codec family
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          set -euo pipefail
+          for target in decode_any decode_png decode_jpeg decode_gif decode_webp decode_plain decode_ico; do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=30 -print_final_stats=1
+            echo "::endgroup::"
+          done

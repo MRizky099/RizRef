@@ -40,7 +40,8 @@ pub enum CodecError {
         /// What the encoder reported.
         reason: String,
     },
-    /// The image dimensions cannot be expressed in the target format.
+    /// The image dimensions exceed a decode limit or cannot be expressed in the
+    /// target format.
     TooLarge {
         /// Pixel width that was requested.
         width: u32,
@@ -66,10 +67,9 @@ impl fmt::Display for CodecError {
             Self::Encode { format, reason } => {
                 write!(formatter, "cannot encode {} image: {reason}", format.name())
             }
-            Self::TooLarge { width, height } => write!(
-                formatter,
-                "image of {width} x {height} pixels is too large for the target format"
-            ),
+            Self::TooLarge { width, height } => {
+                write!(formatter, "image of {width} x {height} pixels is too large")
+            }
         }
     }
 }
@@ -124,7 +124,7 @@ mod tests {
                 height: 70_000,
             }
             .to_string(),
-            "image of 70000 x 70000 pixels is too large for the target format"
+            "image of 70000 x 70000 pixels is too large"
         );
     }
 }

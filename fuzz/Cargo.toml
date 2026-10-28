@@ -1,0 +1,65 @@
+[package]
+name = "rizref-codecs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rizref-codecs = { path = "../crates/rizref-codecs" }
+
+[workspace]
+# Deliberately its own workspace: the fuzz crate needs nightly, while the
+# application builds on stable.
+
+[[bin]]
+name = "decode_any"
+path = "fuzz_targets/decode_any.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_png"
+path = "fuzz_targets/decode_png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_jpeg"
+path = "fuzz_targets/decode_jpeg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_gif"
+path = "fuzz_targets/decode_gif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_webp"
+path = "fuzz_targets/decode_webp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_plain"
+path = "fuzz_targets/decode_plain.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_ico"
+path = "fuzz_targets/decode_ico.rs"
+test = false
+doc = false
+bench = false

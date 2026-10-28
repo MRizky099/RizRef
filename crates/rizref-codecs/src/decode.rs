@@ -12,12 +12,50 @@ use std::io::Cursor;
 
 use crate::buffer::ImageBuffer;
 use crate::error::CodecError;
+use crate::exif;
 use crate::sniff::{ImageFormat, sniff};
 
-/// Decodes `bytes`, choosing the decoder from the file's signature.
+/// Resource limits applied before a decoder is allowed to allocate pixels.
+///
+/// Reference boards import files from the internet, so a hostile or merely
+/// absurd header must be refused *before* a bitmap is allocated. The default
+/// caps a single image at 100 megapixels — larger than any camera or reference
+/// sheet, and still over a gigabyte at one byte per channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    /// Largest accepted `width × height` product.
+    pub max_pixels: u64,
+}
+
+impl DecodeLimits {
+    /// The default 100 MP cap.
+    pub const DEFAULT: Self = Self {
+        max_pixels: 100_000_000,
+    };
+
+    /// Whether `width × height` is within the cap.
+    pub fn allows(self, width: u32, height: u32) -> bool {
+        u64::from(width) * u64::from(height) <= self.max_pixels
+    }
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Decodes `bytes` under the default [`DecodeLimits`], choosing the decoder
+/// from the file's signature.
 pub fn decode(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
+    decode_with_limits(bytes, DecodeLimits::default())
+}
+
+/// Decodes `bytes` under explicit resource limits, choosing the decoder from
+/// the file's signature.
+pub fn decode_with_limits(bytes: &[u8], limits: DecodeLimits) -> Result<ImageBuffer, CodecError> {
     let format = sniff(bytes).ok_or(CodecError::Unrecognized)?;
-    decode_as(bytes, format)
+    decode_as_with_limits(bytes, format, limits)
 }
 
 /// Decodes `bytes` that the caller already knows the format of.
@@ -26,15 +64,24 @@ pub fn decode(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
 /// information than the first handful of bytes, such as an import job that
 /// recorded the format when the file was read.
 pub fn decode_as(bytes: &[u8], format: ImageFormat) -> Result<ImageBuffer, CodecError> {
+    decode_as_with_limits(bytes, format, DecodeLimits::default())
+}
+
+/// Decodes `bytes` of a known format under explicit resource limits.
+pub fn decode_as_with_limits(
+    bytes: &[u8],
+    format: ImageFormat,
+    limits: DecodeLimits,
+) -> Result<ImageBuffer, CodecError> {
     match format {
-        ImageFormat::Png => decode_png(bytes),
-        ImageFormat::Jpeg => decode_jpeg(bytes),
-        ImageFormat::Gif => decode_gif(bytes),
-        ImageFormat::WebP => decode_webp(bytes),
+        ImageFormat::Png => decode_png(bytes, limits),
+        ImageFormat::Jpeg => decode_jpeg(bytes, limits),
+        ImageFormat::Gif => decode_gif(bytes, limits),
+        ImageFormat::WebP => decode_webp(bytes, limits),
         ImageFormat::Bmp | ImageFormat::Tga | ImageFormat::Pnm | ImageFormat::Qoi => {
-            decode_plain(bytes, format)
+            decode_plain(bytes, format, limits)
         }
-        ImageFormat::Ico => decode_ico(bytes),
+        ImageFormat::Ico => decode_ico(bytes, limits),
         ImageFormat::Heif => Err(CodecError::Unsupported {
             format,
             detail: "no pure-Rust decoder in this build; HEIC is an accepted gap until a \
@@ -42,6 +89,31 @@ pub fn decode_as(bytes: &[u8], format: ImageFormat) -> Result<ImageBuffer, Codec
                 .to_owned(),
         }),
     }
+}
+
+/// Refuses dimensions over the caller's cap before any pixels are allocated.
+fn check_limits(width: u32, height: u32, limits: DecodeLimits) -> Result<(), CodecError> {
+    if limits.allows(width, height) {
+        Ok(())
+    } else {
+        Err(CodecError::TooLarge { width, height })
+    }
+}
+
+/// The IHDR dimensions of a PNG, when the bytes open with a complete header.
+///
+/// A PNG begins: 8-byte signature, 4-byte chunk length, `IHDR`, then width and
+/// height as big-endian `u32`. Reading those 24 bytes is enough to enforce the
+/// cap without trusting the rest of the file.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+    let header = bytes.get(..24)?;
+    if header[..8] != SIGNATURE || &header[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(header[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(header[20..24].try_into().ok()?);
+    Some((width, height))
 }
 
 /// Reports a decoder failure, keeping the format for the message.
@@ -86,7 +158,14 @@ fn expand_channels(source: &[u8], channels: usize, alpha: u8) -> Vec<u8> {
 }
 
 /// PNG, through the `png` crate.
-fn decode_png(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
+fn decode_png(bytes: &[u8], limits: DecodeLimits) -> Result<ImageBuffer, CodecError> {
+    // Read the IHDR dimensions directly: the decoder's own header pass refuses
+    // a file without IDAT, which would turn "too large" into a vague decode
+    // error before the cap is consulted.
+    if let Some((width, height)) = png_dimensions(bytes) {
+        check_limits(width, height, limits)?;
+    }
+
     // Both the PNG and JPEG decoders need a seekable reader; a borrowed slice
     // wrapped in a cursor is exactly that, with nothing copied.
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
@@ -99,6 +178,9 @@ fn decode_png(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
     let mut reader = decoder
         .read_info()
         .map_err(|error| failed(ImageFormat::Png, error))?;
+    let info = reader.info();
+    check_limits(info.width, info.height, limits)?;
+
     let mut buffer = vec![
         0_u8;
         reader.output_buffer_size().ok_or_else(|| failed(
@@ -128,32 +210,49 @@ fn decode_png(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
     finish(ImageFormat::Png, info.width, info.height, rgba)
 }
 
-/// JPEG, through `zune-jpeg`.
-fn decode_jpeg(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
+/// JPEG, through `zune-jpeg`, with EXIF orientation applied.
+fn decode_jpeg(bytes: &[u8], limits: DecodeLimits) -> Result<ImageBuffer, CodecError> {
     // Ask for RGBA directly: JPEG has no alpha, and letting the decoder expand
     // the chroma planes removes a BGR/RGB guess from this crate.
     let options = zune_jpeg::zune_core::options::DecoderOptions::default()
         .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(bytes), options);
 
-    let pixels = decoder
-        .decode()
+    // Read the frame header first so an oversized image is refused before the
+    // decoder allocates its output buffer.
+    decoder
+        .decode_headers()
         .map_err(|error| failed(ImageFormat::Jpeg, error))?;
     let (width, height) = decoder
         .dimensions()
         .ok_or_else(|| failed(ImageFormat::Jpeg, "image dimensions are missing"))?;
+    check_limits(width as u32, height as u32, limits)?;
 
-    finish(ImageFormat::Jpeg, width as u32, height as u32, pixels)
+    let pixels = decoder
+        .decode()
+        .map_err(|error| failed(ImageFormat::Jpeg, error))?;
+
+    let image = finish(ImageFormat::Jpeg, width as u32, height as u32, pixels)?;
+    Ok(exif::apply_orientation(
+        image,
+        exif::jpeg_orientation(bytes),
+    ))
 }
 
 /// GIF, through the `gif` crate; only the first frame is used.
-fn decode_gif(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
+fn decode_gif(bytes: &[u8], limits: DecodeLimits) -> Result<ImageBuffer, CodecError> {
     let mut options = gif::DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);
 
     let mut decoder = options
         .read_info(bytes)
         .map_err(|error| failed(ImageFormat::Gif, error))?;
+    check_limits(
+        u32::from(decoder.width()),
+        u32::from(decoder.height()),
+        limits,
+    )?;
+
     let frame = decoder
         .read_next_frame()
         .map_err(|error| failed(ImageFormat::Gif, error))?
@@ -168,10 +267,11 @@ fn decode_gif(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
 }
 
 /// WebP, through `image-webp`; lossy and lossless are both handled.
-fn decode_webp(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
+fn decode_webp(bytes: &[u8], limits: DecodeLimits) -> Result<ImageBuffer, CodecError> {
     let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes))
         .map_err(|error| failed(ImageFormat::WebP, error))?;
     let (width, height) = decoder.dimensions();
+    check_limits(width, height, limits)?;
     let has_alpha = decoder.has_alpha();
 
     // The decoder writes 4 bytes per pixel only when the file carries alpha;
@@ -191,14 +291,22 @@ fn decode_webp(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
         expand_channels(&buffer, 3, u8::MAX)
     };
 
-    finish(ImageFormat::WebP, width, height, rgba)
+    let image = finish(ImageFormat::WebP, width, height, rgba)?;
+    Ok(exif::apply_orientation(
+        image,
+        exif::webp_orientation(bytes),
+    ))
 }
 
 /// BMP, TGA, PNM and QOI, through the trimmed `image` backends.
 ///
 /// Grouped into one call because they share a shape: a simple container with no
 /// colour management to speak of, and no need for a dedicated pure-Rust crate.
-fn decode_plain(bytes: &[u8], format: ImageFormat) -> Result<ImageBuffer, CodecError> {
+fn decode_plain(
+    bytes: &[u8],
+    format: ImageFormat,
+    limits: DecodeLimits,
+) -> Result<ImageBuffer, CodecError> {
     let backend = match format {
         ImageFormat::Bmp => image::ImageFormat::Bmp,
         ImageFormat::Tga => image::ImageFormat::Tga,
@@ -206,6 +314,13 @@ fn decode_plain(bytes: &[u8], format: ImageFormat) -> Result<ImageBuffer, CodecE
         ImageFormat::Qoi => image::ImageFormat::Qoi,
         _ => return Err(CodecError::Unrecognized),
     };
+
+    // `into_dimensions` reads the header only: the cap must be enforced before
+    // `load_from_memory_with_format` allocates the bitmap.
+    let (width, height) = image::ImageReader::with_format(Cursor::new(bytes), backend)
+        .into_dimensions()
+        .map_err(|error| failed(format, error))?;
+    check_limits(width, height, limits)?;
 
     let decoded = image::load_from_memory_with_format(bytes, backend)
         .map_err(|error| failed(format, error))?;
@@ -216,7 +331,7 @@ fn decode_plain(bytes: &[u8], format: ImageFormat) -> Result<ImageBuffer, CodecE
 }
 
 /// ICO, through the `ico` crate; the largest embedded image wins.
-fn decode_ico(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
+fn decode_ico(bytes: &[u8], limits: DecodeLimits) -> Result<ImageBuffer, CodecError> {
     let directory =
         ico::IconDir::read(Cursor::new(bytes)).map_err(|error| failed(ImageFormat::Ico, error))?;
 
@@ -225,6 +340,7 @@ fn decode_ico(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
         .iter()
         .max_by_key(|entry| u64::from(entry.width()) * u64::from(entry.height()))
         .ok_or_else(|| failed(ImageFormat::Ico, "icon contains no images"))?;
+    check_limits(best.width(), best.height(), limits)?;
 
     let image = best
         .decode()
@@ -240,7 +356,7 @@ fn decode_ico(bytes: &[u8]) -> Result<ImageBuffer, CodecError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, decode_as};
+    use super::{DecodeLimits, decode, decode_as, decode_with_limits};
     use crate::buffer::ImageBuffer;
     use crate::error::CodecError;
     use crate::sniff::ImageFormat;
@@ -503,5 +619,88 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_header_over_the_megapixel_cap_is_refused_before_decoding() {
+        // A real IHDR but no image data: the dimensions are readable, so the
+        // cap can answer without ever allocating the 1.6 GB bitmap.
+        let mut bytes = Vec::new();
+        {
+            let encoder = png::Encoder::new(&mut bytes, 20_000, 20_000);
+            let _writer = encoder.write_header().expect("header");
+        }
+
+        let error = decode_with_limits(&bytes, DecodeLimits::default())
+            .expect_err("400 MP is over the default cap");
+
+        assert!(
+            matches!(
+                error,
+                CodecError::TooLarge {
+                    width: 20_000,
+                    height: 20_000
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_megapixel_cap_is_exclusive_of_nothing_under_it() {
+        let original = sample();
+        let bytes = png_of(&original);
+
+        let limits = DecodeLimits {
+            max_pixels: u64::from(original.width()) * u64::from(original.height()),
+        };
+        assert!(decode_with_limits(&bytes, limits).is_ok());
+
+        let below = DecodeLimits {
+            max_pixels: limits.max_pixels - 1,
+        };
+        assert!(matches!(
+            decode_with_limits(&bytes, below),
+            Err(CodecError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn exif_orientation_is_baked_into_the_decoded_jpeg() {
+        let original = ImageBuffer::filled(4, 2, [90, 100, 110, 255]);
+        let mut bytes = jpeg_of(&original, 95);
+
+        // Insert an APP1 EXIF segment (little-endian TIFF, orientation 6 =
+        // rotate 90 degrees clockwise) right after SOI.
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42_u16.to_le_bytes());
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        tiff.extend_from_slice(&1_u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112_u16.to_le_bytes());
+        tiff.extend_from_slice(&3_u16.to_le_bytes());
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&6_u16.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]);
+        tiff.extend_from_slice(&0_u32.to_le_bytes());
+
+        let mut segment = vec![0xFF, 0xE1];
+        let length = (2 + 6 + tiff.len()) as u16;
+        segment.extend_from_slice(&length.to_be_bytes());
+        segment.extend_from_slice(b"Exif\0\0");
+        segment.extend_from_slice(&tiff);
+
+        let mut with_exif = bytes[..2].to_vec();
+        with_exif.extend_from_slice(&segment);
+        with_exif.extend_from_slice(&bytes[2..]);
+        bytes = with_exif;
+
+        let decoded = decode(&bytes).expect("decode rotated jpeg");
+
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (2, 4),
+            "orientation 6 swaps the dimensions"
+        );
     }
 }

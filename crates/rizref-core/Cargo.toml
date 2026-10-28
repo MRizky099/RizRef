@@ -9,8 +9,11 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+rizref-codecs = { path = "../rizref-codecs" }
 glam.workspace = true
 serde.workspace = true
+# Content identity for assets: the checksum of the original encoded bytes.
+blake3.workspace = true
 
 # `harness = false`: stable Rust has no `#[bench]`, so the target is a small
 # program that prints its own timings. `test = false` keeps `cargo test` from

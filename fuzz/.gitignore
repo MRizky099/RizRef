@@ -1,0 +1,6 @@
+target/
+corpus/
+artifacts/
+coverage/
+# Resolved fresh by the fuzz job; it churns with nightly-only dependencies.
+Cargo.lock
