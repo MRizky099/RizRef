@@ -192,3 +192,14 @@ fn the_fuzzer_found_ico_palette_overflow_is_a_decode_error() {
         "unexpected error: {error:?}"
     );
 }
+
+#[test]
+fn an_eight_bit_ico_reproducer_does_not_panic() {
+    // 70 bytes from the same fuzz target. The first version of the ICO
+    // validator panicked on it while computing its bit mask (`1u8 << 8`).
+    let bytes = fixture("malformed-ico-eight-bit.ico");
+
+    let outcome = std::panic::catch_unwind(|| decode(&bytes));
+
+    assert!(outcome.is_ok(), "decode panicked on the 8-bit reproducer");
+}

@@ -423,8 +423,27 @@ fn check_ico_bitmap(data: &[u8], limits: DecodeLimits) -> Result<(), CodecError>
     let bits = bits as usize;
     let row_bytes = (width * bits).div_ceil(8);
     let stride = row_bytes.div_ceil(4) * 4;
-    let per_byte = 8 / bits;
-    let mask = (1_u8 << bits) - 1;
+
+    // `ico` unpacks a 4-bit row without honouring the image width: an odd
+    // width writes one pixel past the end of the bottom row and panics. No
+    // validation of the data can make that decode safe, so such an entry is
+    // reported as unsupported instead.
+    if bits == 4 && !width.is_multiple_of(2) {
+        return Err(failed(
+            ImageFormat::Ico,
+            "4-bit icon has an odd width, which its decoder cannot unpack",
+        ));
+    }
+
+    let check = |index: u8| -> Result<(), CodecError> {
+        if usize::from(index) >= colors {
+            return Err(failed(
+                ImageFormat::Ico,
+                format!("indexed icon uses colour {index} but its palette holds {colors}"),
+            ));
+        }
+        Ok(())
+    };
 
     let mut offset = palette_end;
     for _row in 0..pixel_height as usize {
@@ -434,24 +453,31 @@ fn check_ico_bitmap(data: &[u8], limits: DecodeLimits) -> Result<(), CodecError>
         // panicked exactly this way.
         let available = data.len().saturating_sub(offset).min(row_bytes);
         let row_data = &data[offset..offset + available];
-        let mut pixels = 0;
-        for &byte in row_data {
-            for sub in 0..per_byte {
-                if pixels == width {
-                    break;
+        // The per-depth loops mirror `ico` exactly, including its quirks: the
+        // 4-bit arm ignores the width and unpacks both nibbles of every byte.
+        match bits {
+            1 => {
+                let mut col = 0;
+                for &byte in row_data {
+                    for bit in 0..8 {
+                        check((byte >> (7 - bit)) & 1)?;
+                        col += 1;
+                        if col == width {
+                            break;
+                        }
+                    }
                 }
-                let shift = 8 - bits * (sub + 1);
-                let index = (byte >> shift) & mask;
-                if usize::from(index) >= colors {
-                    return Err(failed(
-                        ImageFormat::Ico,
-                        format!("indexed icon uses colour {index} but its palette holds {colors}"),
-                    ));
-                }
-                pixels += 1;
             }
-            if pixels == width {
-                break;
+            4 => {
+                for &byte in row_data {
+                    check((byte >> 4) & 0xF)?;
+                    check(byte & 0xF)?;
+                }
+            }
+            _ => {
+                for &byte in row_data {
+                    check(byte)?;
+                }
             }
         }
         offset = offset.saturating_add(stride);
@@ -738,6 +764,30 @@ mod tests {
             super::check_ico_bitmap(&entry, DecodeLimits::default()).is_err(),
             "a truncated row must not skip the bytes that are present"
         );
+    }
+
+    #[test]
+    fn an_8_bit_icon_is_scanned_without_a_shift_overflow() {
+        // 8 bits is the depth where a naive `1u8 << bits` mask panics; the
+        // second fuzz reproducer hit exactly that in this validator.
+        let entry = bmp_entry(2, 2, 8, 1, 1, &[0x01, 0x00]);
+
+        let error = super::check_ico_bitmap(&entry, DecodeLimits::default())
+            .expect_err("colour 1 is outside a one-colour palette");
+
+        assert!(error.to_string().contains("palette holds 1"), "{error}");
+    }
+
+    #[test]
+    fn a_4_bit_icon_with_an_odd_width_is_refused() {
+        // `ico` writes one pixel past the buffer for odd 4-bit rows, so the
+        // entry must be reported before it reaches the crate.
+        let entry = bmp_entry(3, 2, 4, 16, 16, &[0u8; 8]);
+
+        let error = super::check_ico_bitmap(&entry, DecodeLimits::default())
+            .expect_err("an odd 4-bit row cannot be unpacked safely");
+
+        assert!(error.to_string().contains("odd width"), "{error}");
     }
 
     #[test]
