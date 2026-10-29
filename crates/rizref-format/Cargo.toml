@@ -10,10 +10,17 @@ workspace = true
 
 [dependencies]
 rizref-core = { path = "../rizref-core" }
+# Preview and thumbnail encoding/decoding: the container stores encoded image
+# bytes, and turning a decoded preview into one (or back) is codec work.
+rizref-codecs = { path = "../rizref-codecs" }
+glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 lz4_flex.workspace = true
 blake3.workspace = true
+# The board thumbnail composite: tested CPU rasterisation, already used by the
+# application's own UI layer.
+tiny-skia.workspace = true
 
 # `harness = false`: stable Rust has no `#[bench]`, so the target is a small
 # program that prints its own timings. `test = false` keeps `cargo test` from

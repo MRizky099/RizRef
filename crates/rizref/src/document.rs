@@ -1,16 +1,19 @@
-//! The open document's identity and unsaved state.
+//! The open document's identity, file path and unsaved state.
 //!
-//! Only the title-bar shell needs this today: the display name, the unsaved
-//! marker and the dirty flag that guards closing the window. The `.rizref`
-//! reader/writer in phase 06 will fill in a real path and clear the flag on a
-//! successful save; keeping the state here means the window title, the close
-//! guard and that future save path cannot disagree about what "unsaved" means.
+//! The title bar shows the display name and the unsaved marker; the close guard
+//! uses the dirty flag; and the save/open paths use the file path. Keeping all
+//! three here means the window title, the guard and the save path cannot
+//! disagree about what "unsaved" or "this board" means.
+
+use std::path::{Path, PathBuf};
 
 /// One open board document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     /// File name including the `.rizref` extension.
     name: String,
+    /// Where the board is stored, once it has been saved or opened.
+    path: Option<PathBuf>,
     /// Whether the document has changes not written to disk.
     dirty: bool,
 }
@@ -23,13 +26,61 @@ impl Document {
     pub fn untitled(number: u32) -> Self {
         Self {
             name: format!("Document{number}.rizref"),
+            path: None,
             dirty: true,
+        }
+    }
+
+    /// A document opened from `path`, initially clean.
+    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Board.rizref")
+            .to_owned();
+        Self {
+            name,
+            path: Some(path),
+            dirty: false,
         }
     }
 
     /// Whether the document has unsaved changes.
     pub const fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// The file path, when the document has one.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// The display name including the extension.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The display name without its extension, for a board's own name field.
+    pub fn stem(&self) -> &str {
+        self.name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or(&self.name)
+    }
+
+    /// Marks the document as stored at `path`, with that file's name.
+    pub fn set_path(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        self.name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Board.rizref")
+            .to_owned();
+        self.path = Some(path);
     }
 
     /// Marks the document as changed. Returns whether the flag actually moved.
@@ -39,8 +90,7 @@ impl Document {
         changed
     }
 
-    /// Marks the document as saved. Used by the phase-06 save path.
-    #[allow(dead_code)]
+    /// Marks the document as saved.
     pub fn mark_saved(&mut self) -> bool {
         let changed = self.dirty;
         self.dirty = false;
@@ -90,8 +140,35 @@ mod tests {
     fn a_name_without_an_extension_gets_a_trailing_marker() {
         let document = Document {
             name: "Notes".to_owned(),
+            path: None,
             dirty: true,
         };
         assert_eq!(document.display_title(), "Notes*");
+    }
+
+    #[test]
+    fn an_opened_document_is_clean_and_keeps_its_path() {
+        let document = Document::from_path("C:/boards/hands study.rizref");
+
+        assert!(!document.is_dirty());
+        assert_eq!(document.display_title(), "hands study.rizref");
+        assert_eq!(document.stem(), "hands study");
+        assert_eq!(
+            document.path().expect("path"),
+            std::path::Path::new("C:/boards/hands study.rizref")
+        );
+    }
+
+    #[test]
+    fn saving_under_a_new_path_renames_the_document() {
+        let mut document = Document::untitled(3);
+        document.set_path("C:/boards/hero refs.rizref");
+        document.mark_saved();
+
+        assert_eq!(document.display_title(), "hero refs.rizref");
+        assert_eq!(
+            document.path().expect("path").to_string_lossy(),
+            "C:/boards/hero refs.rizref"
+        );
     }
 }

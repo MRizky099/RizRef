@@ -18,9 +18,9 @@
 //! window events into board calls, owns the note editor and the note textures,
 //! and draws whatever the board reports.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,6 +29,7 @@ use glam::{DVec2, Vec2};
 use rizref_core::{
     Asset, AssetId, Camera, Item, ItemBody, ItemId, Rect, Scene, SceneId, Selection,
 };
+use rizref_format::{AssetOrigin, AssetProvenance, SaveMode, SaveRequest};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -40,10 +41,10 @@ use crate::accessibility::Accessibility;
 use crate::board::{Board, CursorHint, Modifiers, ViewInfo};
 use crate::canvas::{FrameFlags, HudUpload, ItemQuad, QuadInstance, UiUpload};
 use crate::clipboard::{self, ClipboardContent};
-use crate::dev_state;
+use crate::dialogs;
 use crate::document::Document;
 use crate::hud::HudSurface;
-use crate::import::{ImportOutcome, ImportRequest, Importer};
+use crate::import::{ImportOutcome, ImportPurpose, ImportRequest, Importer};
 use crate::input::{self, Button as InputButton, Command, Trigger};
 use crate::memory::DecodeCache;
 use crate::note::{self, NoteSession};
@@ -54,7 +55,7 @@ use crate::platform::{
     self, DropEvent, DropRegistration, SingleInstance, forward_args_to_primary,
     serve_forwarded_args,
 };
-use crate::recents::Recents;
+use crate::recents::{Recents, now_unix};
 use crate::renderer::{FrameError, FrameParams, GpuSurface};
 use crate::settings::Settings;
 use crate::shortcuts::{Key as ShortcutKey, KeyChord, ShortcutId, Shortcuts};
@@ -156,6 +157,9 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 /// Exit codes: `0` after a normal run, `2` for an argument this build does not
 /// understand, `1` when the application could not start at all.
 pub fn run(args: Vec<String>) -> ExitCode {
+    if args.first().map(String::as_str) == Some("inspect") {
+        return crate::inspect::run(&args[1..]);
+    }
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => {
             println!("{}", version_line());
@@ -214,6 +218,7 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("    rizref [OPTION]... [FILE]...");
+    println!("    rizref inspect <FILE> [--verify]");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help            print this help and exit");
@@ -221,6 +226,10 @@ fn print_help() {
     println!("    -v, --verbose         log at debug level");
     println!("    --build-info          print what this build contains and exit");
     println!("    --check-dialogs       open the native file dialog and print the chosen paths");
+    println!();
+    println!("SUBCOMMANDS:");
+    println!("    inspect <FILE>        print a board's header, chunks and document summary");
+    println!("                          (--verify recomputes every digest)");
     println!();
     println!("A second launch hands its FILE arguments to the running instance and exits.");
     println!();
@@ -417,6 +426,8 @@ struct App {
     modifiers: ModifiersState,
     /// Playback clocks for the animated assets on the board.
     playbacks: HashMap<AssetId, Playback>,
+    /// Assets whose full-resolution texture has been requested from the pool.
+    pending_textures: BTreeSet<AssetId>,
     /// When the next animation frame is due, for the event loop's timer.
     next_frame_at: Option<Instant>,
     /// The active note edit session, if any.
@@ -445,6 +456,12 @@ struct App {
     shortcuts: Shortcuts,
     /// The recent-board list.
     recents: Recents,
+    /// Provenance hints for assets, persisted in and restored from a board.
+    provenance: BTreeMap<AssetId, AssetProvenance>,
+    /// The document last read from disk, for unknown-field and link preservation.
+    loaded_document: Option<rizref_format::SceneDocument>,
+    /// What to do after the user confirms discarding unsaved changes.
+    pending_action: Option<PendingAction>,
     /// The desired window modes (topmost, opacity, click-through, ghost).
     window_modes: WindowModes,
     /// The UI Automation adapter, present on Windows once the window exists.
@@ -468,9 +485,22 @@ struct Playback {
     next_at: Instant,
 }
 
+/// A destructive action waiting on the unsaved-changes guard.
+#[derive(Debug, Clone)]
+enum PendingAction {
+    /// Close the application.
+    Quit,
+    /// Replace the board with a new empty one.
+    NewBoard,
+    /// Replace the board with the file at this path.
+    OpenBoard(PathBuf),
+}
+
 impl App {
     fn new(plan: WindowPlan, proxy: EventLoopProxy<AppEvent>, start_on_launch: bool) -> Self {
-        let scene = Scene::new(SceneId::from_bytes(*b"rizref-dev-scene"));
+        // Every session starts with its own identity; a board saved from the
+        // start view must not share a scene id with the next launch.
+        let scene = Scene::new(SceneId::random());
         let worker_proxy = proxy.clone();
         let importer = Importer::new(move |outcome| {
             if worker_proxy
@@ -482,9 +512,9 @@ impl App {
         });
         tracing::info!(workers = importer.worker_count(), "import pool started");
 
-        // The camera survives restarts through the dev dump (phase 06 moves it
-        // into the .rizref container); without one, the default view.
-        let camera = dev_state::load().unwrap_or_default();
+        // The camera belongs to the board document; a session with no board
+        // starts at the default view.
+        let camera = Camera::default();
         let settings = Settings::load();
         let mut shortcuts = Shortcuts::new();
         shortcuts.apply_overrides(&settings.shortcuts);
@@ -514,6 +544,7 @@ impl App {
             hud: None,
             modifiers: ModifiersState::default(),
             playbacks: HashMap::new(),
+            pending_textures: BTreeSet::new(),
             next_frame_at: None,
             note_session: None,
             note_textures: HashMap::new(),
@@ -532,6 +563,9 @@ impl App {
             settings,
             shortcuts,
             recents,
+            provenance: BTreeMap::new(),
+            loaded_document: None,
+            pending_action: None,
             window_modes,
             accessibility: None,
             published_accessibility: 0,
@@ -556,6 +590,7 @@ impl App {
         if self.should_confirm_close() {
             let title = self.document.as_ref().map(Document::display_title);
             if let Some(title) = title {
+                self.pending_action = Some(PendingAction::Quit);
                 self.shell.title_bar.hide();
                 self.shell.open_confirm_close(title);
             }
@@ -568,18 +603,42 @@ impl App {
     /// Leaves the event loop immediately; callers must have cleared the close
     /// guard or confirmed that there is nothing to lose.
     fn exit(&mut self, event_loop: &ActiveEventLoop) {
-        // Dev-only checkpoint of the view transform; phase 06 folds this into
-        // the .rizref container and deletes the module.
-        dev_state::store(&self.view.camera);
         tracing::info!("closing the window");
         event_loop.exit();
     }
 
-    /// Confirms the close guard's destructive choice.
+    /// Confirms the unsaved-changes guard and runs the pending action.
     fn confirm_discard(&mut self, event_loop: &ActiveEventLoop) {
         self.shell.confirm_close = None;
         self.shell.touch();
-        self.exit(event_loop);
+        match self.pending_action.take() {
+            Some(PendingAction::NewBoard) => self.new_board_now(),
+            Some(PendingAction::OpenBoard(path)) => {
+                self.open_board_now(&path);
+            }
+            Some(PendingAction::Quit) | None => self.exit(event_loop),
+        }
+    }
+
+    /// Asks before replacing a dirty board, then runs `action` on confirmation.
+    fn request_destructive(&mut self, action: PendingAction, discard_label: &str, note: &str) {
+        self.commit_note_edit();
+        if !self.should_confirm_close() {
+            match action {
+                PendingAction::NewBoard => self.new_board_now(),
+                PendingAction::OpenBoard(path) => {
+                    self.open_board_now(&path);
+                }
+                PendingAction::Quit => {}
+            }
+            return;
+        }
+        if let Some(title) = self.document.as_ref().map(Document::display_title) {
+            self.pending_action = Some(action);
+            self.shell.title_bar.hide();
+            self.shell.open_confirm(title, discard_label, note);
+            self.redraw();
+        }
     }
 
     /// Allocates the next untitled document name.
@@ -587,6 +646,273 @@ impl App {
         let number = self.next_document;
         self.next_document = self.next_document.saturating_add(1);
         Document::untitled(number)
+    }
+
+    /// Drops the old board's GPU textures and resets per-board caches.
+    fn reset_board(&mut self, scene: Scene) {
+        let old_assets: Vec<AssetId> = self
+            .board
+            .scene()
+            .assets()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        if let Some(renderer) = self.renderer.as_mut() {
+            for id in old_assets {
+                renderer.remove_texture(id);
+            }
+        }
+        self.board = Board::new(scene);
+        self.board.set_snap_enabled(self.settings.snap_enabled);
+        self.decode_cache = DecodeCache::new(self.settings.max_decode_bytes);
+        self.playbacks.clear();
+        self.pending_textures.clear();
+        self.note_textures.clear();
+        self.dirty_notes.clear();
+        self.provenance.clear();
+        self.loaded_document = None;
+    }
+
+    /// Replaces the board with a new empty one, without asking.
+    fn new_board_now(&mut self) {
+        self.reset_board(Scene::new(SceneId::random()));
+        self.view.camera = Camera::default();
+        self.shell.set_mode(Mode::Canvas);
+        self.document = Some(self.new_document());
+        self.refresh_window_title();
+        let cursor = self.view.cursor_position();
+        self.update_title_bar_pointer(cursor);
+        self.shell.toast("New board", Instant::now());
+        self.redraw();
+    }
+
+    /// Opens `path`, replacing the board. Errors become a toast, never a panic.
+    fn open_board_now(&mut self, path: &Path) {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("board")
+            .to_owned();
+        match rizref_format::load(path) {
+            Ok(loaded) => {
+                let rizref_format::LoadedBoard {
+                    document,
+                    scene,
+                    camera,
+                    name,
+                    thumbnail,
+                    missing,
+                    recovered,
+                    ..
+                } = loaded;
+                let item_count = scene.items().len();
+                let provenance: BTreeMap<AssetId, AssetProvenance> = document
+                    .assets
+                    .iter()
+                    .filter_map(|entry| {
+                        AssetId::from_hex(&entry.hash).map(|id| {
+                            (
+                                id,
+                                AssetProvenance {
+                                    origin: entry.origin,
+                                    source_path: entry.source_path.clone(),
+                                    source_url: entry.source_url.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                self.reset_board(scene);
+                self.provenance = provenance;
+                self.loaded_document = Some(document);
+                self.view.camera = camera;
+                self.document = Some(Document::from_path(path));
+                self.shell.set_mode(Mode::Canvas);
+                self.refresh_window_title();
+                self.upload_asset_previews();
+                self.record_recent(path, item_count, thumbnail.as_ref());
+                let message = if recovered {
+                    format!("Recovered {name} (interrupted save)")
+                } else {
+                    format!("Opened {name}")
+                };
+                let message = if missing.is_empty() {
+                    message
+                } else {
+                    format!("{message} · {} linked image(s) missing", missing.len())
+                };
+                self.shell.toast(message, Instant::now());
+                tracing::info!(
+                    path = %path.display(),
+                    items = item_count,
+                    missing = missing.len(),
+                    recovered,
+                    "board opened"
+                );
+                self.redraw();
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot open board");
+                self.shell.toast(
+                    format!("Could not open {file_name}: {error}"),
+                    Instant::now(),
+                );
+                self.redraw();
+            }
+        }
+    }
+
+    /// Uploads every loaded asset's preview, so a board draws before any full
+    /// decode starts.
+    fn upload_asset_previews(&mut self) {
+        let scene = self.board.scene();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        for (id, asset) in scene.assets().iter() {
+            if !renderer.has_texture(*id) {
+                renderer.upload_texture(*id, asset.preview().image(), true);
+            }
+        }
+    }
+
+    /// Records a board in the recent list and persists the list.
+    fn record_recent(
+        &mut self,
+        path: &Path,
+        item_count: usize,
+        thumbnail: Option<&rizref_format::Preview>,
+    ) {
+        self.recents.record(
+            path.to_string_lossy().into_owned(),
+            u32::try_from(item_count).unwrap_or(u32::MAX),
+            thumbnail.map(|preview| preview.bytes.clone()),
+            now_unix(),
+        );
+        if let Err(error) = self.recents.save() {
+            tracing::warn!(%error, "cannot save the recent-board list");
+        }
+    }
+
+    /// Saves the board to its file, or asks for one first.
+    fn save_document(&mut self, save_as: bool) {
+        let now = Instant::now();
+        if self.document.is_none() {
+            self.document = Some(self.new_document());
+        }
+        let existing = !save_as && self.document.as_ref().is_some_and(|d| d.path().is_some());
+        let path = if existing {
+            self.document
+                .as_ref()
+                .and_then(Document::path)
+                .expect("checked above")
+                .to_path_buf()
+        } else {
+            let default = self
+                .document
+                .as_ref()
+                .map(Document::name)
+                .unwrap_or("Board.rizref")
+                .to_owned();
+            let Some(path) = dialogs::save_board(&default) else {
+                return;
+            };
+            path
+        };
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("Board")
+            .to_owned();
+
+        let result = {
+            let mut request = SaveRequest::new(self.board.scene(), self.view.camera, &name);
+            request.provenance = &self.provenance;
+            request.background = self.settings.canvas_theme.rgba();
+            request.save_as = !existing;
+            request.old_document = self.loaded_document.as_ref();
+            rizref_format::save(&path, &request)
+        };
+
+        match result {
+            Ok(report) => {
+                if let Some(document) = self.document.as_mut() {
+                    document.set_path(&path);
+                    document.mark_saved();
+                }
+                self.refresh_window_title();
+                let thumbnail = rizref_format::read_summary(&path)
+                    .ok()
+                    .and_then(|summary| summary.thumbnail);
+                if let Ok(mut reader) = rizref_format::BoardReader::open_path(&path) {
+                    self.loaded_document = reader.document().ok();
+                }
+                self.record_recent(&path, self.board.scene().items().len(), thumbnail.as_ref());
+                let verb = match report.mode {
+                    SaveMode::Fresh => "Saved",
+                    SaveMode::Appended => "Saved (incremental)",
+                    SaveMode::Compacted => "Saved (compacted)",
+                };
+                self.shell.toast(
+                    format!(
+                        "{verb} {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    now,
+                );
+                tracing::info!(
+                    path = %path.display(),
+                    mode = ?report.mode,
+                    bytes = report.bytes_written,
+                    file_len = report.file_len,
+                    generation = report.generation,
+                    "board saved"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot save board");
+                self.shell.toast(format!("Could not save: {error}"), now);
+            }
+        }
+        self.redraw();
+    }
+
+    /// Exports the board as a PNG image.
+    fn export_board(&mut self) {
+        let now = Instant::now();
+        let default = format!(
+            "{}.png",
+            self.document
+                .as_ref()
+                .map(Document::stem)
+                .unwrap_or("Board")
+        );
+        let Some(path) = dialogs::export_png(&default) else {
+            return;
+        };
+        match rizref_format::thumbnail::export_png(
+            &path,
+            self.board.scene(),
+            self.settings.canvas_theme.rgba(),
+            2048,
+        ) {
+            Ok(()) => {
+                self.shell.toast(
+                    format!(
+                        "Exported {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    now,
+                );
+                tracing::info!(path = %path.display(), "board exported");
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot export board");
+                self.shell.toast(format!("Could not export: {error}"), now);
+            }
+        }
+        self.redraw();
     }
 
     /// Ensures a document exists for content being added, and refreshes the
@@ -934,23 +1260,11 @@ impl App {
         match action {
             Action::Command(command) => self.apply(command),
             Action::NewBoard => {
-                self.commit_note_edit();
-                self.board = Board::new(Scene::new(new_scene_id()));
-                self.board.set_snap_enabled(self.settings.snap_enabled);
-                self.decode_cache = DecodeCache::new(self.settings.max_decode_bytes);
-                self.playbacks.clear();
-                self.note_textures.clear();
-                self.dirty_notes.clear();
-                self.view.camera = Camera::default();
-                self.shell.set_mode(Mode::Canvas);
-                self.document = Some(self.new_document());
-                self.refresh_window_title();
-                // The mode switch hides the bar; if the pointer already rests
-                // on the title strip, show the new document's name right away.
-                let cursor = self.view.cursor_position();
-                self.update_title_bar_pointer(cursor);
-                self.shell.toast("New board", now);
-                self.redraw();
+                self.request_destructive(
+                    PendingAction::NewBoard,
+                    "Discard changes",
+                    "Creating a new board will discard them.",
+                );
             }
             Action::OpenImages => {
                 self.open_images();
@@ -960,10 +1274,20 @@ impl App {
                 self.paste();
                 self.redraw();
             }
-            Action::OpenBoard | Action::OpenRecent(_) => {
-                self.shell.toast(
-                    "Board loading arrives with the .rizref container (phase 06)",
-                    now,
+            Action::OpenBoard => {
+                if let Some(path) = dialogs::pick_board() {
+                    self.request_destructive(
+                        PendingAction::OpenBoard(path),
+                        "Discard changes",
+                        "Opening another board will discard them.",
+                    );
+                }
+            }
+            Action::OpenRecent(path) => {
+                self.request_destructive(
+                    PendingAction::OpenBoard(path),
+                    "Discard changes",
+                    "Opening another board will discard them.",
                 );
             }
             Action::RemoveRecent(path) => {
@@ -990,10 +1314,9 @@ impl App {
                     }
                 }
             }
-            Action::Save | Action::SaveAs | Action::Export => {
-                self.shell
-                    .toast("Saving arrives with the .rizref container (phase 06)", now);
-            }
+            Action::Save => self.save_document(false),
+            Action::SaveAs => self.save_document(true),
+            Action::Export => self.export_board(),
             Action::ShowStart => {
                 self.commit_note_edit();
                 self.shell.set_mode(Mode::Start);
@@ -1511,13 +1834,11 @@ impl App {
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("rizref"))
             {
-                tracing::info!(
-                    path = %path.display(),
-                    "board file requested; the container reader arrives in phase 06"
-                );
-                self.shell.toast(
-                    "Board loading arrives with the .rizref container (phase 06)",
-                    Instant::now(),
+                tracing::info!(path = %path.display(), "board file requested");
+                self.request_destructive(
+                    PendingAction::OpenBoard(path),
+                    "Discard changes",
+                    "Opening another board will discard them.",
                 );
             } else {
                 tracing::info!(path = %path.display(), "not an image; ignored");
@@ -1611,6 +1932,23 @@ impl App {
 
     /// Turns one worker result into an asset, an item and a GPU texture.
     fn apply_import(&mut self, outcome: ImportOutcome) {
+        if let ImportPurpose::RefreshTexture(asset_id) = outcome.purpose {
+            match outcome.result {
+                Ok(imported) => {
+                    self.pending_textures.remove(&asset_id);
+                    self.apply_texture_refresh(asset_id, imported);
+                }
+                // Keep the request recorded: a corrupt original would
+                // otherwise be decoded again on every visible frame.
+                Err(error) => tracing::debug!(
+                    asset = %asset_id,
+                    reason = %error.reason,
+                    "full-resolution decode failed; keeping the preview"
+                ),
+            }
+            return;
+        }
+
         let imported = match outcome.result {
             Ok(imported) => imported,
             Err(error) => {
@@ -1644,7 +1982,20 @@ impl App {
             asset = asset.with_animation(animation);
         }
         let encoded_len = asset.encoded().len();
+        let source_path = imported.source_path.clone();
         let (asset_id, was_new) = self.board.scene_mut().insert_asset(asset);
+        self.provenance.insert(
+            asset_id,
+            AssetProvenance {
+                origin: if source_path.is_some() {
+                    AssetOrigin::File
+                } else {
+                    AssetOrigin::Clipboard
+                },
+                source_path: source_path.map(|path| path.display().to_string()),
+                source_url: None,
+            },
+        );
         if was_new {
             tracing::info!(
                 asset = %asset_id,
@@ -1681,6 +2032,9 @@ impl App {
             return;
         };
         self.board.refresh_rects();
+        if self.mark_document_dirty() {
+            self.refresh_window_title();
+        }
 
         let pixels = Arc::new(imported.image);
         let full_bytes = (pixels.width() as u64) * (pixels.height() as u64) * 4;
@@ -1712,6 +2066,54 @@ impl App {
             cache_entries = self.decode_cache.len(),
             latency_ms = outcome.latency.as_secs_f64() * 1000.0,
             "image placed"
+        );
+        self.redraw();
+    }
+
+    /// Uploads a refreshed full-resolution texture for an existing asset.
+    fn apply_texture_refresh(
+        &mut self,
+        asset_id: AssetId,
+        mut imported: crate::import::ImportedImage,
+    ) {
+        if self.board.scene().asset(asset_id).is_none() {
+            return;
+        }
+        // A deferred decode is also where an animated GIF's frames arrive: the
+        // board file stores only the original bytes, so the animation is
+        // rebuilt here and attached to the existing content-addressed asset.
+        if let Some(animation) = imported.animation.take()
+            && let Some(preview) = self
+                .board
+                .scene()
+                .asset(asset_id)
+                .map(|asset| asset.preview().image().clone())
+        {
+            let replacement = Asset::from_parts(
+                Arc::clone(&imported.encoded),
+                imported.format,
+                imported.checksum,
+                &imported.image,
+                preview,
+            )
+            .with_animation(animation);
+            self.board.scene_mut().replace_asset(replacement);
+        }
+        let pixels = Arc::new(imported.image);
+        let full_bytes = (pixels.width() as u64) * (pixels.height() as u64) * 4;
+        let display = imported.display;
+        for evicted in self.decode_cache.insert(asset_id, Arc::clone(&pixels)) {
+            tracing::debug!(asset = %evicted, "decoded bitmap evicted from the memory cache");
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            let upload = display.as_ref().unwrap_or(&pixels);
+            renderer.upload_texture(asset_id, upload, false);
+        }
+        tracing::debug!(
+            asset = %asset_id,
+            decoded_bytes = full_bytes,
+            cache_bytes = self.decode_cache.bytes(),
+            "full-resolution texture refreshed"
         );
         self.redraw();
     }
@@ -1802,21 +2204,40 @@ impl App {
     }
 
     /// Uploads previews for items whose full texture is missing or evicted,
-    /// and upgrades a preview to the full bitmap when the cache still has it.
+    /// upgrades a preview when the cache still has the full bitmap, and asks
+    /// the worker pool to decode assets that have never been seen at full size.
     fn ensure_textures(&mut self, items: &[ItemQuad]) {
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
-        };
-        for item in items {
-            renderer.touch_texture(item.asset);
-            if !renderer.has_texture(item.asset) {
-                if let Some(asset) = self.board.scene().asset(item.asset) {
-                    renderer.upload_texture(item.asset, asset.preview().image(), true);
+        let mut wanted = Vec::new();
+        {
+            let Some(renderer) = self.renderer.as_mut() else {
+                return;
+            };
+            for item in items {
+                renderer.touch_texture(item.asset);
+                if !renderer.has_texture(item.asset) {
+                    if let Some(asset) = self.board.scene().asset(item.asset) {
+                        renderer.upload_texture(item.asset, asset.preview().image(), true);
+                    }
+                } else if renderer.texture_is_preview(item.asset) {
+                    if let Some(full) = self.decode_cache.get(item.asset) {
+                        renderer.upload_texture(item.asset, &full, false);
+                    } else if !self.pending_textures.contains(&item.asset) {
+                        wanted.push(item.asset);
+                    }
                 }
-            } else if renderer.texture_is_preview(item.asset)
-                && let Some(full) = self.decode_cache.get(item.asset)
+            }
+        }
+        for asset_id in wanted {
+            let Some(asset) = self.board.scene().asset(asset_id) else {
+                continue;
+            };
+            let request = ImportRequest::texture(asset_id, Arc::clone(asset.encoded()));
+            if self
+                .importer
+                .as_ref()
+                .is_some_and(|pool| pool.submit(request))
             {
-                renderer.upload_texture(item.asset, &full, false);
+                self.pending_textures.insert(asset_id);
             }
         }
     }
@@ -2954,18 +3375,6 @@ fn command_mutates_items(command: Command) -> bool {
             | DistributeHorizontal
             | DistributeVertical
     )
-}
-
-/// A fresh scene id for a new board.
-fn new_scene_id() -> SceneId {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&(nanos as u64).to_le_bytes());
-    bytes[8..12].copy_from_slice(&(nanos >> 64).to_le_bytes()[..4]);
-    bytes[12..].copy_from_slice(&(u64::from(std::process::id())).to_le_bytes()[..4]);
-    SceneId::from_bytes(bytes)
 }
 
 /// The edge-resize direction for a point near the frameless window's border.

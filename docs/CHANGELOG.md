@@ -2,6 +2,53 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Phase 06 — The `.rizref` file format (done)
+
+On branch `feat/phase-06-rizref-format`. Closes issue #7. Format specification:
+[`format.md`](format.md).
+
+- `rizref-format`: the complete v1 container. A fixed 64-byte header carries a UUID v4
+  scene id, revision, writer version and creation/modification times. Chunks use a
+  24-byte frame (4-byte tag, compression code, stored and decompressed lengths):
+  `NAME`, `THMB`, `DOC `, `BLOB`, `PREV`, `INDX` and `END!`. A fixed 80-byte footer at
+  the end of a clean file points at the last index and carries its digest; the index
+  lists every live chunk by offset with a BLAKE3 digest and stores its own digest in
+  front of its JSON.
+- `rizref-format`: content-addressed originals. Every `BLOB` is the 32-byte BLAKE3 of
+  the original bytes followed by those bytes verbatim; identical images are one asset
+  and one chunk. `PREV` stores a small JPEG/PNG preview per asset so a board shows
+  pictures before any original is decoded.
+- `rizref-format`: the scene document is format-owned JSON mirroring `rizref-core`
+  (camera, scene rect, items in z-order, groups, assets, board name). Unknown members
+  are preserved at every level on resave; `schema_version` refuses newer revisions;
+  `assets[].embedded = false` declares a link-only asset and the reader reports it as
+  missing instead of failing. Provenance paths/URLs are hints only.
+- `rizref-format`: fresh saves write `<file>.rizref.tmp` and rename atomically.
+  Incremental saves append only changed chunks plus a new index and footer; unchanged
+  blobs are never copied. Compaction (full rewrite) triggers when the file would grow beyond
+  three times its live bytes (dead space over twice live), on Save As, and whenever the existing file cannot be appended
+  to (recovered, foreign or another scene).
+- `rizref-format`: recovery scans the chunk stream when no valid footer exists and
+  keeps the last valid index; a partially written index fails its own digest, so the
+  previous generation loads. All chunk payloads are read lazily by offset.
+- `rizref-format`: board thumbnails are composited from item previews with tiny-skia
+  (bounding box, ≤ 512 px, JPEG when opaque and PNG with alpha); export reuses the
+  same compositor for a PNG.
+- `rizref`: `rizref inspect <file> [--verify]` — header, document summary, chunk table
+  and digest/blob verification without opening a window. Exit codes 0/1/2.
+- `rizref`: Save, Save As, Export (PNG, composited from the stored previews), Open board, Open recent and
+  dropped `.rizref` files are wired; New/Open/Quit share the unsaved-changes guard. A successful save
+  clears the dirty marker, updates the title and records the board (path, item count,
+  thumbnail) in recents. Loading restores the camera, re-uploads previews immediately
+  and streams full-resolution textures from the worker pool as items become visible.
+- `rizref`: removed the phase-00 `dev_state` camera checkpoint and its temporary
+  checksummed header; `SceneId::random` produces real UUID v4 ids. Asset provenance
+  (origin, source path) is recorded on import and restored on open.
+- Tests: 200-item mixed-codec round trip, incremental-vs-compaction growth, a
+  1000-point crash matrix, fresh-save truncation matrix, digest verification and
+  deliberate corruption. 499 workspace tests pass; clippy and fmt clean. A 500 MB
+  board's name/thumbnail read measured 334 µs (best of 20, warm).
+
 ## Phase 05 — UI Shell (done)
 
 Merged 2026-10-29 in PR #17 (branch `feat/phase-05-ui-shell`, merge commit

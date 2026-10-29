@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Sender, unbounded};
 use glam::Vec2;
 use rizref_codecs::{CodecError, DecodeLimits, ImageBuffer, ImageFormat, decode_as_with_limits};
-use rizref_core::{Animation, AnimationFrame, Fitted, checksum, fit_to_side, generate_preview};
+use rizref_core::{
+    Animation, AnimationFrame, AssetId, Fitted, checksum, fit_to_side, generate_preview,
+};
 
 use crate::platform::imaging;
 use crate::textures::MAX_TEXTURE_SIDE;
@@ -61,6 +63,15 @@ impl ImportSource {
     }
 }
 
+/// What the application should do with a decoded image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportPurpose {
+    /// Place a new item on the board.
+    PlaceItem,
+    /// Decode an existing asset again to replace its preview texture.
+    RefreshTexture(AssetId),
+}
+
 /// A request to import one image around a world-space point.
 #[derive(Debug, Clone)]
 pub struct ImportRequest {
@@ -70,6 +81,8 @@ pub struct ImportRequest {
     pub drop_world: Vec2,
     /// When the request was submitted, for the end-to-end latency trace.
     pub queued_at: Instant,
+    /// What the result is for.
+    pub purpose: ImportPurpose,
 }
 
 impl ImportRequest {
@@ -79,6 +92,7 @@ impl ImportRequest {
             source,
             drop_world,
             queued_at: Instant::now(),
+            purpose: ImportPurpose::PlaceItem,
         }
     }
 
@@ -90,6 +104,16 @@ impl ImportRequest {
     /// A request for in-memory bytes.
     pub fn bytes(label: impl Into<String>, bytes: impl Into<Arc<[u8]>>, drop_world: Vec2) -> Self {
         Self::new(ImportSource::bytes(label, bytes), drop_world)
+    }
+
+    /// A request to decode `asset` again for its full-resolution texture.
+    pub fn texture(asset: AssetId, bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self {
+            source: ImportSource::bytes(format!("asset {asset}"), bytes),
+            drop_world: Vec2::ZERO,
+            queued_at: Instant::now(),
+            purpose: ImportPurpose::RefreshTexture(asset),
+        }
     }
 }
 
@@ -112,6 +136,10 @@ pub struct ImportedImage {
     pub animation: Option<Animation>,
     /// BLAKE3 of `encoded`, computed on the worker.
     pub checksum: [u8; 32],
+    /// The file this image was read from, when it came from one.
+    ///
+    /// A provenance hint for the board file; never needed to decode or draw.
+    pub source_path: Option<PathBuf>,
 }
 
 /// Why an import produced no image.
@@ -134,6 +162,8 @@ pub struct ImportOutcome {
     pub latency: Duration,
     /// The decoded image, or the reason it failed.
     pub result: Result<ImportedImage, ImportError>,
+    /// What the result is for.
+    pub purpose: ImportPurpose,
 }
 
 /// A fixed-size pool of decode threads.
@@ -214,6 +244,7 @@ fn process(request: ImportRequest) -> ImportOutcome {
         source,
         drop_world,
         queued_at,
+        purpose,
     } = request;
     let label = source.label.clone();
 
@@ -248,6 +279,7 @@ fn process(request: ImportRequest) -> ImportOutcome {
         drop_world,
         latency,
         result,
+        purpose,
     }
 }
 
@@ -322,6 +354,7 @@ fn import(source: &ImportSource) -> Result<ImportedImage, ImportError> {
         preview,
         animation,
         checksum,
+        source_path: source.path.clone(),
     })
 }
 

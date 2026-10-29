@@ -3,8 +3,9 @@
 //! Layout is computed once per size ([`StartLayout`]) and used by both the
 //! painter and hit-testing, so a button can never be drawn in one place and
 //! clicked in another. Cards read the [`Recents`] store; a card without a stored
-//! preview draws a monogram placeholder (phase 06 starts filling previews in on
-//! save).
+//! preview draws a monogram placeholder. The save path records the board
+//! thumbnail in that store, so a preview tile is available to the card renderer
+//! and the Explorer provider.
 
 use crate::recents::Recents;
 use crate::ui::menu::Action;
@@ -29,7 +30,7 @@ pub enum StartControl {
     NewBoard,
     /// Open the image dialog.
     OpenImages,
-    /// Open a board file (phase 06).
+    /// Open a board file.
     OpenBoard,
     /// Open a recent board.
     Recent(usize),

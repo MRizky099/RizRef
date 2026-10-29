@@ -50,6 +50,31 @@ impl AssetId {
         }
         out
     }
+
+    /// Parses exactly 64 hex digits, accepting upper- and lowercase.
+    ///
+    /// Used when a `.rizref` document names its assets by content hash.
+    pub fn from_hex(text: &str) -> Option<Self> {
+        let digits = text.as_bytes();
+        if digits.len() != Self::HEX_LEN {
+            return None;
+        }
+        let mut raw = [0u8; Self::BYTE_LEN];
+        for (pair, slot) in digits.as_chunks::<2>().0.iter().zip(raw.iter_mut()) {
+            *slot = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
+        }
+        Some(Self(raw))
+    }
+}
+
+/// Value of a single hex digit, or `None` if the byte is not one.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl fmt::Display for AssetId {
@@ -136,6 +161,32 @@ impl Asset {
         }
     }
 
+    /// Builds an asset from decoded facts the file already stored.
+    ///
+    /// Loading a board does not decode every original just to learn its size:
+    /// the `.rizref` document carries the pixel dimensions, and the stored
+    /// preview supplies the thumbnail. The full bitmap is decoded on demand by
+    /// the renderer, exactly as it is for an asset whose bitmap was evicted.
+    pub fn from_meta(
+        encoded: Arc<[u8]>,
+        format: ImageFormat,
+        checksum: [u8; AssetId::BYTE_LEN],
+        pixel_width: u32,
+        pixel_height: u32,
+        preview: ImageBuffer,
+    ) -> Self {
+        Self {
+            id: AssetId::from_checksum(checksum),
+            format,
+            checksum,
+            encoded,
+            pixel_width,
+            pixel_height,
+            preview: PreviewImage::new(preview),
+            animation: None,
+        }
+    }
+
     /// Attaches an animation, as an animated GIF import does.
     ///
     /// The asset's still image stays the first frame, so everything that does
@@ -210,6 +261,15 @@ impl AssetStore {
                 (id, true)
             }
         }
+    }
+
+    /// Replaces the asset with the same id, returning the previous one.
+    ///
+    /// The only caller is a background re-decode that attaches an animation to
+    /// an asset loaded from a file. Content addressing makes the replacement
+    /// safe: same id means same original bytes.
+    pub fn replace(&mut self, asset: Asset) -> Option<Asset> {
+        self.assets.insert(asset.id(), asset)
     }
 
     /// The asset with `id`, if present.
@@ -301,6 +361,40 @@ mod tests {
         assert_eq!((asset.pixel_width(), asset.pixel_height()), (4, 3));
         assert_eq!(asset.format(), ImageFormat::Png);
         assert_eq!((asset.preview().width(), asset.preview().height()), (2, 1));
+    }
+
+    #[test]
+    fn asset_ids_round_trip_through_hex() {
+        let id = AssetId::from_checksum(super::checksum(b"an original image"));
+
+        let hex = id.to_hex();
+
+        assert_eq!(hex.len(), AssetId::HEX_LEN);
+        assert_eq!(AssetId::from_hex(&hex), Some(id));
+        assert_eq!(AssetId::from_hex(&hex.to_uppercase()), Some(id));
+        assert_eq!(AssetId::from_hex(""), None);
+        assert_eq!(AssetId::from_hex(&"0".repeat(63)), None);
+        assert_eq!(AssetId::from_hex(&"z".repeat(64)), None);
+    }
+
+    #[test]
+    fn an_asset_can_be_built_from_stored_facts_without_a_full_decode() {
+        let bytes = b"stored original";
+        let checksum = super::checksum(bytes);
+        let asset = Asset::from_meta(
+            Arc::from(&bytes[..]),
+            ImageFormat::Jpeg,
+            checksum,
+            1920,
+            1080,
+            ImageBuffer::filled(2, 1, [1, 2, 3, 255]),
+        );
+
+        assert_eq!(asset.id(), AssetId::from_checksum(checksum));
+        assert_eq!((asset.pixel_width(), asset.pixel_height()), (1920, 1080));
+        assert_eq!(asset.format(), ImageFormat::Jpeg);
+        assert_eq!(asset.encoded().as_ref(), bytes);
+        assert_eq!(asset.preview().width(), 2);
     }
 
     #[test]

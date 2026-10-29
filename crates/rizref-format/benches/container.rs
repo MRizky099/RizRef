@@ -1,9 +1,9 @@
-//! Skeleton benchmark for the container framing.
+//! Benchmark for the container primitives.
 //!
 //! `cargo bench` should answer "did the file format get slower?" from phase 00
-//! on, so the two costs that sit in front of every save and every open are
-//! measured here: encoding/decoding the header, and the LZ4 + BLAKE3 round trip
-//! that every chunk pays.
+//! on, so the costs that sit in front of every save and every open are measured
+//! here: encoding/decoding the header and a chunk frame, BLAKE3 over a large
+//! blob, and the LZ4 round trip a document pays.
 //!
 //! It deliberately does **not** measure any phase-07 budget: board load, save,
 //! cold start and binary size need the full application and are verified in
@@ -14,7 +14,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use rizref_core::SceneId;
-use rizref_format::{Header, checksum, compression};
+use rizref_format::{CHUNK_HEADER_LEN, ChunkHeader, ChunkKind, Header, checksum, compression};
 
 /// Payload used for the compression lines: 1 MiB, incompressible-ish content so
 /// the numbers reflect a worst case rather than a buffer of zeroes.
@@ -61,23 +61,34 @@ fn time_throughput(label: &str, bytes: usize, iterations: u32, mut body: impl Fn
 
 fn main() {
     let scene_id = SceneId::from_hex("0123456789abcdeffedcba9876543210").expect("valid hex id");
-    let mut header = Header::new(scene_id);
-    header.payload_len = PAYLOAD_LEN as u64;
+    let header = Header::new(scene_id, 1_700_000_000_000);
     let encoded = header.encode();
 
-    println!("rizref-format skeleton benchmark");
+    println!("rizref-format benchmark");
 
     time_per_call("Header::encode", HEADER_ITERATIONS, || {
         u64::from((black_box(header.encode()))[8])
     });
 
     time_per_call("Header::decode", HEADER_ITERATIONS, || {
+        Header::decode(black_box(&encoded))
+            .expect("benchmark header is valid")
+            .flags
+    });
+
+    let frame = ChunkHeader::raw(ChunkKind::Blob, PAYLOAD_LEN as u64).encode();
+    time_per_call("ChunkHeader::encode", HEADER_ITERATIONS, || {
+        u64::from((black_box(ChunkHeader::raw(ChunkKind::Blob, 1))).encode()[4])
+    });
+    time_per_call("ChunkHeader::decode", HEADER_ITERATIONS, || {
         u64::from(
-            Header::decode(black_box(&encoded))
-                .expect("benchmark header is valid")
-                .flags,
+            ChunkHeader::decode(black_box(&frame))
+                .expect("benchmark frame is valid")
+                .stored_len
+                .min(u64::from(u32::MAX)) as u32,
         )
     });
+    assert_eq!(frame.len(), CHUNK_HEADER_LEN);
 
     // A deterministic xorshift stream, standing in for the original image bytes
     // a board carries: those have already been compressed once by their own
@@ -93,7 +104,7 @@ fn main() {
         })
         .collect();
 
-    let packed = compression::compress(&payload).expect("1 MiB is within the chunk limit");
+    let packed = compression::compress_lz4(&payload).expect("1 MiB is within the chunk limit");
 
     time_throughput(
         "blake3 digest (32 B)",
@@ -102,16 +113,9 @@ fn main() {
         || u64::from(checksum::digest(black_box(&payload))[0]),
     );
 
-    time_throughput(
-        "blake3 checksum8 (8 B)",
-        PAYLOAD_LEN,
-        COMPRESSION_ITERATIONS,
-        || u64::from(checksum::checksum8(black_box(&payload))[0]),
-    );
-
     time_throughput("lz4 compress", PAYLOAD_LEN, COMPRESSION_ITERATIONS, || {
         u64::from(
-            compression::compress(black_box(&payload))
+            compression::compress_lz4(black_box(&payload))
                 .expect("within the chunk limit")
                 .len() as u16,
         )
@@ -123,7 +127,7 @@ fn main() {
         COMPRESSION_ITERATIONS,
         || {
             u64::from(
-                compression::decompress(black_box(&packed))
+                compression::decompress_lz4(black_box(&packed), PAYLOAD_LEN as u64)
                     .expect("valid lz4")
                     .len() as u32,
             )

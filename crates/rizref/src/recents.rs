@@ -1,10 +1,10 @@
 //! The start view's recent-board list.
 //!
 //! `%APPDATA%\RizRef\recents.json`. A recent entry carries the path, when the
-//! board was last edited, its item count and optionally the embedded preview
-//! bytes, so the start view can draw a card without opening the board. Preview
-//! capture itself is wired by phase 06 (the save path) — this module only
-//! stores and prunes what it is given.
+//! board was last edited, its item count and optionally the board thumbnail
+//! bytes, so a card can be drawn without opening the board. The save and open
+//! paths record the thumbnail; this module only stores and prunes what it is
+//! given.
 //!
 //! Paths are compared case-insensitively on Windows, because the same board can
 //! be reached through different casing; duplicates would otherwise pile up.
@@ -114,8 +114,6 @@ impl Recents {
     /// Records a board at the front, replacing an older entry for the same path.
     ///
     /// `now` is passed in rather than read here so the ordering is testable.
-    /// The save path wires this in phase 06; the store and its tests land now.
-    #[allow(dead_code)]
     pub fn record(
         &mut self,
         path: impl Into<String>,
