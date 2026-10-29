@@ -128,13 +128,22 @@ impl Shell {
     /// Repeated close requests keep the existing dialog instead of resetting
     /// the highlighted button under the user's pointer.
     pub fn open_confirm_close(&mut self, title: String) {
+        self.open_confirm(
+            title,
+            "Close without saving",
+            "Closing now will discard them.",
+        );
+    }
+
+    /// Opens the unsaved-changes guard for a non-close destructive step.
+    pub fn open_confirm(&mut self, title: String, discard_label: &str, note: &str) {
         if self.confirm_close.is_some() {
             return;
         }
         self.menu = None;
         self.shortcuts = None;
         self.settings = None;
-        self.confirm_close = Some(panels::ConfirmClose::new(title));
+        self.confirm_close = Some(panels::ConfirmClose::for_action(title, discard_label, note));
         self.touch();
     }
 

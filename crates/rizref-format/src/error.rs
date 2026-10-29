@@ -1,9 +1,13 @@
 //! Errors reported by the `.rizref` container.
 //!
 //! Every failure mode a reader has to distinguish is its own variant: "this is
-//! not a RizRef file" and "this RizRef file is damaged" call for different
-//! messages and different recovery (in the first case, offer the open dialog
-//! again; in the second, offer the autosave copy).
+//! not a RizRef file", "this RizRef file is damaged", "this file was written by
+//! a newer build" and "the linked image this board points at is gone" call for
+//! different messages and different recovery (offer the open dialog again, offer
+//! the recovered board, ask to update RizRef, or run the relink flow).
+//!
+//! Messages are written for the person reading the title bar or a log line, not
+//! for the type system: no variant name appears in its own text.
 
 use std::error::Error;
 use std::fmt;
@@ -24,6 +28,11 @@ pub enum FormatError {
         /// The bytes that were found instead.
         found: [u8; 8],
     },
+    /// The header is structurally invalid.
+    BadHeader {
+        /// What is wrong with it.
+        reason: String,
+    },
     /// The file was written by a container revision this build cannot read.
     UnsupportedVersion {
         /// Revision found in the header.
@@ -31,28 +40,69 @@ pub enum FormatError {
         /// Highest revision this build understands.
         supported: u16,
     },
-    /// The header's integrity check does not match its own contents.
-    IntegrityMismatch,
-    /// A chunk carries a kind code this build does not know.
-    UnknownChunkKind {
-        /// The code found in the payload.
-        code: u16,
+    /// The scene document uses a schema revision this build cannot migrate.
+    UnsupportedSchema {
+        /// Revision found in the document.
+        found: u16,
+        /// Highest revision this build understands.
+        supported: u16,
+    },
+    /// A chunk frame is structurally invalid.
+    BadChunk {
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// A chunk names a compression codec this build does not know.
+    UnknownCompression {
+        /// The code found in the chunk header.
+        code: u8,
     },
     /// A chunk is larger than this build is willing to allocate for.
     ChunkTooLarge {
         /// Size the chunk claims, in bytes.
-        size: usize,
+        size: u64,
         /// Largest size this build accepts, in bytes.
-        limit: usize,
+        limit: u64,
     },
     /// A compressed chunk could not be decompressed.
     Decompression {
         /// What the decompressor reported.
         reason: String,
     },
-    /// The metadata chunk is not valid UTF-8 JSON.
-    Metadata {
-        /// What the JSON parser reported.
+    /// A digest stored beside a chunk does not match its contents.
+    IntegrityMismatch {
+        /// What was being checked, for example `scene document`.
+        subject: &'static str,
+    },
+    /// The scene document is not valid JSON for the current schema.
+    Document {
+        /// What the JSON parser or the conversion reported.
+        reason: String,
+    },
+    /// The board index is missing, unreadable or refers outside the file.
+    Index {
+        /// What the parser or the bounds check reported.
+        reason: String,
+    },
+    /// A clean board has no scene document at all.
+    MissingDocument,
+    /// A document names an asset whose embedded bytes are absent.
+    MissingBlob {
+        /// Hex content hash of the missing asset.
+        hash: String,
+    },
+    /// The thumbnail or preview bytes could not be encoded or decoded.
+    Preview {
+        /// What the codec reported.
+        reason: String,
+    },
+    /// A file operation failed.
+    Io {
+        /// What was being attempted, for example `read`.
+        operation: &'static str,
+        /// Path involved, when there is one.
+        path: String,
+        /// The operating-system message.
         reason: String,
     },
 }
@@ -67,15 +117,18 @@ impl fmt::Display for FormatError {
             Self::BadMagic { found } => {
                 write!(formatter, "not a RizRef board (magic bytes {found:02x?})")
             }
+            Self::BadHeader { reason } => write!(formatter, "invalid board header: {reason}"),
             Self::UnsupportedVersion { found, supported } => write!(
                 formatter,
                 "board uses container revision {found}, this build reads up to {supported}"
             ),
-            Self::IntegrityMismatch => {
-                formatter.write_str("header checksum does not match the header contents")
-            }
-            Self::UnknownChunkKind { code } => {
-                write!(formatter, "unknown payload chunk kind {code}")
+            Self::UnsupportedSchema { found, supported } => write!(
+                formatter,
+                "board uses document schema {found}, this build reads up to {supported}"
+            ),
+            Self::BadChunk { reason } => write!(formatter, "invalid chunk: {reason}"),
+            Self::UnknownCompression { code } => {
+                write!(formatter, "chunk uses unknown compression code {code}")
             }
             Self::ChunkTooLarge { size, limit } => write!(
                 formatter,
@@ -84,12 +137,48 @@ impl fmt::Display for FormatError {
             Self::Decompression { reason } => {
                 write!(formatter, "cannot decompress chunk: {reason}")
             }
-            Self::Metadata { reason } => write!(formatter, "cannot read scene metadata: {reason}"),
+            Self::IntegrityMismatch { subject } => {
+                write!(formatter, "{subject} does not match its checksum")
+            }
+            Self::Document { reason } => write!(formatter, "cannot read scene document: {reason}"),
+            Self::Index { reason } => write!(formatter, "cannot read board index: {reason}"),
+            Self::MissingDocument => formatter.write_str("board has no scene document"),
+            Self::MissingBlob { hash } => write!(
+                formatter,
+                "the image with content hash {hash} is missing from the board"
+            ),
+            Self::Preview { reason } => write!(formatter, "cannot handle preview image: {reason}"),
+            Self::Io {
+                operation,
+                path,
+                reason,
+            } => {
+                if path.is_empty() {
+                    write!(formatter, "cannot {operation}: {reason}")
+                } else {
+                    write!(formatter, "cannot {operation} {path}: {reason}")
+                }
+            }
         }
     }
 }
 
 impl Error for FormatError {}
+
+impl FormatError {
+    /// Wraps an I/O error with the operation and path it belongs to.
+    pub(crate) fn io(
+        operation: &'static str,
+        path: impl Into<String>,
+        error: std::io::Error,
+    ) -> Self {
+        Self::Io {
+            operation,
+            path: path.into(),
+            reason: error.to_string(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -99,16 +188,25 @@ mod tests {
     fn every_variant_describes_itself() {
         let errors = [
             FormatError::Truncated {
-                needed: 44,
+                needed: 64,
                 available: 3,
             },
             FormatError::BadMagic { found: [0; 8] },
+            FormatError::BadHeader {
+                reason: "header_size 0".to_owned(),
+            },
             FormatError::UnsupportedVersion {
                 found: 9,
                 supported: 1,
             },
-            FormatError::IntegrityMismatch,
-            FormatError::UnknownChunkKind { code: 999 },
+            FormatError::UnsupportedSchema {
+                found: 3,
+                supported: 1,
+            },
+            FormatError::BadChunk {
+                reason: "lengths disagree".to_owned(),
+            },
+            FormatError::UnknownCompression { code: 7 },
             FormatError::ChunkTooLarge {
                 size: 1 << 40,
                 limit: 1 << 30,
@@ -116,8 +214,26 @@ mod tests {
             FormatError::Decompression {
                 reason: "bad size prefix".to_owned(),
             },
-            FormatError::Metadata {
+            FormatError::IntegrityMismatch {
+                subject: "scene document",
+            },
+            FormatError::Document {
                 reason: "expected value".to_owned(),
+            },
+            FormatError::Index {
+                reason: "not json".to_owned(),
+            },
+            FormatError::MissingDocument,
+            FormatError::MissingBlob {
+                hash: "ab".repeat(32),
+            },
+            FormatError::Preview {
+                reason: "unknown image format".to_owned(),
+            },
+            FormatError::Io {
+                operation: "read",
+                path: "board.rizref".to_owned(),
+                reason: "access denied".to_owned(),
             },
         ];
 
@@ -125,7 +241,9 @@ mod tests {
             let message = error.to_string();
             assert!(!message.is_empty());
             assert!(
-                !message.contains("Truncated") && !message.contains("BadMagic"),
+                !message.contains("Truncated")
+                    && !message.contains("BadMagic")
+                    && !message.contains("UnsupportedSchema"),
                 "messages are for users, not for the type system: {message}"
             );
         }
@@ -134,13 +252,33 @@ mod tests {
     #[test]
     fn truncation_reports_both_lengths() {
         let error = FormatError::Truncated {
-            needed: 44,
+            needed: 64,
             available: 12,
         };
 
         assert_eq!(
             error.to_string(),
-            "file is truncated: 44 bytes needed, 12 available"
+            "file is truncated: 64 bytes needed, 12 available"
         );
+    }
+
+    #[test]
+    fn an_io_error_names_the_file_when_it_has_one() {
+        let with_path = FormatError::Io {
+            operation: "write",
+            path: "C:/boards/a.rizref".to_owned(),
+            reason: "disk full".to_owned(),
+        };
+        let without_path = FormatError::Io {
+            operation: "write",
+            path: String::new(),
+            reason: "disk full".to_owned(),
+        };
+
+        assert_eq!(
+            with_path.to_string(),
+            "cannot write C:/boards/a.rizref: disk full"
+        );
+        assert_eq!(without_path.to_string(), "cannot write: disk full");
     }
 }

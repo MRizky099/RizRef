@@ -532,19 +532,42 @@ pub enum CloseChoice {
     Discard,
 }
 
-/// The modal "unsaved changes" dialog shown when closing a dirty document.
+/// The modal "unsaved changes" dialog shown before a destructive step.
 #[derive(Debug, Clone)]
 pub struct ConfirmClose {
     /// Document title including the unsaved marker.
     pub title: String,
-    /// 0 = Cancel, 1 = Close without saving.
+    /// Label of the destructive button.
+    pub discard_label: String,
+    /// One line explaining what continuing will do.
+    pub note: String,
+    /// 0 = Cancel, 1 = the destructive choice.
     selected: usize,
 }
 
 impl ConfirmClose {
-    /// A dialog for `title`, with Cancel selected by default.
+    /// A dialog for closing `title`, with Cancel selected by default.
+    #[allow(dead_code)]
     pub fn new(title: String) -> Self {
-        Self { title, selected: 0 }
+        Self::for_action(
+            title,
+            "Close without saving",
+            "Closing now will discard them.",
+        )
+    }
+
+    /// A dialog for a destructive step that is not a close.
+    pub fn for_action(
+        title: String,
+        discard_label: impl Into<String>,
+        note: impl Into<String>,
+    ) -> Self {
+        Self {
+            title,
+            discard_label: discard_label.into(),
+            note: note.into(),
+            selected: 0,
+        }
     }
 
     /// Handles one key.
@@ -620,7 +643,7 @@ impl ConfirmClose {
             TEXT,
         );
         painter.text(
-            "Closing now will discard them.",
+            &self.note,
             panel.x + PADDING,
             panel.y + 70.0,
             11.5,
@@ -647,7 +670,7 @@ impl ConfirmClose {
                     },
                 );
                 painter.text_centered(
-                    "Close without saving",
+                    &self.discard_label,
                     *rect,
                     rect.y + 8.0,
                     12.0,

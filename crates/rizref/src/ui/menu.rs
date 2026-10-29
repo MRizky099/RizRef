@@ -56,7 +56,7 @@ pub enum Action {
     OpenImages,
     /// Paste files or a bitmap from the clipboard.
     Paste,
-    /// Pick a `.rizref` board (loading lands in phase 06).
+    /// Pick a `.rizref` board to open.
     OpenBoard,
     /// Open one recent board.
     OpenRecent(PathBuf),
@@ -64,11 +64,11 @@ pub enum Action {
     RemoveRecent(PathBuf),
     /// Show a recent board in Explorer.
     OpenContainingFolder(PathBuf),
-    /// Save (phase 06).
+    /// Save to the current file, asking for one the first time.
     Save,
-    /// Save as (phase 06).
+    /// Save to a new file.
     SaveAs,
-    /// Export (phase 06).
+    /// Export the board as a PNG image.
     Export,
     /// Return to the start view.
     ShowStart,

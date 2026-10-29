@@ -11,8 +11,8 @@
 //! `platform::imaging`). Formats that are recognised but never decodable are
 //! left out so the dialog cannot offer a file the loader will refuse.
 //!
-//! Phase 03 wires the image dialog to Ctrl+O; board open/save and export
-//! dialogs arrive with the UI in phase 05.
+//! Ctrl+O opens the image dialog; the board open, save and PNG-export dialogs
+//! were added with the `.rizref` container.
 
 use std::path::PathBuf;
 
@@ -30,6 +30,54 @@ pub fn pick_images() -> Option<Vec<PathBuf>> {
         .set_title("Open images")
         .add_filter("Images", &IMAGE_EXTENSIONS)
         .pick_files()
+}
+
+/// Opens the native "open board" dialog.
+pub fn pick_board() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Open board")
+        .add_filter("RizRef board", &["rizref"])
+        .pick_file()
+}
+
+/// Opens the native "save board" dialog.
+///
+/// The returned path always carries the `.rizref` extension, even when the user
+/// typed a bare name: a board whose extension is missing would not be offered
+/// back by the open dialog or the Explorer thumbnail provider.
+pub fn save_board(default_name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Save board")
+        .add_filter("RizRef board", &["rizref"])
+        .set_file_name(default_name)
+        .save_file()
+        .map(|path| with_extension(path, "rizref"))
+}
+
+/// Opens the native "export board as PNG" dialog.
+pub fn export_png(default_name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Export board as PNG")
+        .add_filter("PNG image", &["png"])
+        .set_file_name(default_name)
+        .save_file()
+        .map(|path| with_extension(path, "png"))
+}
+
+/// Returns `path` with the requested extension.
+///
+/// A matching extension is kept as typed; any other name gets the right one, so
+/// a board cannot be saved as `board.txt` and then be invisible to the open
+/// dialog and the Explorer thumbnail provider.
+fn with_extension(path: PathBuf, extension: &str) -> PathBuf {
+    if path
+        .extension()
+        .and_then(|current| current.to_str())
+        .is_some_and(|current| current.eq_ignore_ascii_case(extension))
+    {
+        return path;
+    }
+    path.with_extension(extension)
 }
 
 #[cfg(test)]
@@ -60,5 +108,30 @@ mod tests {
                 assert_ne!(extension, other, "duplicate extension in the filter list");
             }
         }
+    }
+
+    #[test]
+    fn a_saved_board_always_carries_its_extension() {
+        use super::with_extension;
+        use std::path::PathBuf;
+
+        assert_eq!(
+            with_extension(PathBuf::from("C:/boards/hands"), "rizref"),
+            PathBuf::from("C:/boards/hands.rizref")
+        );
+        assert_eq!(
+            with_extension(PathBuf::from("C:/boards/hands.rizref"), "rizref"),
+            PathBuf::from("C:/boards/hands.rizref")
+        );
+        assert_eq!(
+            with_extension(PathBuf::from("C:/boards/hands.wrong"), "rizref"),
+            PathBuf::from("C:/boards/hands.rizref"),
+            "the board extension wins over a foreign one"
+        );
+        assert_eq!(
+            with_extension(PathBuf::from("C:/boards/hands.RIZREF"), "rizref"),
+            PathBuf::from("C:/boards/hands.RIZREF"),
+            "the extension match is case-insensitive"
+        );
     }
 }

@@ -61,6 +61,34 @@ impl SceneId {
         }
         Some(Self(raw))
     }
+
+    /// A fresh UUID version 4 identifier.
+    ///
+    /// The bits a UUID v4 reserves are set correctly (version nibble `4`,
+    /// variant bits `10`), so ids are recognisable to other tools. Entropy
+    /// comes from the clock, the process id, a process-wide counter and the
+    /// address of a stack value, hashed with BLAKE3: enough to make a collision
+    /// between boards created on one machine practically impossible, without
+    /// pulling in a random-number crate for a value that is never a secret.
+    pub fn random() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stack_marker = 0_u8;
+        let mut entropy = Vec::with_capacity(32);
+        entropy.extend_from_slice(&nanos.to_le_bytes());
+        entropy.extend_from_slice(&u64::from(std::process::id()).to_le_bytes());
+        entropy.extend_from_slice(&counter.to_le_bytes());
+        entropy.extend_from_slice(&(std::ptr::addr_of!(stack_marker) as usize).to_le_bytes());
+        let digest = blake3::hash(&entropy);
+        let mut raw = [0u8; Self::BYTE_LEN];
+        raw.copy_from_slice(&digest.as_bytes()[..Self::BYTE_LEN]);
+        raw[6] = (raw[6] & 0x0f) | 0x40;
+        raw[8] = (raw[8] & 0x3f) | 0x80;
+        Self(raw)
+    }
 }
 
 impl fmt::Display for SceneId {
@@ -209,6 +237,14 @@ impl Scene {
     /// whether this call inserted it.
     pub fn insert_asset(&mut self, asset: Asset) -> (AssetId, bool) {
         self.assets.intern(asset)
+    }
+
+    /// Replaces an asset with the same content id, returning the previous one.
+    ///
+    /// Used when a deferred decode discovers that a GIF is animated: the
+    /// original bytes are identical, only the attached frames are new.
+    pub fn replace_asset(&mut self, asset: Asset) -> Option<Asset> {
+        self.assets.replace(asset)
     }
 
     /// Allocates the next item id, keeping a session high-water mark.
@@ -449,6 +485,18 @@ mod tests {
         assert_eq!(SceneId::from_hex(&"0".repeat(31)), None, "too short");
         assert_eq!(SceneId::from_hex(&"0".repeat(33)), None, "too long");
         assert_eq!(SceneId::from_hex(&"z".repeat(32)), None, "not hex");
+    }
+
+    #[test]
+    fn random_scene_ids_are_uuid_v4_and_not_repeated() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let id = SceneId::random();
+            let bytes = id.as_bytes();
+            assert_eq!(bytes[6] & 0xf0, 0x40, "UUID version nibble");
+            assert_eq!(bytes[8] & 0xc0, 0x80, "UUID variant bits");
+            assert!(seen.insert(id), "random ids must not repeat");
+        }
     }
 
     #[test]

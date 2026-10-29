@@ -268,6 +268,15 @@ impl GpuSurface {
         self.textures.contains(asset)
     }
 
+    /// Drops one asset's texture, returning whether it was resident.
+    ///
+    /// Used when a board is replaced: the new board may not contain the asset,
+    /// and keeping its VRAM alive until the LRU evicts it would look like a
+    /// budget that never recovers.
+    pub fn remove_texture(&mut self, asset: rizref_core::AssetId) -> bool {
+        self.textures.remove(asset)
+    }
+
     /// Whether `asset`'s resident texture is only its preview.
     pub fn texture_is_preview(&self, asset: rizref_core::AssetId) -> bool {
         self.textures.is_preview(asset).unwrap_or(false)

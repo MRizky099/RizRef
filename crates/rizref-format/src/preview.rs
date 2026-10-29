@@ -1,16 +1,15 @@
-//! The embedded board preview.
+//! The embedded board thumbnail.
 //!
-//! A board carries its own thumbnail, which is what lets a recent-boards list
-//! show what a file looks like without opening it. The preview travels as its
-//! own chunk so a reader that only wants the thumbnail can skip everything else,
-//! and so an unchanged preview can be copied verbatim on save instead of
-//! re-rendering the board.
+//! A board carries its own thumbnail, which is what lets the start view — and,
+//! later, the Windows Explorer thumbnail provider — show what a file looks like
+//! without opening it. The thumbnail travels as its own chunk so a reader that
+//! only wants the picture can skip everything else, and so an unchanged
+//! thumbnail can be copied verbatim on save instead of re-rendered.
 //!
-//! Phase 00 fixes only the shape of the value and keeps the encoded bytes
-//! opaque: the container never learns an image format, and the encoder plus the
-//! pixel-size policy arrive with the image pipeline in phase 03/06. That policy
-//! is deliberately *not* invented here — the right maximum edge depends on how
-//! the recent-boards strip is drawn, and on the phase-07 save budget.
+//! The container keeps the encoded bytes opaque: it never learns an image
+//! format. The chunk payload stores the pixel width and height in front of those
+//! bytes, which is what lets a recents tile be laid out from the aspect ratio
+//! alone. [`crate::thumbnail`] is the compositor that produces them.
 
 /// An encoded preview image, with the pixel size it stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]

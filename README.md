@@ -26,8 +26,11 @@ phase 05 (custom context menus, a start view with recents, a rebindable shortcut
 with an F1 overlay, settings, a frameless auto-hiding title bar that names the open
 document and marks unsaved work, an unsaved-changes close guard, always-on-top/
 opacity/click-through/borderless window modes, ghost mode, color picker, canvas lock
-and a UIA accessibility tree) have landed. The workspace builds, tests and lints
-clean.
+and a UIA accessibility tree) and phase 06 (the complete `.rizref` container: header,
+chunk stream, JSON scene document, content-addressed image blobs, asset previews,
+board thumbnails, atomic fresh saves, incremental appends, recovery and compaction,
+`rizref inspect --verify`, and Save/Open/Export wiring in the application) have
+landed. The workspace builds, tests and lints clean.
 
 ## Design principles
 
@@ -49,6 +52,7 @@ crates/
   rizref-format/   .rizref container reader/writer — single source of truth
   rizref-codecs/   image decode/encode dispatch (pure-Rust codec backends)
 docs/
+  format.md        the `.rizref` file-format specification
   ...              local working documents (not published to this remote)
 ```
 
@@ -57,7 +61,7 @@ One line each, in the direction dependencies flow:
 | Crate | Responsibility |
 |---|---|
 | `rizref-core` | Scene model, camera, rectangle geometry, selection and the undo history. Deterministic, no IO, no UI, no windowing. |
-| `rizref-format` | The `.rizref` container — header, checksums, chunk vocabulary, metadata. The only crate allowed to write board files. |
+| `rizref-format` | The `.rizref` container — header, chunk framing, scene document, content-addressed blobs, index/footer, recovery, incremental save and board thumbnails. The only crate allowed to write board files. See [`docs/format.md`](docs/format.md). |
 | `rizref-codecs` | Decodes every supported image format into one RGBA buffer and encodes PNG/JPEG. All backends are pure Rust. |
 | `rizref` | The binary: window, renderer, input, clipboard, dialogs and Windows platform glue. |
 
