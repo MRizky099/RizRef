@@ -29,6 +29,7 @@ pub mod drop_target;
 pub mod imaging;
 pub mod message_box;
 pub mod single_instance;
+pub mod window_modes;
 
 pub use drop_target::{DropEvent, Registration as DropRegistration};
 pub use message_box::alert;

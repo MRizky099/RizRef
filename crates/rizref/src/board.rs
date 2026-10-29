@@ -232,8 +232,7 @@ impl Board {
         self.gesture.is_some()
     }
 
-    /// Enables or disables snapping (the settings toggle lands in phase 05).
-    #[cfg(test)]
+    /// Enables or disables snapping (the settings toggle).
     pub fn set_snap_enabled(&mut self, enabled: bool) {
         self.snap_enabled = enabled;
     }

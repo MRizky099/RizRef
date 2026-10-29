@@ -20,9 +20,14 @@ Vulkan→DX12 surface, on-demand pacing, single instance, logs), phase 02 (f64 c
 pan/zoom/rotate, grid, quad + HUD pipelines), phase 03 (worker-thread image import
 with EXIF-aware decoding, BLAKE3 asset dedup, previews, an OLE drop target that also
 accepts virtual files such as Outlook attachments, clipboard paste, Ctrl+O and per-item
-sRGB textures) and phase 04 (select/marquee, move/scale/rotate/flip, snapping with smart
-guides, arrange/align/distribute, groups, notes and a coalescing undo history) have
-landed. The workspace builds, tests and lints clean.
+sRGB textures), phase 04 (select/marquee, move/scale/rotate/flip, snapping with smart
+guides, arrange/align/distribute, groups, notes and a coalescing undo history) and
+phase 05 (custom context menus, a start view with recents, a rebindable shortcut table
+with an F1 overlay, settings, a frameless auto-hiding title bar that names the open
+document and marks unsaved work, an unsaved-changes close guard, always-on-top/
+opacity/click-through/borderless window modes, ghost mode, color picker, canvas lock
+and a UIA accessibility tree) have landed. The workspace builds, tests and lints
+clean.
 
 ## Design principles
 

@@ -1,16 +1,18 @@
-//! The declarative input map: what the user does → what the app does.
+//! The pointer input map: what the user does with the mouse → what the app does.
 //!
-//! The map is a *table*, not a match statement scattered through the event
-//! handler: phase 05's rebinding UI then edits data instead of control flow,
-//! and the whole default scheme is reviewable in one glance below. winit types
-//! are kept out of the table itself so the mapping stays unit-testable without
-//! a window server; the event handler in `app` translates winit events into
-//! the small [`Trigger`] vocabulary and looks the command up.
+//! Keyboard bindings are *not* here. They live in [`crate::shortcuts`], which
+//! owns the rebindable table and the conflict rules; this module only keeps the
+//! gestures that are structural rather than user-bindable (a wheel notch is a
+//! wheel notch, a middle-button drag is a pan). Keeping the pointer table
+//! separate means the shortcut editor can never accidentally rebind panning to
+//! a key that is already taken by text input.
+//!
+//! winit types are kept out of the tables themselves so both mappings stay
+//! unit-testable without a window server.
 
-use crate::board::{Modifiers, NUDGE_PIXELS};
 use crate::view::PanKind;
 
-/// One user action the canvas can take.
+/// One action the canvas can take.
 ///
 /// View commands drive the camera; item commands go through the board's command
 /// stack, so every one of them is undoable.
@@ -30,6 +32,9 @@ pub enum Command {
     ZoomHundred,
     /// Reset the view rotation to zero (`2`).
     ResetRotation,
+    /// Reset zoom to 100%, rotation to zero and centre on the content
+    /// (`ctrl+0`).
+    ResetView,
     /// `ctrl+A`.
     SelectAll,
     /// `esc`.
@@ -97,7 +102,7 @@ pub enum Command {
     DistributeVertical,
 }
 
-/// A user gesture the table recognises, before modifiers are applied.
+/// A pointer gesture the table recognises, before modifiers are applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// A mouse-wheel notch, with or without alt.
@@ -114,15 +119,6 @@ pub enum Trigger {
         /// Space was held (the left-drag pan modifier).
         space_held: bool,
     },
-    /// A keyboard key press or release.
-    Key {
-        /// The key.
-        key: Key,
-        /// `true` for press, `false` for release.
-        pressed: bool,
-        /// Modifiers as of the event.
-        mods: Modifiers,
-    },
 }
 
 /// Mouse buttons the canvas listens to.
@@ -134,119 +130,16 @@ pub enum Button {
     Middle,
 }
 
-/// Keyboard keys the canvas binds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Key {
-    /// `0` — zoom to 100%.
-    Digit0,
-    /// `1` — zoom to fit.
-    Digit1,
-    /// `2` — reset rotation.
-    Digit2,
-    /// `3` — arrange in a grid.
-    Digit3,
-    /// `4` — hierarchical arrange.
-    Digit4,
-    /// `5` — spread.
-    Digit5,
-    /// `6` — stack.
-    Digit6,
-    /// `F` — frame all content.
-    F,
-    /// `A`.
-    A,
-    /// `D`.
-    D,
-    /// `G`.
-    G,
-    /// `H`.
-    H,
-    /// `N`.
-    N,
-    /// `R`.
-    R,
-    /// `V`.
-    V,
-    /// `W`.
-    W,
-    /// `Y`.
-    Y,
-    /// `Z`.
-    Z,
-    /// Left arrow.
-    Left,
-    /// Right arrow.
-    Right,
-    /// Up arrow.
-    Up,
-    /// Down arrow.
-    Down,
-    /// Page up.
-    PageUp,
-    /// Page down.
-    PageDown,
-    /// Home.
-    Home,
-    /// End.
-    End,
-    /// Delete.
-    Delete,
-    /// Backspace.
-    Backspace,
-    /// Escape.
-    Escape,
-    /// Comma.
-    Comma,
-    /// Period.
-    Period,
-}
-
-/// One row of the table: this gesture means that command.
+/// One row of the pointer table.
 struct Row {
     trigger: fn(&Trigger) -> bool,
     command: Command,
 }
 
-/// Whether a key trigger is a press of `key` with exactly `mods`.
-#[cfg(test)]
-const fn key_press(key: Key, mods: Modifiers) -> Trigger {
-    Trigger::Key {
-        key,
-        pressed: true,
-        mods,
-    }
-}
-
-/// Modifier shorthand for the table.
-const NONE: Modifiers = Modifiers {
-    shift: false,
-    ctrl: false,
-    alt: false,
-};
-/// Modifiers with shift.
-const SHIFT: Modifiers = Modifiers {
-    shift: true,
-    ctrl: false,
-    alt: false,
-};
-/// Modifiers with control.
-const CTRL: Modifiers = Modifiers {
-    shift: false,
-    ctrl: true,
-    alt: false,
-};
-/// Modifiers with control and shift.
-const CTRL_SHIFT: Modifiers = Modifiers {
-    shift: true,
-    ctrl: true,
-    alt: false,
-};
-
-/// The default input scheme.
+/// The structural pointer scheme.
 ///
-/// Rows are matched top to bottom; the first row whose trigger accepts the
-/// event wins. Order matters where triggers overlap: modifier combinations come
-/// before their unmodified keys, and space+left before plain left.
+/// Rows are matched top to bottom; order matters where triggers overlap:
+/// space+left comes before plain left.
 const TABLE: &[Row] = &[
     Row {
         trigger: |t| matches!(t, Trigger::Wheel { alt: true }),
@@ -295,219 +188,10 @@ const TABLE: &[Row] = &[
         },
         command: Command::EndPan,
     },
-    // --- ctrl+shift combinations, before their shorter forms -----------------
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Z, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::Redo,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::G, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::UngroupSelection,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Left, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::AlignLeft,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Right, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::AlignRight,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Up, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::AlignTop,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Down, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::AlignBottom,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Comma, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::DistributeHorizontal,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Period, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::DistributeVertical,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::W, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::MatchWidth,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::H, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::MatchHeight,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::R, pressed: true, mods } if *mods == CTRL_SHIFT),
-        command: Command::ResetTransform,
-    },
-    // --- ctrl combinations ---------------------------------------------------
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Z, pressed: true, mods } if *mods == CTRL),
-        command: Command::Undo,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Y, pressed: true, mods } if *mods == CTRL),
-        command: Command::Redo,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::A, pressed: true, mods } if *mods == CTRL),
-        command: Command::SelectAll,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::D, pressed: true, mods } if *mods == CTRL),
-        command: Command::DuplicateSelection,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::G, pressed: true, mods } if *mods == CTRL),
-        command: Command::GroupSelection,
-    },
-    // --- shift combinations --------------------------------------------------
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::H, pressed: true, mods } if *mods == SHIFT),
-        command: Command::FlipHorizontal,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::V, pressed: true, mods } if *mods == SHIFT),
-        command: Command::FlipVertical,
-    },
-    // --- unmodified keys -----------------------------------------------------
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Digit1, pressed: true, mods } if *mods == NONE),
-        command: Command::FitContent,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::F, pressed: true, mods } if *mods == NONE),
-        command: Command::FitContent,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Digit0, pressed: true, mods } if *mods == NONE),
-        command: Command::ZoomHundred,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Digit2, pressed: true, mods } if *mods == NONE),
-        command: Command::ResetRotation,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Digit3, pressed: true, mods } if *mods == NONE),
-        command: Command::ArrangeGrid,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Digit4, pressed: true, mods } if *mods == NONE),
-        command: Command::ArrangeHierarchy,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Digit5, pressed: true, mods } if *mods == NONE),
-        command: Command::ArrangeSpread,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Digit6, pressed: true, mods } if *mods == NONE),
-        command: Command::ArrangeStack,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Escape, pressed: true, mods } if *mods == NONE),
-        command: Command::Deselect,
-    },
-    Row {
-        trigger: |t| {
-            matches!(
-                t,
-                Trigger::Key {
-                    key: Key::Delete | Key::Backspace,
-                    pressed: true,
-                    mods: NONE
-                }
-            )
-        },
-        command: Command::DeleteSelection,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Left, pressed: true, mods } if *mods == NONE),
-        command: Command::Nudge {
-            dx: -1,
-            dy: 0,
-            pixels: NUDGE_PIXELS,
-        },
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Right, pressed: true, mods } if *mods == NONE),
-        command: Command::Nudge {
-            dx: 1,
-            dy: 0,
-            pixels: NUDGE_PIXELS,
-        },
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Up, pressed: true, mods } if *mods == NONE),
-        command: Command::Nudge {
-            dx: 0,
-            dy: -1,
-            pixels: NUDGE_PIXELS,
-        },
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Down, pressed: true, mods } if *mods == NONE),
-        command: Command::Nudge {
-            dx: 0,
-            dy: 1,
-            pixels: NUDGE_PIXELS,
-        },
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Left, pressed: true, mods } if *mods == SHIFT),
-        command: Command::Nudge {
-            dx: -1,
-            dy: 0,
-            pixels: NUDGE_PIXELS * 10.0,
-        },
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Right, pressed: true, mods } if *mods == SHIFT),
-        command: Command::Nudge {
-            dx: 1,
-            dy: 0,
-            pixels: NUDGE_PIXELS * 10.0,
-        },
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Up, pressed: true, mods } if *mods == SHIFT),
-        command: Command::Nudge {
-            dx: 0,
-            dy: -1,
-            pixels: NUDGE_PIXELS * 10.0,
-        },
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Down, pressed: true, mods } if *mods == SHIFT),
-        command: Command::Nudge {
-            dx: 0,
-            dy: 1,
-            pixels: NUDGE_PIXELS * 10.0,
-        },
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::PageUp, pressed: true, mods } if *mods == NONE),
-        command: Command::RaiseSelection,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::PageDown, pressed: true, mods } if *mods == NONE),
-        command: Command::LowerSelection,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::Home, pressed: true, mods } if *mods == NONE),
-        command: Command::RaiseToTop,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::End, pressed: true, mods } if *mods == NONE),
-        command: Command::LowerToBottom,
-    },
-    Row {
-        trigger: |t| matches!(t, Trigger::Key { key: Key::N, pressed: true, mods } if *mods == NONE),
-        command: Command::CreateNote,
-    },
 ];
 
-/// Looks up the command for `trigger`, or `None` when the gesture is not
-/// bound (the event handler then ignores it).
+/// Looks up the command for a pointer `trigger`, or `None` when the gesture is
+/// not bound (the event handler then handles it as a selection/gesture).
 pub fn resolve(trigger: &Trigger) -> Option<Command> {
     TABLE
         .iter()
@@ -517,25 +201,8 @@ pub fn resolve(trigger: &Trigger) -> Option<Command> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Button, Command, Key, Modifiers, Trigger, key_press, resolve};
-    use crate::board::NUDGE_PIXELS;
+    use super::{Button, Command, Trigger, resolve};
     use crate::view::PanKind;
-
-    const CTRL: Modifiers = Modifiers {
-        shift: false,
-        ctrl: true,
-        alt: false,
-    };
-    const CTRL_SHIFT: Modifiers = Modifiers {
-        shift: true,
-        ctrl: true,
-        alt: false,
-    };
-    const SHIFT: Modifiers = Modifiers {
-        shift: true,
-        ctrl: false,
-        alt: false,
-    };
 
     #[test]
     fn the_wheel_zooms_and_alt_wheel_rotates() {
@@ -585,179 +252,16 @@ mod tests {
     }
 
     #[test]
-    fn either_pan_button_releases_the_pan() {
+    fn releasing_a_button_never_zooms_or_rotates() {
         for button in [Button::Left, Button::Middle] {
             assert_eq!(
                 resolve(&Trigger::Button {
                     button,
                     pressed: false,
-                    space_held: false,
+                    space_held: true,
                 }),
-                Some(Command::EndPan)
-            );
-        }
-    }
-
-    #[test]
-    fn the_numbers_and_f_match_the_plan() {
-        assert_eq!(
-            resolve(&key_press(Key::Digit1, Modifiers::default())),
-            Some(Command::FitContent)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::F, Modifiers::default())),
-            Some(Command::FitContent)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::Digit0, Modifiers::default())),
-            Some(Command::ZoomHundred)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::Digit2, Modifiers::default())),
-            Some(Command::ResetRotation)
-        );
-        for (key, command) in [
-            (Key::Digit3, Command::ArrangeGrid),
-            (Key::Digit4, Command::ArrangeHierarchy),
-            (Key::Digit5, Command::ArrangeSpread),
-            (Key::Digit6, Command::ArrangeStack),
-        ] {
-            assert_eq!(
-                resolve(&key_press(key, Modifiers::default())),
-                Some(command)
-            );
-        }
-    }
-
-    #[test]
-    fn history_and_selection_shortcuts() {
-        assert_eq!(resolve(&key_press(Key::Z, CTRL)), Some(Command::Undo));
-        assert_eq!(resolve(&key_press(Key::Y, CTRL)), Some(Command::Redo));
-        assert_eq!(resolve(&key_press(Key::Z, CTRL_SHIFT)), Some(Command::Redo));
-        assert_eq!(resolve(&key_press(Key::A, CTRL)), Some(Command::SelectAll));
-        assert_eq!(
-            resolve(&key_press(Key::Escape, Modifiers::default())),
-            Some(Command::Deselect)
-        );
-    }
-
-    #[test]
-    fn item_shortcuts_do_not_shadow_each_other() {
-        assert_eq!(
-            resolve(&key_press(Key::H, SHIFT)),
-            Some(Command::FlipHorizontal)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::V, SHIFT)),
-            Some(Command::FlipVertical)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::H, CTRL_SHIFT)),
-            Some(Command::MatchHeight),
-            "ctrl+shift+H is match height, not flip"
-        );
-        assert_eq!(
-            resolve(&key_press(Key::W, CTRL_SHIFT)),
-            Some(Command::MatchWidth)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::R, CTRL_SHIFT)),
-            Some(Command::ResetTransform)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::G, CTRL)),
-            Some(Command::GroupSelection)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::G, CTRL_SHIFT)),
-            Some(Command::UngroupSelection)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::D, CTRL)),
-            Some(Command::DuplicateSelection)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::Delete, Modifiers::default())),
-            Some(Command::DeleteSelection)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::Backspace, Modifiers::default())),
-            Some(Command::DeleteSelection)
-        );
-    }
-
-    #[test]
-    fn arrows_nudge_and_shift_arrows_nudge_further() {
-        assert_eq!(
-            resolve(&key_press(Key::Left, Modifiers::default())),
-            Some(Command::Nudge {
-                dx: -1,
-                dy: 0,
-                pixels: NUDGE_PIXELS
-            })
-        );
-        assert_eq!(
-            resolve(&key_press(Key::Down, SHIFT)),
-            Some(Command::Nudge {
-                dx: 0,
-                dy: 1,
-                pixels: NUDGE_PIXELS * 10.0
-            })
-        );
-    }
-
-    #[test]
-    fn z_order_shortcuts() {
-        assert_eq!(
-            resolve(&key_press(Key::PageUp, Modifiers::default())),
-            Some(Command::RaiseSelection)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::PageDown, Modifiers::default())),
-            Some(Command::LowerSelection)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::Home, Modifiers::default())),
-            Some(Command::RaiseToTop)
-        );
-        assert_eq!(
-            resolve(&key_press(Key::End, Modifiers::default())),
-            Some(Command::LowerToBottom)
-        );
-    }
-
-    #[test]
-    fn align_and_distribute_shortcuts() {
-        for (key, command) in [
-            (Key::Left, Command::AlignLeft),
-            (Key::Right, Command::AlignRight),
-            (Key::Up, Command::AlignTop),
-            (Key::Down, Command::AlignBottom),
-            (Key::Comma, Command::DistributeHorizontal),
-            (Key::Period, Command::DistributeVertical),
-        ] {
-            assert_eq!(resolve(&key_press(key, CTRL_SHIFT)), Some(command));
-        }
-    }
-
-    #[test]
-    fn key_releases_bind_nothing() {
-        for key in [
-            Key::Digit0,
-            Key::Digit1,
-            Key::Digit2,
-            Key::F,
-            Key::H,
-            Key::Z,
-        ] {
-            assert_eq!(
-                resolve(&Trigger::Key {
-                    key,
-                    pressed: false,
-                    mods: Modifiers::default()
-                }),
-                None,
-                "{key:?} release is not a command"
+                Some(Command::EndPan),
+                "releasing a button always ends a pan"
             );
         }
     }

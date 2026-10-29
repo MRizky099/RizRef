@@ -29,13 +29,13 @@ const INITIAL_INSTANCE_CAPACITY: usize = 256;
 const INITIAL_OVERLAY_CAPACITY: usize = 4096;
 
 /// Side length in uniform bytes of the `Globals` block.
-const GLOBALS_SIZE: u64 = 64;
+///
+/// Eighteen floats of data (72 bytes) rounded up to the 16-byte uniform
+/// alignment WGSL requires.
+const GLOBALS_SIZE: u64 = 80;
 
 /// The per-frame uniform block, laid out exactly like the WGSL `Globals`
-/// struct (all fields 4-byte aligned, 64 bytes total).
-///
-/// Packed by hand rather than via a derive crate: the block is 16 floats, and
-/// the workspace does not carry a byte-packing dependency for one struct.
+/// struct (all fields 4-byte aligned, 80 bytes total).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Globals {
     /// Camera eye in world units, narrowed to f32.
@@ -56,6 +56,10 @@ pub struct Globals {
     pub grid_visible: f32,
     /// 1.0 when the scene-rect border should draw.
     pub border_visible: f32,
+    /// 1.0 when the checkerboard backdrop should draw.
+    pub checkerboard: f32,
+    /// 1.0 when items should draw in grayscale.
+    pub grayscale: f32,
     /// HUD texture size in device pixels.
     pub hud_size: [f32; 2],
 }
@@ -88,13 +92,15 @@ impl Globals {
                 0.0
             },
             border_visible: if scene_rect.is_some() { 1.0 } else { 0.0 },
+            checkerboard: 0.0,
+            grayscale: 0.0,
             hud_size: [0.0, 0.0],
         }
     }
 
-    /// The block as its 64 uniform bytes.
-    pub fn bytes(&self) -> [u8; 64] {
-        let floats: [f32; 16] = [
+    /// The block as its 80 uniform bytes.
+    pub fn bytes(&self) -> [u8; 80] {
+        let floats: [f32; 20] = [
             self.eye[0],
             self.eye[1],
             self.viewport[0],
@@ -109,8 +115,12 @@ impl Globals {
             self.scene_max[1],
             self.grid_visible,
             self.border_visible,
+            self.checkerboard,
+            self.grayscale,
             self.hud_size[0],
             self.hud_size[1],
+            0.0,
+            0.0,
         ];
         pack_floats(&floats)
     }
@@ -146,7 +156,8 @@ impl QuadInstance {
 
     /// The instance as its 64 vertex bytes.
     pub fn bytes(&self) -> [u8; 64] {
-        pack_floats(&[
+        let mut bytes = [0u8; 64];
+        let floats = [
             self.center[0],
             self.center[1],
             self.size[0],
@@ -163,7 +174,11 @@ impl QuadInstance {
             self.tint[1],
             self.tint[2],
             self.tint[3],
-        ])
+        ];
+        for (slot, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(floats.iter()) {
+            slot.copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes
     }
 
     /// The axis-aligned world rect the rotated quad sweeps out — what the
@@ -190,10 +205,10 @@ pub struct ItemQuad {
     pub asset: AssetId,
 }
 
-/// Packs 16 f32 values into the 64 bytes the uniform and instance layouts
-/// expect (native-endian, 4-byte stride).
-fn pack_floats(floats: &[f32; 16]) -> [u8; 64] {
-    let mut bytes = [0u8; 64];
+/// Packs 20 f32 values into the 80 bytes the uniform layout expects
+/// (native-endian, 4-byte stride).
+fn pack_floats(floats: &[f32; 20]) -> [u8; 80] {
+    let mut bytes = [0u8; 80];
     for (slot, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(floats.iter()) {
         slot.copy_from_slice(&value.to_ne_bytes());
     }
@@ -214,10 +229,14 @@ pub struct Canvas {
     hud_texture: Option<wgpu::Texture>,
     hud_bind_group: Option<wgpu::BindGroup>,
     hud_texture_size: (u32, u32),
+    ui_texture: Option<wgpu::Texture>,
+    ui_bind_group: Option<wgpu::BindGroup>,
+    ui_texture_size: (u32, u32),
     background_pipeline: wgpu::RenderPipeline,
     item_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
+    ui_pipeline: wgpu::RenderPipeline,
 }
 
 impl Canvas {
@@ -420,6 +439,15 @@ impl Canvas {
             wgpu::BlendState::ALPHA_BLENDING,
             wgpu::PrimitiveTopology::TriangleStrip,
         );
+        let ui_pipeline = make_pipeline(
+            "rizref-ui-pipeline",
+            "vs_ui",
+            "fs_ui",
+            Some(&hud_texture_layout),
+            &[],
+            wgpu::BlendState::ALPHA_BLENDING,
+            wgpu::PrimitiveTopology::TriangleStrip,
+        );
 
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rizref-globals"),
@@ -463,10 +491,14 @@ impl Canvas {
             hud_texture: None,
             hud_bind_group: None,
             hud_texture_size: (0, 0),
+            ui_texture: None,
+            ui_bind_group: None,
+            ui_texture_size: (0, 0),
             background_pipeline,
             item_pipeline,
             overlay_pipeline,
             hud_pipeline,
+            ui_pipeline,
         }
     }
 
@@ -479,6 +511,7 @@ impl Canvas {
     ///
     /// `hud_size` rides along here because the HUD vertex shader reads it from
     /// the same uniform block.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_globals(
         &self,
         queue: &wgpu::Queue,
@@ -487,9 +520,12 @@ impl Canvas {
         physical_scale: f64,
         scene_rect: Option<Rect>,
         hud_size: (f32, f32),
+        flags: FrameFlags,
     ) {
         let mut globals = Globals::new(camera, viewport, physical_scale, scene_rect);
         globals.hud_size = [hud_size.0, hud_size.1];
+        globals.checkerboard = if flags.checkerboard { 1.0 } else { 0.0 };
+        globals.grayscale = if flags.grayscale { 1.0 } else { 0.0 };
         queue.write_buffer(&self.globals_buffer, 0, &globals.bytes());
     }
 
@@ -626,6 +662,94 @@ impl Canvas {
         );
     }
 
+    /// Uploads the cached shell layer, keeps the existing one, or releases it.
+    ///
+    /// The texture is rebuilt only when its size changes; pixels are written on
+    /// every `Layer` upload. `Keep` is what makes an idle shell free: the event
+    /// loop only asks for a `Layer` when its revision moved.
+    pub fn set_ui(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ui: UiUpload) {
+        let (bytes, width, height) = match ui {
+            UiUpload::None => {
+                self.ui_bind_group = None;
+                self.ui_texture = None;
+                self.ui_texture_size = (0, 0);
+                return;
+            }
+            UiUpload::Keep => return,
+            UiUpload::Layer {
+                bytes,
+                width,
+                height,
+            } => (bytes, width, height),
+        };
+
+        if self.ui_texture_size != (width, height) {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("rizref-ui"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: Self::HUD_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let layout = self.ui_pipeline.get_bind_group_layout(1);
+            self.ui_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rizref-ui-bind-group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&device.create_sampler(
+                            &wgpu::SamplerDescriptor {
+                                label: Some("rizref-ui-sampler"),
+                                mag_filter: wgpu::FilterMode::Nearest,
+                                min_filter: wgpu::FilterMode::Nearest,
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                ],
+            }));
+            self.ui_texture = Some(texture);
+            self.ui_texture_size = (width, height);
+        }
+
+        let texture = self
+            .ui_texture
+            .as_ref()
+            .expect("the texture exists after the size check");
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     /// Draws the background pass: grid, origin cross, scene-rect border.
     pub fn draw_background<'r>(&self, pass: &mut wgpu::RenderPass<'r>) {
         pass.set_pipeline(&self.background_pipeline);
@@ -683,6 +807,26 @@ impl Canvas {
         pass.set_bind_group(1, bind_group, &[]);
         pass.draw(0..4, 0..1);
     }
+
+    /// Draws the shell layer over the whole viewport.
+    pub fn draw_ui<'r>(&self, pass: &mut wgpu::RenderPass<'r>) {
+        let Some(bind_group) = self.ui_bind_group.as_ref() else {
+            return;
+        };
+        pass.set_pipeline(&self.ui_pipeline);
+        pass.set_bind_group(0, &self.globals_bind_group, &[]);
+        pass.set_bind_group(1, bind_group, &[]);
+        pass.draw(0..4, 0..1);
+    }
+}
+
+/// Per-frame display-effect flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameFlags {
+    /// Draw the checkerboard backdrop.
+    pub checkerboard: bool,
+    /// Draw items in grayscale.
+    pub grayscale: bool,
 }
 
 /// One frame's HUD layer, or its absence.
@@ -690,6 +834,24 @@ impl Canvas {
 pub enum HudUpload<'a> {
     /// No HUD this frame.
     None,
+    /// Straight-alpha RGBA pixels of `width` × `height` device pixels.
+    Layer {
+        /// The pixels, row-major, 4 bytes per pixel.
+        bytes: &'a [u8],
+        /// Width in device pixels.
+        width: u32,
+        /// Height in device pixels.
+        height: u32,
+    },
+}
+
+/// One frame's shell UI layer.
+#[derive(Debug, Clone, Copy)]
+pub enum UiUpload<'a> {
+    /// No shell UI this frame; release the texture.
+    None,
+    /// Reuse the texture already on the GPU (nothing in the shell changed).
+    Keep,
     /// Straight-alpha RGBA pixels of `width` × `height` device pixels.
     Layer {
         /// The pixels, row-major, 4 bytes per pixel.
@@ -718,7 +880,17 @@ mod tests {
                 glam::Vec2::splat(10.0),
             )),
         );
-        assert_eq!(globals.bytes().len(), 64);
+        assert_eq!(globals.bytes().len(), 80);
+    }
+
+    #[test]
+    fn the_effect_flags_ride_in_the_global_block() {
+        let mut globals = Globals::new(&Camera::default(), DVec2::ONE, 1.0, None);
+        globals.checkerboard = 1.0;
+        globals.grayscale = 1.0;
+        assert_eq!(globals.bytes().len(), 80);
+        assert_eq!(globals.checkerboard, 1.0);
+        assert_eq!(globals.grayscale, 1.0);
     }
 
     #[test]
@@ -830,6 +1002,10 @@ mod tests {
             1.0,
             None,
             (0.0, 0.0),
+            super::FrameFlags {
+                checkerboard: true,
+                grayscale: true,
+            },
         );
 
         let asset = rizref_core::AssetId::from_checksum([7; 32]);
@@ -851,6 +1027,15 @@ mod tests {
         }];
         canvas.set_items(&device, &queue, &items);
         canvas.set_hud(&device, &queue, super::HudUpload::None);
+        canvas.set_ui(
+            &device,
+            &queue,
+            super::UiUpload::Layer {
+                bytes: &[0u8; 64 * 64 * 4],
+                width: 64,
+                height: 64,
+            },
+        );
         canvas.set_overlay(
             &device,
             &queue,
@@ -907,6 +1092,7 @@ mod tests {
             canvas.draw_items(&mut pass, &bind_groups);
             canvas.draw_overlay(&mut pass);
             canvas.draw_hud(&mut pass);
+            canvas.draw_ui(&mut pass);
         }
         queue.submit(Some(encoder.finish()));
         // Pipeline creation validates the shader and layouts synchronously;

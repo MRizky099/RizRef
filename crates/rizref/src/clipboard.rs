@@ -68,6 +68,15 @@ pub fn read_text() -> Result<String, String> {
         .map_err(|error| format!("the clipboard holds no text: {error}"))
 }
 
+/// Writes plain text to the clipboard (the colour picker's hex readout).
+pub fn write_text(text: &str) -> Result<(), String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("cannot open the clipboard: {error}"))?;
+    clipboard
+        .set_text(text.to_owned())
+        .map_err(|error| format!("cannot write the clipboard: {error}"))
+}
+
 /// Encodes raw clipboard RGBA as PNG.
 fn png_from_rgba(width: u32, height: u32, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     let image = ImageBuffer::from_rgba(width, height, bytes)

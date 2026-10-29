@@ -260,6 +260,13 @@ impl ViewState {
                 self.camera.set_rotation(0.0);
                 self.refresh_cursor_world();
             }
+            Command::ResetView => {
+                self.camera = Camera::default();
+                if let Some(rect) = scene_rect {
+                    self.camera.frame(rect, self.viewport, FRAME_PADDING);
+                }
+                self.refresh_cursor_world();
+            }
             // Item commands are dispatched by the board, never routed here.
             _ => {}
         }

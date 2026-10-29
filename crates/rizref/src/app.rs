@@ -26,31 +26,44 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glam::{DVec2, Vec2};
-use rizref_core::{Asset, AssetId, Item, ItemBody, ItemId, Rect, Scene, SceneId, Selection};
+use rizref_core::{
+    Asset, AssetId, Camera, Item, ItemBody, ItemId, Rect, Scene, SceneId, Selection,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
+use crate::accessibility::Accessibility;
 use crate::board::{Board, CursorHint, Modifiers, ViewInfo};
-use crate::canvas::{HudUpload, ItemQuad, QuadInstance};
+use crate::canvas::{FrameFlags, HudUpload, ItemQuad, QuadInstance, UiUpload};
 use crate::clipboard::{self, ClipboardContent};
 use crate::dev_state;
+use crate::document::Document;
 use crate::hud::HudSurface;
 use crate::import::{ImportOutcome, ImportRequest, Importer};
-use crate::input::{self, Button as InputButton, Command, Key as InputKey, Trigger};
+use crate::input::{self, Button as InputButton, Command, Trigger};
 use crate::memory::DecodeCache;
 use crate::note::{self, NoteSession};
 use crate::overlay::{self, OverlayState, OverlayVertex};
 use crate::placement;
+use crate::platform::window_modes::WindowModes;
 use crate::platform::{
     self, DropEvent, DropRegistration, SingleInstance, forward_args_to_primary,
     serve_forwarded_args,
 };
+use crate::recents::Recents;
 use crate::renderer::{FrameError, FrameParams, GpuSurface};
+use crate::settings::Settings;
+use crate::shortcuts::{Key as ShortcutKey, KeyChord, ShortcutId, Shortcuts};
 use crate::text::TextEngine;
+use crate::ui::menu::{self, Action, MenuContext, MenuEntry, MenuResult};
+use crate::ui::panels::{self, CloseChoice, PanelResult, SettingId};
+use crate::ui::start::{self, StartLayout};
+use crate::ui::titlebar::{self, TitleBarButton};
+use crate::ui::{Mode, Shell, UiLayer};
 use crate::view::{FRAME_PADDING, ViewState};
 
 /// The window RizRef opens.
@@ -83,7 +96,6 @@ impl Default for WindowPlan {
 pub const CANVAS_BACKGROUND: [u8; 4] = [24, 24, 28, 255];
 
 /// Readout surface width in logical pixels.
-/// Readout surface width in logical pixels.
 ///
 /// Narrow enough for the 600 px default window with its 14 px margin, and wide
 /// enough for the zoom readout plus a selection size.
@@ -97,6 +109,9 @@ const LOG_FILES_KEPT: usize = 14;
 
 /// Double-click window for zoom-to-item and note editing.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// Thickness of the frameless window's edge-resize band, in logical pixels.
+const RESIZE_EDGE: f64 = 5.0;
 
 /// Version string used by `--version` and the summary line.
 pub fn version_line() -> String {
@@ -346,13 +361,21 @@ fn install_panic_hook(log_dir: PathBuf) {
 
 /// Events that arrive in the loop from outside winit's own flow.
 #[derive(Debug)]
-enum AppEvent {
+pub(crate) enum AppEvent {
     /// A second launch handed its arguments to this instance.
     ForwardedArgs(Vec<String>),
     /// An import worker finished one request.
     Import(Box<ImportOutcome>),
     /// The OLE drop target received files, in client-area physical pixels.
     Dropped(Box<DropEvent>),
+    /// An accessibility adapter event (tree request, action, deactivation).
+    Accessibility(accesskit_winit::Event),
+}
+
+impl From<accesskit_winit::Event> for AppEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Self::Accessibility(event)
+    }
 }
 
 /// One note's resident texture.
@@ -404,8 +427,36 @@ struct App {
     dirty_notes: BTreeSet<ItemId>,
     /// The last click, for double-click detection.
     last_click: Option<(Instant, Option<ItemId>)>,
+    /// The last press on the title bar's drag area, for double-click maximize.
+    last_title_click: Option<Instant>,
     /// The cursor currently set on the window.
     cursor_icon: Option<CursorIcon>,
+    /// Start view, menus, overlays and toasts.
+    shell: Shell,
+    /// The open document, absent on the start view before any board exists.
+    document: Option<Document>,
+    /// The next untitled document number.
+    next_document: u32,
+    /// The cached, dirty-tracked screen-space shell layer.
+    ui_layer: UiLayer,
+    /// Persisted settings.
+    settings: Settings,
+    /// The rebindable keyboard table built from the settings.
+    shortcuts: Shortcuts,
+    /// The recent-board list.
+    recents: Recents,
+    /// The desired window modes (topmost, opacity, click-through, ghost).
+    window_modes: WindowModes,
+    /// The UI Automation adapter, present on Windows once the window exists.
+    accessibility: Option<Accessibility>,
+    /// Accessibility tree revision already published.
+    published_accessibility: u64,
+    /// Pending colour-picker readback, in logical cursor coordinates.
+    pending_pick: Option<DVec2>,
+    /// Latch for the polled ghost hotkey.
+    ghost_hotkey_was_down: bool,
+    /// Latch for the polled click-through hotkey.
+    click_through_hotkey_was_down: bool,
 }
 
 /// One asset's place in its animation.
@@ -418,7 +469,7 @@ struct Playback {
 }
 
 impl App {
-    fn new(plan: WindowPlan, proxy: EventLoopProxy<AppEvent>) -> Self {
+    fn new(plan: WindowPlan, proxy: EventLoopProxy<AppEvent>, start_on_launch: bool) -> Self {
         let scene = Scene::new(SceneId::from_bytes(*b"rizref-dev-scene"));
         let worker_proxy = proxy.clone();
         let importer = Importer::new(move |outcome| {
@@ -434,6 +485,20 @@ impl App {
         // The camera survives restarts through the dev dump (phase 06 moves it
         // into the .rizref container); without one, the default view.
         let camera = dev_state::load().unwrap_or_default();
+        let settings = Settings::load();
+        let mut shortcuts = Shortcuts::new();
+        shortcuts.apply_overrides(&settings.shortcuts);
+        let mut board = Board::new(scene);
+        board.set_snap_enabled(settings.snap_enabled);
+        let window_modes = WindowModes::from_settings(&settings);
+        let mut recents = Recents::load();
+        let pruned = recents.retain_existing();
+        if pruned > 0
+            && let Err(error) = recents.save()
+        {
+            tracing::warn!(%error, "cannot save the recent-board list");
+        }
+
         Self {
             drop_target: None,
             proxy,
@@ -441,8 +506,8 @@ impl App {
             plan,
             window: None,
             renderer: None,
-            board: Board::new(scene),
-            decode_cache: DecodeCache::with_default_cap(),
+            board,
+            decode_cache: DecodeCache::new(settings.max_decode_bytes),
             importer: Some(importer),
             pending_paths: Vec::new(),
             text: TextEngine::new(),
@@ -454,23 +519,175 @@ impl App {
             note_textures: HashMap::new(),
             dirty_notes: BTreeSet::new(),
             last_click: None,
+            last_title_click: None,
             cursor_icon: None,
+            shell: Shell::new(if start_on_launch {
+                Mode::Start
+            } else {
+                Mode::Canvas
+            }),
+            ui_layer: UiLayer::new(),
+            document: None,
+            next_document: 1,
+            settings,
+            shortcuts,
+            recents,
+            window_modes,
+            accessibility: None,
+            published_accessibility: 0,
+            pending_pick: None,
+            ghost_hotkey_was_down: false,
+            click_through_hotkey_was_down: false,
         }
     }
 
     /// Whether closing needs a confirmation dialog.
-    ///
-    /// Always `false` today: the dev board is not saved anywhere yet. Phase 05
-    /// replaces the body with the dirty-scene check — the call site in
-    /// `CloseRequested` is the one and only place that will ask.
     fn should_confirm_close(&self) -> bool {
-        false
+        self.document.as_ref().is_some_and(Document::is_dirty)
+    }
+
+    /// Closes the window, asking first when the document has unsaved changes.
+    ///
+    /// This is the single close path for the title-bar button, Ctrl+Q, the menu
+    /// and the native `CloseRequested` message, so no route can bypass the
+    /// guard.
+    fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        self.commit_note_edit();
+        if self.should_confirm_close() {
+            let title = self.document.as_ref().map(Document::display_title);
+            if let Some(title) = title {
+                self.shell.title_bar.hide();
+                self.shell.open_confirm_close(title);
+            }
+            self.redraw();
+            return;
+        }
+        self.exit(event_loop);
+    }
+
+    /// Leaves the event loop immediately; callers must have cleared the close
+    /// guard or confirmed that there is nothing to lose.
+    fn exit(&mut self, event_loop: &ActiveEventLoop) {
+        // Dev-only checkpoint of the view transform; phase 06 folds this into
+        // the .rizref container and deletes the module.
+        dev_state::store(&self.view.camera);
+        tracing::info!("closing the window");
+        event_loop.exit();
+    }
+
+    /// Confirms the close guard's destructive choice.
+    fn confirm_discard(&mut self, event_loop: &ActiveEventLoop) {
+        self.shell.confirm_close = None;
+        self.shell.touch();
+        self.exit(event_loop);
+    }
+
+    /// Allocates the next untitled document name.
+    fn new_document(&mut self) -> Document {
+        let number = self.next_document;
+        self.next_document = self.next_document.saturating_add(1);
+        Document::untitled(number)
+    }
+
+    /// Ensures a document exists for content being added, and refreshes the
+    /// title (the mode may have just switched from the start view).
+    fn ensure_document(&mut self) {
+        if self.document.is_none() {
+            self.document = Some(self.new_document());
+        }
+        self.refresh_window_title();
+    }
+
+    /// Marks the open document dirty. Returns whether the asterisk changed.
+    fn mark_document_dirty(&mut self) -> bool {
+        self.document.as_mut().is_some_and(Document::mark_dirty)
+    }
+
+    /// Mirrors the document title into the title bar and the native window.
+    ///
+    /// The start view stays blank: the title bar only names a document while
+    /// its canvas is on screen.
+    fn refresh_window_title(&mut self) {
+        let title = if self.shell.mode() == Mode::Canvas {
+            self.document.as_ref().map(Document::display_title)
+        } else {
+            None
+        };
+        if self.shell.title_bar.set_title(title.clone()) {
+            self.shell.touch();
+        }
+        if let Some(window) = self.window.as_ref() {
+            let native = title.unwrap_or_else(|| self.plan.title.to_owned());
+            if window.title() != native {
+                window.set_title(&native);
+            }
+        }
     }
 
     /// Asks for one more frame; the loop draws only when something changed.
     fn redraw(&self) {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
+        }
+    }
+
+    /// Whether the title bar may appear in the current window mode.
+    fn title_bar_allowed(&self) -> bool {
+        !self.window_modes.effective_click_through()
+            && !self.window_modes.borderless
+            && !self.shell.picker
+    }
+
+    /// Mirrors always-on-top and maximized into the title bar's icon state.
+    fn sync_title_bar_state(&mut self) {
+        let pinned = self.window_modes.always_on_top;
+        let maximized = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.is_maximized());
+        if self.shell.title_bar.set_state(pinned, maximized) {
+            self.shell.touch();
+        }
+    }
+
+    /// Updates title-bar visibility and hover for the current pointer.
+    fn update_title_bar_pointer(&mut self, cursor: Option<DVec2>) {
+        let allowed = self.title_bar_allowed();
+        let viewport = self.viewport();
+        if self
+            .shell
+            .title_bar
+            .pointer_moved(cursor, viewport, allowed)
+        {
+            self.shell.touch();
+            self.redraw();
+        }
+    }
+
+    /// Handles a left press on the title bar.
+    fn title_bar_press(&mut self, window: &Window, position: DVec2, event_loop: &ActiveEventLoop) {
+        let layout = titlebar::TitleBarLayout::new(self.viewport());
+        if let Some(button) = layout.button_at(position) {
+            self.last_title_click = None;
+            match button {
+                TitleBarButton::Pin => self.execute(Action::ToggleAlwaysOnTop, event_loop),
+                TitleBarButton::Minimize => self.execute(Action::WindowMinimize, event_loop),
+                TitleBarButton::Maximize => self.execute(Action::WindowToggleMaximize, event_loop),
+                TitleBarButton::Close => self.execute(Action::Quit, event_loop),
+            }
+            return;
+        }
+
+        let now = Instant::now();
+        let double = self
+            .last_title_click
+            .is_some_and(|last| now.duration_since(last) < DOUBLE_CLICK);
+        self.last_title_click = Some(now);
+        if double {
+            self.last_title_click = None;
+            self.execute(Action::WindowToggleMaximize, event_loop);
+        } else if let Err(error) = window.drag_window() {
+            tracing::warn!(%error, "cannot start a window drag");
         }
     }
 
@@ -498,6 +715,9 @@ impl App {
         if effects.is_empty() {
             return;
         }
+        if self.mark_document_dirty() {
+            self.refresh_window_title();
+        }
         for id in &effects.content {
             self.dirty_notes.insert(*id);
         }
@@ -516,8 +736,15 @@ impl App {
             DistributeHorizontal, DistributeVertical, DuplicateSelection, FitContent,
             FlipHorizontal, FlipVertical, GroupSelection, LowerSelection, LowerToBottom,
             MatchHeight, MatchWidth, RaiseSelection, RaiseToTop, Redo, ResetRotation,
-            ResetTransform, SelectAll, Undo, UngroupSelection, ZoomHundred,
+            ResetTransform, ResetView, SelectAll, Undo, UngroupSelection, ZoomHundred,
         };
+
+        if self.shell.locked && command_mutates_items(command) {
+            self.shell
+                .toast("Canvas is locked (L to unlock)", Instant::now());
+            self.redraw();
+            return;
+        }
 
         if matches!(
             command,
@@ -528,6 +755,7 @@ impl App {
                 | FitContent
                 | ZoomHundred
                 | ResetRotation
+                | ResetView
         ) {
             self.view.apply_command(command, self.board.scene_rect());
             self.redraw();
@@ -637,6 +865,544 @@ impl App {
         self.apply(command);
     }
 
+    /// The viewport size in logical pixels.
+    fn viewport(&self) -> DVec2 {
+        self.view.viewport()
+    }
+
+    /// Builds the command menu for the current state.
+    fn menu_tree(&self) -> Vec<MenuEntry> {
+        menu::build(&MenuContext {
+            settings: &self.settings,
+            shortcuts: &self.shortcuts,
+            recents: &self.recents,
+            locked: self.shell.locked,
+            ghost: self.window_modes.ghost(),
+            click_through: self.window_modes.click_through,
+            always_on_top: self.window_modes.always_on_top,
+            opacity_percent: self.window_modes.opacity_percent,
+        })
+    }
+
+    /// Opens the full context menu at a logical point.
+    fn open_context_menu(&mut self, position: DVec2) {
+        let tree = self.menu_tree();
+        self.shell.open_menu(tree, position, self.viewport());
+        self.redraw();
+    }
+
+    /// Opens the small context menu for a start-view card.
+    fn open_card_menu(&mut self, path: std::path::PathBuf, position: DVec2) {
+        let tree = vec![
+            MenuEntry::item("Open board…", Action::OpenRecent(path.clone())),
+            MenuEntry::item(
+                "Open containing folder",
+                Action::OpenContainingFolder(path.clone()),
+            ),
+            MenuEntry::separator(),
+            MenuEntry::item("Remove from recents", Action::RemoveRecent(path)),
+        ];
+        self.shell.open_menu(tree, position, self.viewport());
+        self.redraw();
+    }
+
+    /// Saves settings and the shortcut overrides.
+    fn save_settings(&mut self) {
+        self.settings.shortcuts = self.shortcuts.overrides();
+        if let Err(error) = self.settings.save() {
+            tracing::warn!(%error, "cannot save settings");
+            self.shell
+                .toast("Could not write settings.json", Instant::now());
+        }
+    }
+
+    /// Runs one shell or board action.
+    fn execute(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        if self.shell.confirm_close.is_some() {
+            match action {
+                Action::ConfirmCloseCancel => {
+                    self.shell.close_confirm_close();
+                    self.redraw();
+                }
+                Action::ConfirmCloseDiscard => self.confirm_discard(event_loop),
+                // The close guard is modal: nothing behind it runs.
+                _ => {}
+            }
+            return;
+        }
+        let now = Instant::now();
+        match action {
+            Action::Command(command) => self.apply(command),
+            Action::NewBoard => {
+                self.commit_note_edit();
+                self.board = Board::new(Scene::new(new_scene_id()));
+                self.board.set_snap_enabled(self.settings.snap_enabled);
+                self.decode_cache = DecodeCache::new(self.settings.max_decode_bytes);
+                self.playbacks.clear();
+                self.note_textures.clear();
+                self.dirty_notes.clear();
+                self.view.camera = Camera::default();
+                self.shell.set_mode(Mode::Canvas);
+                self.document = Some(self.new_document());
+                self.refresh_window_title();
+                // The mode switch hides the bar; if the pointer already rests
+                // on the title strip, show the new document's name right away.
+                let cursor = self.view.cursor_position();
+                self.update_title_bar_pointer(cursor);
+                self.shell.toast("New board", now);
+                self.redraw();
+            }
+            Action::OpenImages => {
+                self.open_images();
+                self.redraw();
+            }
+            Action::Paste => {
+                self.paste();
+                self.redraw();
+            }
+            Action::OpenBoard | Action::OpenRecent(_) => {
+                self.shell.toast(
+                    "Board loading arrives with the .rizref container (phase 06)",
+                    now,
+                );
+            }
+            Action::RemoveRecent(path) => {
+                let path = path.to_string_lossy().into_owned();
+                if self.recents.remove(&path) {
+                    if let Err(error) = self.recents.save() {
+                        tracing::warn!(%error, "cannot save the recent-board list");
+                    }
+                    self.shell.toast("Removed from recents", now);
+                    self.shell.touch();
+                    self.redraw();
+                }
+            }
+            Action::OpenContainingFolder(path) => {
+                let argument = format!("/select,{}", path.display());
+                match std::process::Command::new("explorer.exe")
+                    .arg(argument)
+                    .spawn()
+                {
+                    Ok(_) => self.shell.toast("Opened in Explorer", now),
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot open Explorer");
+                        self.shell.toast("Could not open Explorer", now);
+                    }
+                }
+            }
+            Action::Save | Action::SaveAs | Action::Export => {
+                self.shell
+                    .toast("Saving arrives with the .rizref container (phase 06)", now);
+            }
+            Action::ShowStart => {
+                self.commit_note_edit();
+                self.shell.set_mode(Mode::Start);
+                self.refresh_window_title();
+                self.redraw();
+            }
+            Action::ShowShortcuts => {
+                self.commit_note_edit();
+                self.shell.toggle_shortcuts();
+                self.redraw();
+            }
+            Action::ShowSettings => {
+                self.commit_note_edit();
+                self.shell.toggle_settings();
+                self.redraw();
+            }
+            Action::About => {
+                self.shell.toast(
+                    format!(
+                        "{} · pure-Rust reference board · F1 for shortcuts",
+                        version_line()
+                    ),
+                    now,
+                );
+            }
+            Action::Quit => self.request_close(event_loop),
+            Action::ToggleAlwaysOnTop => {
+                self.window_modes.always_on_top = !self.window_modes.always_on_top;
+                self.settings.always_on_top = self.window_modes.always_on_top;
+                self.apply_window_modes();
+                self.save_settings();
+                self.sync_title_bar_state();
+                self.shell.toast(
+                    if self.window_modes.always_on_top {
+                        "Always on top"
+                    } else {
+                        "No longer always on top"
+                    },
+                    now,
+                );
+                self.redraw();
+            }
+            Action::WindowMinimize => {
+                if let Some(window) = self.window.as_ref() {
+                    window.set_minimized(true);
+                }
+                self.shell.title_bar.hide();
+                self.redraw();
+            }
+            Action::WindowToggleMaximize => {
+                if let Some(window) = self.window.as_ref() {
+                    window.set_maximized(!window.is_maximized());
+                }
+                self.sync_title_bar_state();
+                self.redraw();
+            }
+            Action::SetOpacity(percent) => {
+                self.window_modes.set_opacity(percent);
+                self.settings.opacity_percent = self.window_modes.opacity_percent;
+                self.apply_window_modes();
+                self.save_settings();
+                self.shell.toast(
+                    format!("Window opacity {}%", self.window_modes.opacity_percent),
+                    now,
+                );
+                self.redraw();
+            }
+            Action::CycleOpacity => {
+                self.window_modes.cycle_opacity();
+                self.settings.opacity_percent = self.window_modes.opacity_percent;
+                self.apply_window_modes();
+                self.save_settings();
+                self.shell.toast(
+                    format!("Window opacity {}%", self.window_modes.opacity_percent),
+                    now,
+                );
+                self.redraw();
+            }
+            Action::ToggleClickThrough => {
+                self.window_modes.toggle_click_through();
+                self.click_through_hotkey_was_down = true;
+                self.apply_window_modes();
+                self.shell.title_bar.hide();
+                let message = if self.window_modes.effective_click_through() {
+                    "Click-through armed · Ctrl+Shift+X restores input"
+                } else {
+                    "Click-through off"
+                };
+                self.shell.toast(message, now);
+                self.redraw();
+            }
+            Action::ToggleGhostMode => {
+                self.window_modes.toggle_ghost();
+                self.ghost_hotkey_was_down = true;
+                self.apply_window_modes();
+                self.shell.title_bar.hide();
+                let message = if self.window_modes.ghost() {
+                    "Ghost mode · Ctrl+Shift+G restores the window"
+                } else {
+                    "Ghost mode off"
+                };
+                self.shell.toast(message, now);
+                self.redraw();
+            }
+            Action::ToggleBorderless => {
+                self.window_modes.borderless = !self.window_modes.borderless;
+                if let Some(window) = self.window.as_ref() {
+                    platform::window_modes::set_borderless(window, self.window_modes.borderless);
+                }
+                self.shell.title_bar.hide();
+                self.shell.toast(
+                    if self.window_modes.borderless {
+                        "Borderless fullscreen"
+                    } else {
+                        "Windowed"
+                    },
+                    now,
+                );
+                self.redraw();
+            }
+            Action::ToggleCanvasLock => {
+                self.shell.locked = !self.shell.locked;
+                let message = if self.shell.locked {
+                    "Canvas locked · navigation still works"
+                } else {
+                    "Canvas unlocked"
+                };
+                self.shell.toast(message, now);
+                self.shell.touch();
+                self.redraw();
+            }
+            Action::ToggleGrid => self.toggle_bool_setting(SettingId::Grid),
+            Action::ToggleSnap => self.toggle_bool_setting(SettingId::Snap),
+            Action::ToggleHud => self.toggle_bool_setting(SettingId::Hud),
+            Action::ToggleBorder => self.toggle_bool_setting(SettingId::Border),
+            Action::ToggleCheckerboard => self.toggle_bool_setting(SettingId::Checkerboard),
+            Action::ToggleGrayscale => self.toggle_bool_setting(SettingId::Grayscale),
+            Action::SetTheme(theme) => {
+                self.settings.canvas_theme = theme;
+                self.save_settings();
+                self.shell.touch();
+                self.redraw();
+            }
+            Action::ColorPicker => {
+                self.shell.picker = true;
+                self.shell.title_bar.hide();
+                self.shell
+                    .toast("Click a pixel to copy its hex colour", now);
+                self.shell.touch();
+                self.redraw();
+            }
+            // Handled by the modal guard above; unreachable with no dialog open.
+            Action::ConfirmCloseCancel | Action::ConfirmCloseDiscard => {}
+        }
+        self.shell.touch();
+    }
+
+    /// Applies the desired window modes to the real window.
+    fn apply_window_modes(&mut self) {
+        if let Some(window) = self.window.as_ref() {
+            self.window_modes.apply(window);
+        }
+    }
+
+    /// Runs a rebindable shortcut.
+    fn execute_shortcut(&mut self, id: ShortcutId, event_loop: &ActiveEventLoop) {
+        if self.shell.mode() == Mode::Start && id.command().is_some() {
+            return;
+        }
+        self.command_cancels_note_edit(id);
+        self.execute(Action::from_shortcut(id), event_loop);
+    }
+
+    /// Ends a note edit before a shortcut runs (so typed text becomes history).
+    fn command_cancels_note_edit(&mut self, id: ShortcutId) {
+        if !matches!(
+            id,
+            ShortcutId::ShowShortcuts | ShortcutId::ShowSettings | ShortcutId::ShowStart
+        ) {
+            self.commit_note_edit();
+        }
+    }
+
+    /// Handles a result from the F1 overlay.
+    fn apply_shortcuts_panel_result(&mut self, result: PanelResult) {
+        match result {
+            PanelResult::None => {}
+            PanelResult::Changed => {
+                self.shell.touch();
+                self.redraw();
+            }
+            PanelResult::Close => {
+                self.shell.shortcuts = None;
+                self.shell.touch();
+                self.redraw();
+            }
+            PanelResult::Bind(id, chord) => {
+                match self.shortcuts.bind(id, chord) {
+                    Ok(()) => {
+                        self.save_settings();
+                        if let Some(panel) = self.shell.shortcuts.as_mut() {
+                            panel.error = None;
+                        }
+                    }
+                    Err(conflict) => {
+                        if let Some(panel) = self.shell.shortcuts.as_mut() {
+                            panel.error = Some(format!(
+                                "{} is already used by {}",
+                                chord,
+                                conflict.action.label()
+                            ));
+                        }
+                    }
+                }
+                self.shell.touch();
+                self.redraw();
+            }
+            PanelResult::Reset(id) => {
+                self.shortcuts.reset(id);
+                self.save_settings();
+                if let Some(panel) = self.shell.shortcuts.as_mut() {
+                    panel.error = None;
+                }
+                self.shell.touch();
+                self.redraw();
+            }
+            PanelResult::Adjust(_, _) => {}
+        }
+    }
+
+    /// Handles a result from the settings dialog.
+    fn apply_settings_panel_result(&mut self, result: PanelResult) {
+        match result {
+            PanelResult::None => {}
+            PanelResult::Changed => {
+                self.shell.touch();
+                self.redraw();
+            }
+            PanelResult::Close => {
+                self.shell.settings = None;
+                self.shell.touch();
+                self.redraw();
+            }
+            PanelResult::Adjust(id, direction) => {
+                self.adjust_setting(id, direction);
+                self.save_settings();
+                self.shell.touch();
+                self.redraw();
+            }
+            PanelResult::Bind(_, _) | PanelResult::Reset(_) => {}
+        }
+    }
+
+    /// Toggles one boolean setting.
+    fn toggle_bool_setting(&mut self, id: SettingId) {
+        let now = Instant::now();
+        match id {
+            SettingId::Grid => self.settings.grid_visible = !self.settings.grid_visible,
+            SettingId::Snap => {
+                self.settings.snap_enabled = !self.settings.snap_enabled;
+                self.board.set_snap_enabled(self.settings.snap_enabled);
+            }
+            SettingId::Hud => self.settings.hud_visible = !self.settings.hud_visible,
+            SettingId::Border => self.settings.scene_border = !self.settings.scene_border,
+            SettingId::Checkerboard => {
+                self.settings.checkerboard = !self.settings.checkerboard;
+            }
+            SettingId::Grayscale => self.settings.grayscale = !self.settings.grayscale,
+            SettingId::AlwaysOnTop => {
+                self.settings.always_on_top = !self.settings.always_on_top;
+                self.window_modes.always_on_top = self.settings.always_on_top;
+                self.apply_window_modes();
+                self.sync_title_bar_state();
+            }
+            SettingId::Opacity | SettingId::GhostOpacity | SettingId::DecodeCap => {}
+        }
+        self.save_settings();
+        self.shell.touch();
+        self.shell
+            .toast(format!("{}: {}", id.label(), id.value(&self.settings)), now);
+        self.redraw();
+    }
+
+    /// Adjusts one setting row from the settings dialog.
+    fn adjust_setting(&mut self, id: SettingId, direction: i32) {
+        match id {
+            SettingId::Opacity => {
+                let percent = panels::cycle_percent(
+                    self.settings.opacity_percent,
+                    direction,
+                    crate::platform::window_modes::MIN_OPACITY_PERCENT,
+                    100,
+                    10,
+                );
+                self.settings.opacity_percent = percent;
+                self.window_modes.set_opacity(percent);
+                self.apply_window_modes();
+            }
+            SettingId::GhostOpacity => {
+                let percent = panels::cycle_percent(
+                    self.settings.ghost_opacity_percent,
+                    direction,
+                    10,
+                    40,
+                    5,
+                );
+                self.settings.ghost_opacity_percent = percent;
+                self.window_modes.ghost_opacity_percent = percent;
+                self.apply_window_modes();
+            }
+            SettingId::DecodeCap => {
+                let cap = panels::cycle_decode_cap(self.settings.max_decode_bytes, direction);
+                self.settings.max_decode_bytes = cap;
+                self.decode_cache.set_max_bytes(cap);
+            }
+            other => self.toggle_bool_setting(other),
+        }
+    }
+
+    /// Copies a picked pixel to the clipboard and reports it.
+    fn finish_pick(&mut self, [r, g, b, a]: [u8; 4]) {
+        let hex = format!("#{r:02X}{g:02X}{b:02X}");
+        self.shell.picker = false;
+        self.pending_pick = None;
+        match clipboard::write_text(&hex) {
+            Ok(()) => self
+                .shell
+                .toast(format!("{hex} copied to the clipboard"), Instant::now()),
+            Err(error) => {
+                tracing::warn!(%error, "cannot copy the picked colour");
+                self.shell
+                    .toast(format!("{hex} (clipboard unavailable)"), Instant::now());
+            }
+        }
+        tracing::info!(r, g, b, a, %hex, "colour picked");
+        self.shell.touch();
+        self.redraw();
+    }
+
+    /// Publishes the current accessibility tree to the adapter.
+    fn refresh_accessibility(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let tree = self.menu_tree();
+        let status = if self.shell.mode() == Mode::Start {
+            "Start view: drop images or open a recent board".to_owned()
+        } else {
+            self.readout_text()
+        };
+        if let Some(accessibility) = self.accessibility.as_mut() {
+            accessibility.update(
+                &tree,
+                &status,
+                &window,
+                &self.shell.title_bar,
+                self.shell.confirm_close.as_ref(),
+            );
+        }
+        self.published_accessibility = self.shell.revision();
+    }
+
+    /// Handles a start-view click. Returns whether it changed anything.
+    fn start_click(&mut self, position: DVec2, event_loop: &ActiveEventLoop) -> bool {
+        let layout = StartLayout::new(self.viewport(), self.recents.entries.len());
+        let Some(control) = layout.hit(position) else {
+            return false;
+        };
+        if let Some(action) = start::action_for(control, &self.recents) {
+            self.execute(action, event_loop);
+            return true;
+        }
+        false
+    }
+
+    /// Handles a start-view right click on a card.
+    fn start_right_click(&mut self, position: DVec2) -> bool {
+        let layout = StartLayout::new(self.viewport(), self.recents.entries.len());
+        let Some(index) = layout.card_at(position) else {
+            return false;
+        };
+        let Some(entry) = self.recents.entries.get(index) else {
+            return false;
+        };
+        let path = entry.path_buf();
+        self.open_card_menu(path, position);
+        true
+    }
+
+    /// Handles one menu result.
+    fn apply_menu_result(&mut self, result: MenuResult, event_loop: &ActiveEventLoop) {
+        match result {
+            MenuResult::None => {}
+            MenuResult::Changed => {
+                self.shell.touch();
+                self.redraw();
+            }
+            MenuResult::Closed => {
+                self.shell.close_menu();
+                self.redraw();
+            }
+            MenuResult::Action(action) => {
+                self.shell.close_menu();
+                self.execute(action, event_loop);
+                self.redraw();
+            }
+        }
+    }
+
     /// The HUD readout line: zoom, rotation, cursor, selection size.
     fn readout_text(&self) -> String {
         let zoom = self.view.camera.zoom * 100.0;
@@ -647,6 +1413,14 @@ impl App {
         };
         let rotation = self.view.camera.rotation.to_degrees();
         let mut notes = Vec::new();
+        if self.shell.locked {
+            notes.push("LOCKED".to_owned());
+        }
+        if self.window_modes.ghost() {
+            notes.push("GHOST".to_owned());
+        } else if self.window_modes.effective_click_through() {
+            notes.push("CLICK-THROUGH".to_owned());
+        }
         if let Some(note) = self.selected_animation_note() {
             notes.push(note);
         }
@@ -710,24 +1484,43 @@ impl App {
     fn submit_import(&mut self, request: ImportRequest) {
         let label = request.source.label.clone();
         let drop_world = request.drop_world;
-        match self.importer.as_ref() {
-            Some(importer) if importer.submit(request) => {
-                tracing::info!(%label, ?drop_world, "import queued");
-            }
-            _ => tracing::error!(%label, "the import pool is not running"),
+        let submitted = self
+            .importer
+            .as_ref()
+            .is_some_and(|importer| importer.submit(request));
+        if submitted {
+            // Content is arriving, so a document must exist even when the
+            // start view was the entry point.
+            self.ensure_document();
+            tracing::info!(%label, ?drop_world, "import queued");
+        } else {
+            tracing::error!(%label, "the import pool is not running");
         }
     }
 
     /// Queues every path in `paths` as an image import around `drop_world`.
     fn import_paths(&mut self, paths: Vec<PathBuf>, drop_world: Vec2) {
+        if paths.iter().any(|path| looks_like_image(path)) && self.shell.mode() == Mode::Start {
+            self.shell.set_mode(Mode::Canvas);
+        }
         for path in paths {
             if looks_like_image(&path) {
                 self.submit_import(ImportRequest::path(path, drop_world));
-            } else {
+            } else if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("rizref"))
+            {
                 tracing::info!(
                     path = %path.display(),
-                    "not an image; board files are phase 05+"
+                    "board file requested; the container reader arrives in phase 06"
                 );
+                self.shell.toast(
+                    "Board loading arrives with the .rizref container (phase 06)",
+                    Instant::now(),
+                );
+            } else {
+                tracing::info!(path = %path.display(), "not an image; ignored");
             }
         }
     }
@@ -738,9 +1531,14 @@ impl App {
         match clipboard::read() {
             Ok(ClipboardContent::Files(paths)) => self.import_paths(paths, drop_world),
             Ok(ClipboardContent::Image { name, png }) => {
+                self.shell.set_mode(Mode::Canvas);
                 self.submit_import(ImportRequest::bytes(name, png, drop_world));
             }
-            Err(reason) => tracing::warn!(%reason, "nothing pasteable on the clipboard"),
+            Err(reason) => {
+                tracing::warn!(%reason, "nothing pasteable on the clipboard");
+                self.shell
+                    .toast("Nothing pasteable on the clipboard", Instant::now());
+            }
         }
     }
 
@@ -748,6 +1546,8 @@ impl App {
     fn open_images(&mut self) {
         if let Some(paths) = crate::dialogs::pick_images() {
             let drop_world = self.drop_world();
+            // `import_paths` switches to the canvas only for actual images, so
+            // cancelling or picking a non-image never strands the start view.
             self.import_paths(paths, drop_world);
         }
     }
@@ -1245,26 +2045,62 @@ impl App {
     // Cursor
     // -----------------------------------------------------------------------
 
-    /// Updates the window cursor icon from the board's hint.
+    /// Updates the window cursor icon from the active shell state or the
+    /// board's hint.
     fn update_cursor_icon(&mut self, window: &Window, screen: DVec2) {
-        let hint = if self.note_session.is_some() {
-            CursorHint::Text
+        let viewport = self.viewport();
+        let title_bar = self
+            .shell
+            .title_bar
+            .visible()
+            .then(|| titlebar::TitleBarLayout::new(viewport));
+        let icon = if let Some(dialog) = &self.shell.confirm_close {
+            if dialog.hit_button(screen, viewport).is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
+        } else if self.shell.picker {
+            CursorIcon::Crosshair
+        } else if let Some(layout) = title_bar.filter(|layout| layout.contains(screen)) {
+            if layout.button_at(screen).is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
+        } else if self.shell.has_overlay() {
+            CursorIcon::Default
+        } else if let Some(direction) = resize_direction(viewport, screen) {
+            resize_cursor(direction)
+        } else if self.shell.mode() == Mode::Start {
+            let layout = StartLayout::new(self.viewport(), self.recents.entries.len());
+            if layout.hit(screen).is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
+        } else if self.shell.locked {
+            CursorIcon::Default
         } else {
-            self.board
-                .cursor(screen, self.view_info(), self.current_mods())
-        };
-        let icon = match hint {
-            CursorHint::Default => CursorIcon::Default,
-            CursorHint::Move => CursorIcon::Move,
-            CursorHint::Grab => CursorIcon::Grab,
-            CursorHint::Grabbing => CursorIcon::Grabbing,
-            CursorHint::ResizeEw => CursorIcon::EwResize,
-            CursorHint::ResizeNs => CursorIcon::NsResize,
-            CursorHint::ResizeNwSe => CursorIcon::NwseResize,
-            CursorHint::ResizeNeSw => CursorIcon::NeswResize,
-            CursorHint::Rotate => CursorIcon::Crosshair,
-            CursorHint::Text => CursorIcon::Text,
-            CursorHint::Crosshair => CursorIcon::Crosshair,
+            let hint = if self.note_session.is_some() {
+                CursorHint::Text
+            } else {
+                self.board
+                    .cursor(screen, self.view_info(), self.current_mods())
+            };
+            match hint {
+                CursorHint::Default => CursorIcon::Default,
+                CursorHint::Move => CursorIcon::Move,
+                CursorHint::Grab => CursorIcon::Grab,
+                CursorHint::Grabbing => CursorIcon::Grabbing,
+                CursorHint::ResizeEw => CursorIcon::EwResize,
+                CursorHint::ResizeNs => CursorIcon::NsResize,
+                CursorHint::ResizeNwSe => CursorIcon::NwseResize,
+                CursorHint::ResizeNeSw => CursorIcon::NeswResize,
+                CursorHint::Rotate => CursorIcon::Crosshair,
+                CursorHint::Text => CursorIcon::Text,
+                CursorHint::Crosshair => CursorIcon::Crosshair,
+            }
         };
         if self.cursor_icon != Some(icon) {
             window.set_cursor(icon);
@@ -1338,7 +2174,13 @@ impl ApplicationHandler<AppEvent> for App {
 
         let attributes = Window::default_attributes()
             .with_title(self.plan.title)
-            .with_inner_size(self.plan.size);
+            .with_inner_size(self.plan.size)
+            // The window draws its own auto-hiding title bar; a native frame
+            // would sit above the board permanently.
+            .with_decorations(false)
+            .with_resizable(true)
+            // AccessKit must attach before the window is first shown.
+            .with_visible(false);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -1348,6 +2190,10 @@ impl ApplicationHandler<AppEvent> for App {
                 return;
             }
         };
+
+        self.accessibility = Accessibility::new(event_loop, &window, self.proxy.clone());
+        window.set_visible(true);
+        self.window_modes.apply(&window);
 
         let size = window.inner_size();
         let scale = window.scale_factor();
@@ -1361,6 +2207,7 @@ impl ApplicationHandler<AppEvent> for App {
                 tracing::info!(?size, scale, "window ready");
                 self.renderer = Some(renderer);
                 self.window = Some(window);
+                self.refresh_window_title();
                 self.install_drop_target();
                 self.window.as_ref().expect("just set").request_redraw();
 
@@ -1397,6 +2244,9 @@ impl ApplicationHandler<AppEvent> for App {
         if window_id != window.id() {
             return;
         }
+        if let Some(accessibility) = self.accessibility.as_mut() {
+            accessibility.process_event(&window, &event);
+        }
         match event {
             WindowEvent::Resized(size) => {
                 self.renderer
@@ -1408,6 +2258,7 @@ impl ApplicationHandler<AppEvent> for App {
                     size.width as f64 / scale,
                     size.height as f64 / scale,
                 ));
+                self.sync_title_bar_state();
                 window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -1421,6 +2272,42 @@ impl ApplicationHandler<AppEvent> for App {
                 let logical = DVec2::new(position.x / scale, position.y / scale);
                 let previous = self.view.cursor_position();
                 self.view.set_cursor(logical);
+                if self.shell.confirm_close.is_some() {
+                    let viewport = self.viewport();
+                    let changed = self
+                        .shell
+                        .confirm_close
+                        .as_mut()
+                        .is_some_and(|dialog| dialog.pointer_move(logical, viewport));
+                    if changed {
+                        self.shell.touch();
+                    }
+                    self.update_cursor_icon(&window, logical);
+                    self.redraw();
+                    return;
+                }
+                self.update_title_bar_pointer(Some(logical));
+                let mut menu_changed = false;
+                let viewport = self.viewport();
+                if let Some(menu) = self.shell.menu.as_mut() {
+                    menu_changed = menu.pointer_move(logical, viewport);
+                }
+                if menu_changed {
+                    self.shell.touch();
+                }
+                if self.shell.title_bar.visible()
+                    && titlebar::TitleBarLayout::new(viewport).contains(logical)
+                {
+                    self.update_cursor_icon(&window, logical);
+                    self.redraw();
+                    return;
+                }
+                if self.shell.has_overlay() || self.shell.mode() == Mode::Start || self.shell.locked
+                {
+                    self.update_cursor_icon(&window, logical);
+                    self.redraw();
+                    return;
+                }
                 if self.view.pan_active() {
                     if let Some(previous) = previous {
                         self.view.drag_pan(logical - previous);
@@ -1438,12 +2325,125 @@ impl ApplicationHandler<AppEvent> for App {
                 self.redraw();
             }
             WindowEvent::CursorLeft { .. } => {
+                if self.shell.title_bar.pointer_left() {
+                    self.shell.touch();
+                    self.redraw();
+                }
                 if self.board.pointer_leave() {
                     self.redraw();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
+                let position = self.view.cursor_position().unwrap_or(self.viewport() * 0.5);
+                if self.shell.confirm_close.is_some() {
+                    if pressed && button == MouseButton::Left {
+                        let viewport = self.viewport();
+                        let choice = self
+                            .shell
+                            .confirm_close
+                            .as_mut()
+                            .map(|dialog| dialog.pointer_click(position, viewport));
+                        match choice {
+                            Some(CloseChoice::Cancel) => {
+                                self.shell.close_confirm_close();
+                                self.redraw();
+                            }
+                            Some(CloseChoice::Discard) => self.confirm_discard(event_loop),
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+                if button == MouseButton::Right {
+                    if !pressed {
+                        return;
+                    }
+                    if self.shell.menu.is_some() {
+                        self.shell.close_menu();
+                        self.redraw();
+                        return;
+                    }
+                    if self.shell.title_bar.visible()
+                        && titlebar::TitleBarLayout::new(self.viewport()).contains(position)
+                    {
+                        return;
+                    }
+                    if self.shell.mode() == Mode::Start {
+                        self.start_right_click(position);
+                        return;
+                    }
+                    if self.shell.has_overlay() {
+                        return;
+                    }
+                    if !self.shell.locked {
+                        let world = self
+                            .view
+                            .camera
+                            .screen_to_world(position, self.viewport())
+                            .as_vec2();
+                        if let Some(id) = self.board.item_at(world)
+                            && !self.board.selection().contains(id)
+                        {
+                            self.board.select_only(id);
+                            self.redraw();
+                        }
+                    }
+                    self.open_context_menu(position);
+                    return;
+                }
+
+                let viewport = self.viewport();
+                if let Some(menu) = self.shell.menu.as_mut() {
+                    let result = menu.pointer_click(position, viewport);
+                    self.apply_menu_result(result, event_loop);
+                    return;
+                }
+                if self.shell.shortcuts.is_some() || self.shell.settings.is_some() {
+                    if pressed
+                        && !panels::shortcuts_contains(viewport, position)
+                        && !panels::settings_contains(viewport, position)
+                    {
+                        self.shell.shortcuts = None;
+                        self.shell.settings = None;
+                        self.shell.touch();
+                        self.redraw();
+                    }
+                    return;
+                }
+                if self.shell.picker && pressed && button == MouseButton::Left {
+                    self.pending_pick = Some(position);
+                    self.redraw();
+                    return;
+                }
+                if pressed
+                    && button == MouseButton::Left
+                    && self.shell.title_bar.visible()
+                    && titlebar::TitleBarLayout::new(viewport).contains(position)
+                {
+                    self.title_bar_press(&window, position, event_loop);
+                    return;
+                }
+                if pressed && button == MouseButton::Left {
+                    // A click anywhere else ends the title-bar double-click run.
+                    self.last_title_click = None;
+                }
+                if pressed
+                    && button == MouseButton::Left
+                    && let Some(direction) = resize_direction(viewport, position)
+                {
+                    if let Err(error) = window.drag_resize_window(direction) {
+                        tracing::warn!(%error, "cannot start a window resize");
+                    }
+                    return;
+                }
+                if self.shell.mode() == Mode::Start {
+                    if pressed {
+                        self.start_click(position, event_loop);
+                    }
+                    return;
+                }
+
                 let button = match button {
                     MouseButton::Left => InputButton::Left,
                     MouseButton::Middle => InputButton::Middle,
@@ -1459,10 +2459,12 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 if button == InputButton::Left {
                     if pressed {
-                        if !self.view.space_held() {
+                        if !self.view.space_held() && !self.shell.locked {
                             self.left_press(&window);
                         }
-                    } else if let Some(screen) = self.view.cursor_position() {
+                    } else if !self.shell.locked
+                        && let Some(screen) = self.view.cursor_position()
+                    {
                         let view = ViewInfo {
                             camera: &self.view.camera,
                             viewport: self.view.viewport(),
@@ -1478,61 +2480,164 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => match delta {
-                MouseScrollDelta::LineDelta(_, y) => {
-                    // Mouse wheels: one notch per detent. Alt turns the view,
-                    // everything else zooms (instant with ctrl, per the view).
-                    let notches = y.round() as i32;
-                    let alt = self.modifiers.alt_key();
-                    let command = input::resolve(&Trigger::Wheel { alt });
-                    self.apply_wheel(command, notches);
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.shell.confirm_close.is_some() {
+                    return;
                 }
-                MouseScrollDelta::PixelDelta(delta) => {
-                    // Trackpad two-finger scroll: pan by the pixel delta.
-                    let scale = window.scale_factor();
-                    let logical: LogicalPosition<f64> = delta.to_logical(scale);
-                    self.view.scroll_pan(DVec2::new(logical.x, logical.y));
-                    self.redraw();
+                if self.shell.menu.is_some() || self.shell.mode() == Mode::Start {
+                    return;
                 }
-            },
+                if self.shell.title_bar.visible()
+                    && self.view.cursor_position().is_some_and(|position| {
+                        titlebar::TitleBarLayout::new(self.viewport()).contains(position)
+                    })
+                {
+                    return;
+                }
+                if self.shell.shortcuts.is_some() {
+                    let (page, key) = match delta {
+                        MouseScrollDelta::LineDelta(_, y) if y > 0.0 => {
+                            (crate::shortcuts::Key::PageUp, true)
+                        }
+                        MouseScrollDelta::LineDelta(_, y) if y < 0.0 => {
+                            (crate::shortcuts::Key::PageDown, true)
+                        }
+                        _ => (crate::shortcuts::Key::PageDown, false),
+                    };
+                    let viewport = self.viewport();
+                    let result =
+                        self.shell.shortcuts.as_mut().filter(|_| key).map(|panel| {
+                            panel.key(KeyChord::plain(page), &self.shortcuts, viewport)
+                        });
+                    if let Some(result) = result {
+                        self.apply_shortcuts_panel_result(result);
+                    }
+                    return;
+                }
+                match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        // Mouse wheels: one notch per detent. Alt turns the view,
+                        // everything else zooms (instant with ctrl, per the view).
+                        let notches = y.round() as i32;
+                        let alt = self.modifiers.alt_key();
+                        let command = input::resolve(&Trigger::Wheel { alt });
+                        self.apply_wheel(command, notches);
+                    }
+                    MouseScrollDelta::PixelDelta(delta) => {
+                        // Trackpad two-finger scroll: pan by the pixel delta.
+                        let scale = window.scale_factor();
+                        let logical: LogicalPosition<f64> = delta.to_logical(scale);
+                        self.view.scroll_pan(DVec2::new(logical.x, logical.y));
+                        self.redraw();
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
+                let chord = shortcut_key(&event.logical_key).map(|key| KeyChord {
+                    key,
+                    ctrl: self.modifiers.control_key(),
+                    shift: self.modifiers.shift_key(),
+                    alt: self.modifiers.alt_key(),
+                });
+
+                // Overlays own the keyboard completely.
+                let viewport = self.viewport();
+                if self.shell.confirm_close.is_some() {
+                    if pressed {
+                        let choice = chord.and_then(|chord| {
+                            self.shell
+                                .confirm_close
+                                .as_mut()
+                                .map(|dialog| dialog.key(chord))
+                        });
+                        match choice {
+                            Some(CloseChoice::Cancel) => {
+                                self.shell.close_confirm_close();
+                                self.redraw();
+                            }
+                            Some(CloseChoice::Discard) => self.confirm_discard(event_loop),
+                            Some(CloseChoice::Changed) => {
+                                self.shell.touch();
+                                self.redraw();
+                            }
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+                if self.shell.shortcuts.is_some() {
+                    let result = chord.and_then(|chord| {
+                        let shortcuts = &self.shortcuts;
+                        self.shell
+                            .shortcuts
+                            .as_mut()
+                            .map(|panel| panel.key(chord, shortcuts, viewport))
+                    });
+                    if let Some(result) = result {
+                        self.apply_shortcuts_panel_result(result);
+                    }
+                    return;
+                }
+                if self.shell.settings.is_some() {
+                    let result = if pressed {
+                        chord.and_then(|chord| {
+                            self.shell.settings.as_mut().map(|panel| panel.key(chord))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(result) = result {
+                        self.apply_settings_panel_result(result);
+                    }
+                    return;
+                }
+                if self.shell.menu.is_some() {
+                    let result = if pressed {
+                        chord.and_then(|chord| {
+                            self.shell
+                                .menu
+                                .as_mut()
+                                .map(|menu| menu.key(chord.key, viewport))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(result) = result {
+                        self.apply_menu_result(result, event_loop);
+                    }
+                    return;
+                }
+
                 if self.note_session.is_some() {
                     if self.handle_note_key(&event, pressed) {
                         self.redraw();
+                        return;
                     }
-                    return;
-                }
-                if matches!(&event.logical_key, Key::Named(NamedKey::Space)) {
-                    self.view.set_space_held(pressed);
-                    return;
-                }
-                if !pressed {
-                    return;
-                }
-                if self.modifiers.control_key()
-                    && let Key::Character(text) = &event.logical_key
-                {
-                    match text.to_ascii_lowercase().as_str() {
-                        "v" => {
-                            self.paste();
-                            return;
-                        }
-                        "o" => {
-                            self.open_images();
-                            return;
-                        }
-                        _ => {}
+                    if !pressed {
+                        return;
+                    }
+                    // F1 and friends fall through; typed characters were
+                    // already consumed by the editor above.
+                } else {
+                    if matches!(&event.logical_key, Key::Named(NamedKey::Space)) {
+                        self.view.set_space_held(pressed);
+                        return;
+                    }
+                    if !pressed {
+                        return;
                     }
                 }
-                if let Some(key) = input_key(&event.logical_key)
-                    && let Some(command) = input::resolve(&Trigger::Key {
-                        key,
-                        pressed,
-                        mods: self.current_mods(),
-                    })
+
+                if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) && self.shell.escape()
                 {
-                    self.apply(command);
+                    self.redraw();
+                    return;
+                }
+                if let Some(chord) = chord
+                    && let Some(id) = self.shortcuts.resolve(chord)
+                {
+                    self.execute_shortcut(id, event_loop);
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -1551,67 +2656,155 @@ impl ApplicationHandler<AppEvent> for App {
                 self.import_paths(vec![path], drop_world);
             }
             WindowEvent::RedrawRequested => {
+                self.sync_title_bar_state();
                 // Advance the zoom animation first: this frame shows the new
                 // state, and if it is still running the next frame is queued.
                 // The HUD and the frame params are gathered before the
                 // renderer is taken mutably, so the borrows never overlap.
-                let animating = self.view.advance(Instant::now());
-                let _next_frame = self.advance_animations(Instant::now());
-                self.ensure_note_textures();
-                let items = self.build_items();
-                self.ensure_textures(&items);
-                let overlay = self.build_overlay();
-                let text = self.readout_text();
-                let hud_layer = self.render_hud(&text);
-                let Some(renderer) = self.renderer.as_mut() else {
-                    return;
+                let canvas_mode = self.shell.mode() == Mode::Canvas;
+                let animating = canvas_mode && self.view.advance(Instant::now());
+                if canvas_mode {
+                    let _next_frame = self.advance_animations(Instant::now());
+                    self.ensure_note_textures();
+                }
+                let items = if canvas_mode {
+                    self.build_items()
+                } else {
+                    Vec::new()
                 };
-                let hud = match &hud_layer {
-                    Some((bytes, width, height)) => HudUpload::Layer {
-                        bytes,
-                        width: *width,
-                        height: *height,
-                    },
-                    None => HudUpload::None,
+                if canvas_mode {
+                    self.ensure_textures(&items);
+                }
+                let overlay = if canvas_mode {
+                    self.build_overlay()
+                } else {
+                    Vec::new()
                 };
-                let params = FrameParams {
-                    camera: &self.view.camera,
-                    viewport: self.view.viewport(),
-                    physical_scale: window.scale_factor(),
-                    scene_rect: self.board.scene_rect(),
-                    items: &items,
-                    overlay: &overlay,
-                    hud,
+                let picking = self.pending_pick.is_some();
+                // The picked frame must contain only the board: the cursor
+                // crosshair and the HUD would otherwise contaminate the pixel.
+                let hud_layer = if canvas_mode && self.settings.hud_visible && !picking {
+                    let text = self.readout_text();
+                    self.render_hud(&text)
+                } else {
+                    None
                 };
-                match renderer.render(&params) {
-                    Ok(()) | Err(FrameError::NeedsReconfigure) => {}
-                    Err(FrameError::Fatal(why)) => {
-                        // Log and stop: retrying into a lost surface would
-                        // spin the loop. The CPU fallback (phase 02+) will
-                        // take over cases a fresh adapter could have served.
-                        tracing::error!(%why, "render failed; window will stay as-is");
+
+                let viewport = self.viewport();
+                let scale = window.scale_factor();
+                let repaint_ui = self
+                    .ui_layer
+                    .needs_paint(viewport, scale, self.shell.revision());
+                if repaint_ui {
+                    let cursor = self.view.cursor_position();
+                    self.ui_layer.paint(
+                        &self.shell,
+                        &self.settings,
+                        &self.shortcuts,
+                        &self.recents,
+                        self.window_modes,
+                        viewport,
+                        scale,
+                        cursor,
+                        &mut self.text,
+                    );
+                }
+                let ui_visible = !picking
+                    && (self.shell.mode() == Mode::Start
+                        || self.shell.has_overlay()
+                        || self.shell.toast.is_some()
+                        || self.shell.picker
+                        || self.window_modes.effective_click_through()
+                        || self.window_modes.effective_opacity_percent() < 100);
+                let ui_bytes = if ui_visible && repaint_ui {
+                    self.ui_layer.upload()
+                } else {
+                    None
+                };
+                let ui = if ui_visible {
+                    match &ui_bytes {
+                        Some((bytes, width, height)) => UiUpload::Layer {
+                            bytes,
+                            width: *width,
+                            height: *height,
+                        },
+                        None if repaint_ui => UiUpload::None,
+                        None => UiUpload::Keep,
                     }
+                } else {
+                    UiUpload::None
+                };
+
+                let physical_pick = self.pending_pick.map(|position| {
+                    (
+                        (position.x * scale).round().max(0.0) as u32,
+                        (position.y * scale).round().max(0.0) as u32,
+                    )
+                });
+                let picked = {
+                    let Some(renderer) = self.renderer.as_mut() else {
+                        return;
+                    };
+                    let hud = match &hud_layer {
+                        Some((bytes, width, height)) => HudUpload::Layer {
+                            bytes,
+                            width: *width,
+                            height: *height,
+                        },
+                        None => HudUpload::None,
+                    };
+                    let params = FrameParams {
+                        camera: &self.view.camera,
+                        viewport: self.view.viewport(),
+                        physical_scale: scale,
+                        scene_rect: self.board.scene_rect(),
+                        items: &items,
+                        overlay: &overlay,
+                        hud,
+                        ui,
+                        flags: FrameFlags {
+                            checkerboard: self.settings.checkerboard,
+                            grayscale: self.settings.grayscale,
+                        },
+                        background: self.settings.canvas_theme.rgba(),
+                        pick: physical_pick,
+                    };
+                    match renderer.render(&params) {
+                        Ok(pixel) => pixel,
+                        Err(FrameError::NeedsReconfigure) => None,
+                        Err(FrameError::Fatal(why)) => {
+                            // Log and stop: retrying into a lost surface would
+                            // spin the loop. The CPU fallback (phase 02+) will
+                            // take over cases a fresh adapter could have served.
+                            tracing::error!(%why, "render failed; window will stay as-is");
+                            None
+                        }
+                    }
+                };
+                if let Some(pixel) = picked {
+                    self.finish_pick(pixel);
                 }
                 if animating {
                     window.request_redraw();
                 }
-            }
-            WindowEvent::CloseRequested => {
-                self.commit_note_edit();
-                if self.should_confirm_close() {
-                    // Phase 05 asks "save changes?" here.
+                if self.published_accessibility != self.shell.revision() {
+                    self.refresh_accessibility();
                 }
-                // Dev-only checkpoint of the view transform; phase 06 folds
-                // this into the .rizref container and deletes the module.
-                dev_state::store(&self.view.camera);
-                tracing::info!("close requested; exiting");
-                event_loop.exit();
             }
+            WindowEvent::Focused(false) => {
+                if self.shell.title_bar.hide() {
+                    self.shell.touch();
+                }
+                if self.shell.close_menu() {
+                    self.redraw();
+                }
+            }
+            WindowEvent::CloseRequested => self.request_close(event_loop),
             _ => {}
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::ForwardedArgs(args) => {
                 tracing::info!(count = args.len(), "accepted forwarded args");
@@ -1623,15 +2816,64 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::Import(outcome) => self.apply_import(*outcome),
             AppEvent::Dropped(event) => self.apply_drop(*event),
+            AppEvent::Accessibility(event) => match event.window_event {
+                accesskit_winit::WindowEvent::InitialTreeRequested => {
+                    self.refresh_accessibility();
+                }
+                accesskit_winit::WindowEvent::ActionRequested(request) => {
+                    let action = self
+                        .accessibility
+                        .as_ref()
+                        .and_then(|accessibility| accessibility.requested_action(&request));
+                    if let Some(action) = action {
+                        self.execute(action, event_loop);
+                        self.redraw();
+                    }
+                }
+                accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                    tracing::debug!("accessibility deactivated");
+                }
+            },
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // The board idles at zero CPU unless something is animating: a playing
         // GIF arms a one-shot timer for its next frame, and everything else
-        // waits for an event.
-        match self.next_frame_at {
-            Some(deadline) if deadline <= Instant::now() => {
+        // waits for an event. Ghost/click-through modes add a 50 ms poll so the
+        // window can be woken even though it receives no input.
+        let now = Instant::now();
+        if self.shell.expire_toast(now) {
+            self.redraw();
+        }
+
+        let mut poll_deadline = None;
+        if self.window_modes.ghost() {
+            let down = platform::window_modes::ghost_chord_down();
+            if down && !self.ghost_hotkey_was_down {
+                self.ghost_hotkey_was_down = true;
+                self.execute(Action::ToggleGhostMode, event_loop);
+            } else if !down {
+                self.ghost_hotkey_was_down = false;
+            }
+            poll_deadline = Some(now + Duration::from_millis(50));
+        } else if self.window_modes.effective_click_through() {
+            let down = platform::window_modes::click_through_chord_down();
+            if down && !self.click_through_hotkey_was_down {
+                self.click_through_hotkey_was_down = true;
+                self.execute(Action::ToggleClickThrough, event_loop);
+            } else if !down {
+                self.click_through_hotkey_was_down = false;
+            }
+            poll_deadline = Some(now + Duration::from_millis(50));
+        }
+
+        let deadline = [self.next_frame_at, self.shell.next_wake(), poll_deadline]
+            .into_iter()
+            .flatten()
+            .min();
+        match deadline {
+            Some(deadline) if deadline <= now => {
                 self.redraw();
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
@@ -1645,47 +2887,112 @@ impl ApplicationHandler<AppEvent> for App {
     }
 }
 
-/// Maps a winit logical key to the input table's vocabulary.
-fn input_key(key: &Key) -> Option<InputKey> {
+/// Maps a winit logical key to the shortcut vocabulary.
+fn shortcut_key(key: &Key) -> Option<ShortcutKey> {
     match key {
-        Key::Character(text) => match text.to_ascii_lowercase().as_str() {
-            "0" => Some(InputKey::Digit0),
-            "1" => Some(InputKey::Digit1),
-            "2" => Some(InputKey::Digit2),
-            "3" => Some(InputKey::Digit3),
-            "4" => Some(InputKey::Digit4),
-            "5" => Some(InputKey::Digit5),
-            "6" => Some(InputKey::Digit6),
-            "a" => Some(InputKey::A),
-            "d" => Some(InputKey::D),
-            "f" => Some(InputKey::F),
-            "g" => Some(InputKey::G),
-            "h" => Some(InputKey::H),
-            "n" => Some(InputKey::N),
-            "r" => Some(InputKey::R),
-            "v" => Some(InputKey::V),
-            "w" => Some(InputKey::W),
-            "y" => Some(InputKey::Y),
-            "z" => Some(InputKey::Z),
-            "," => Some(InputKey::Comma),
-            "." => Some(InputKey::Period),
-            _ => None,
-        },
+        Key::Character(text) => ShortcutKey::from_name(text),
         Key::Named(named) => match named {
-            NamedKey::ArrowLeft => Some(InputKey::Left),
-            NamedKey::ArrowRight => Some(InputKey::Right),
-            NamedKey::ArrowUp => Some(InputKey::Up),
-            NamedKey::ArrowDown => Some(InputKey::Down),
-            NamedKey::PageUp => Some(InputKey::PageUp),
-            NamedKey::PageDown => Some(InputKey::PageDown),
-            NamedKey::Home => Some(InputKey::Home),
-            NamedKey::End => Some(InputKey::End),
-            NamedKey::Delete => Some(InputKey::Delete),
-            NamedKey::Backspace => Some(InputKey::Backspace),
-            NamedKey::Escape => Some(InputKey::Escape),
+            NamedKey::F1 => Some(ShortcutKey::F1),
+            NamedKey::F2 => Some(ShortcutKey::F2),
+            NamedKey::F11 => Some(ShortcutKey::F11),
+            NamedKey::ArrowLeft => Some(ShortcutKey::Left),
+            NamedKey::ArrowRight => Some(ShortcutKey::Right),
+            NamedKey::ArrowUp => Some(ShortcutKey::Up),
+            NamedKey::ArrowDown => Some(ShortcutKey::Down),
+            NamedKey::PageUp => Some(ShortcutKey::PageUp),
+            NamedKey::PageDown => Some(ShortcutKey::PageDown),
+            NamedKey::Home => Some(ShortcutKey::Home),
+            NamedKey::End => Some(ShortcutKey::End),
+            NamedKey::Delete => Some(ShortcutKey::Delete),
+            NamedKey::Backspace => Some(ShortcutKey::Backspace),
+            NamedKey::Escape => Some(ShortcutKey::Escape),
+            NamedKey::Tab => Some(ShortcutKey::Tab),
+            NamedKey::Space => Some(ShortcutKey::Space),
+            NamedKey::Enter => Some(ShortcutKey::Enter),
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Whether a command changes scene content (and must be blocked by the canvas
+/// lock). Navigation and selection stay available in a locked canvas.
+fn command_mutates_items(command: Command) -> bool {
+    use Command::{
+        AlignBottom, AlignLeft, AlignRight, AlignTop, ArrangeGrid, ArrangeHierarchy, ArrangeSpread,
+        ArrangeStack, CreateNote, DeleteSelection, DistributeHorizontal, DistributeVertical,
+        DuplicateSelection, FlipHorizontal, FlipVertical, GroupSelection, LowerSelection,
+        LowerToBottom, MatchHeight, MatchWidth, Nudge, RaiseSelection, RaiseToTop, Redo,
+        ResetTransform, Undo, UngroupSelection,
+    };
+    matches!(
+        command,
+        Undo | Redo
+            | DuplicateSelection
+            | DeleteSelection
+            | Nudge { .. }
+            | FlipHorizontal
+            | FlipVertical
+            | ResetTransform
+            | MatchWidth
+            | MatchHeight
+            | GroupSelection
+            | UngroupSelection
+            | RaiseSelection
+            | LowerSelection
+            | RaiseToTop
+            | LowerToBottom
+            | ArrangeGrid
+            | ArrangeHierarchy
+            | ArrangeSpread
+            | ArrangeStack
+            | CreateNote
+            | AlignLeft
+            | AlignRight
+            | AlignTop
+            | AlignBottom
+            | DistributeHorizontal
+            | DistributeVertical
+    )
+}
+
+/// A fresh scene id for a new board.
+fn new_scene_id() -> SceneId {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&(nanos as u64).to_le_bytes());
+    bytes[8..12].copy_from_slice(&(nanos >> 64).to_le_bytes()[..4]);
+    bytes[12..].copy_from_slice(&(u64::from(std::process::id())).to_le_bytes()[..4]);
+    SceneId::from_bytes(bytes)
+}
+
+/// The edge-resize direction for a point near the frameless window's border.
+///
+/// The title bar owns the top strip, so only the left, right, bottom and bottom
+/// corners are exposed: a pointer near the top reveals the bar instead.
+fn resize_direction(viewport: DVec2, point: DVec2) -> Option<ResizeDirection> {
+    let west = point.x <= RESIZE_EDGE;
+    let east = point.x >= viewport.x - RESIZE_EDGE;
+    let south = point.y >= viewport.y - RESIZE_EDGE;
+    match (west, east, south) {
+        (true, false, true) => Some(ResizeDirection::SouthWest),
+        (false, true, true) => Some(ResizeDirection::SouthEast),
+        (true, false, false) => Some(ResizeDirection::West),
+        (false, true, false) => Some(ResizeDirection::East),
+        (false, false, true) => Some(ResizeDirection::South),
+        _ => None,
+    }
+}
+
+/// The cursor matching a resize direction.
+fn resize_cursor(direction: ResizeDirection) -> CursorIcon {
+    match direction {
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::EwResize,
+        ResizeDirection::North | ResizeDirection::South => CursorIcon::NsResize,
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::NwseResize,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::NeswResize,
     }
 }
 
@@ -1773,7 +3080,7 @@ fn run_window(guard: Option<SingleInstance>, parsed: ParsedArgs) -> ExitCode {
         let _ = proxy.send_event(AppEvent::ForwardedArgs(args));
     });
 
-    let mut app = App::new(WindowPlan::default(), app_proxy);
+    let mut app = App::new(WindowPlan::default(), app_proxy, parsed.paths.is_empty());
     app.pending_paths = parsed.paths;
     match event_loop.run_app(&mut app) {
         Ok(()) => {
@@ -1859,10 +3166,11 @@ fn check_dialogs() {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANVAS_BACKGROUND, LOG_FILES_KEPT, Playback, WindowPlan, input_key, looks_like_image,
-        parse_args, stale_logs, tick_animations, version_line,
+        CANVAS_BACKGROUND, LOG_FILES_KEPT, Playback, ShortcutKey, WindowPlan, looks_like_image,
+        parse_args, resize_cursor, resize_direction, shortcut_key, stale_logs, tick_animations,
+        version_line,
     };
-    use glam::Vec2;
+    use glam::{DVec2, Vec2};
     use rizref_codecs::ImageBuffer;
     use rizref_core::{
         Animation, AnimationFrame, Asset, AssetId, Item, ItemId, Rect, Scene, SceneId, Selection,
@@ -1974,16 +3282,20 @@ mod tests {
     }
 
     #[test]
-    fn logical_keys_map_to_the_input_table() {
+    fn logical_keys_map_to_the_shortcut_vocabulary() {
         assert_eq!(
-            input_key(&Key::Character("Z".into())),
-            Some(super::InputKey::Z)
+            shortcut_key(&Key::Character("Z".into())),
+            Some(ShortcutKey::Z)
         );
         assert_eq!(
-            input_key(&Key::Named(NamedKey::ArrowLeft)),
-            Some(super::InputKey::Left)
+            shortcut_key(&Key::Named(NamedKey::ArrowLeft)),
+            Some(ShortcutKey::Left)
         );
-        assert_eq!(input_key(&Key::Named(NamedKey::Tab)), None);
+        assert_eq!(
+            shortcut_key(&Key::Named(NamedKey::Tab)),
+            Some(ShortcutKey::Tab)
+        );
+        assert_eq!(shortcut_key(&Key::Named(NamedKey::F3)), None);
     }
 
     /// A scene with one animated item at the origin, 10 x 10 world units.
@@ -2154,6 +3466,36 @@ mod tests {
         assert!(uploads.is_empty());
         assert_eq!(next, None);
         assert!(playbacks.is_empty());
+    }
+
+    #[test]
+    fn the_frameless_window_resizes_from_its_side_and_bottom_edges() {
+        let viewport = DVec2::new(800.0, 600.0);
+        assert_eq!(
+            resize_direction(viewport, DVec2::new(2.0, 300.0)),
+            Some(winit::window::ResizeDirection::West)
+        );
+        assert_eq!(
+            resize_direction(viewport, DVec2::new(798.0, 300.0)),
+            Some(winit::window::ResizeDirection::East)
+        );
+        assert_eq!(
+            resize_direction(viewport, DVec2::new(400.0, 598.0)),
+            Some(winit::window::ResizeDirection::South)
+        );
+        assert_eq!(
+            resize_direction(viewport, DVec2::new(2.0, 598.0)),
+            Some(winit::window::ResizeDirection::SouthWest)
+        );
+        assert_eq!(
+            resize_direction(viewport, DVec2::new(798.0, 598.0)),
+            Some(winit::window::ResizeDirection::SouthEast)
+        );
+        assert_eq!(resize_direction(viewport, DVec2::new(400.0, 300.0)), None);
+        assert_eq!(
+            resize_cursor(winit::window::ResizeDirection::South),
+            winit::window::CursorIcon::NsResize
+        );
     }
 
     #[test]

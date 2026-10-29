@@ -214,6 +214,26 @@ impl TextEngine {
     pub fn font_system_mut(&mut self) -> &mut FontSystem {
         &mut self.fonts
     }
+
+    /// The shaped width of one line of text at `font_size`, in pixels.
+    ///
+    /// Used by the shell to size panels, menu columns and right-aligned
+    /// accelerator labels. Shaping here is deliberate: guessing from character
+    /// counts drifts with font and DPI, and the shell is custom-painted, so
+    /// there is no layout engine to ask.
+    pub fn measure(&mut self, text: &str, font_size: f32) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let metrics = Metrics::new(font_size, (font_size * 1.35).ceil());
+        let mut buffer = Buffer::new(&mut self.fonts, metrics);
+        buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.fonts, false);
+        buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0_f32, f32::max)
+    }
 }
 
 impl Default for TextEngine {

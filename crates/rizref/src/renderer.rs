@@ -12,8 +12,7 @@ use glam::DVec2;
 use rizref_core::{Camera, Rect};
 use winit::window::Window;
 
-use crate::app::CANVAS_BACKGROUND;
-use crate::canvas::{Canvas, HudUpload, ItemQuad};
+use crate::canvas::{Canvas, FrameFlags, HudUpload, ItemQuad, UiUpload};
 use crate::overlay::OverlayVertex;
 use crate::textures::{MAX_TEXTURE_SIDE, TextureCache};
 
@@ -60,10 +59,27 @@ pub fn describe_backends(backends: wgpu::Backends) -> String {
     }
 }
 
-/// Converts the 8-bit board background into the linear-ish f32 wgpu clears to.
-fn clear_color() -> wgpu::Color {
-    let [r, g, b, a] = CANVAS_BACKGROUND.map(|c| f64::from(c) / 255.0);
-    wgpu::Color { r, g, b, a }
+/// Converts the 8-bit sRGB board background into the linear values wgpu's
+/// clear takes.
+///
+/// The swapchain is an sRGB format: writing `byte / 255` directly would treat
+/// the value as linear and re-encode it on present, washing a charcoal board
+/// out to mid-grey.
+fn clear_color(background: [u8; 4]) -> wgpu::Color {
+    fn srgb_to_linear(byte: u8) -> f64 {
+        let value = f64::from(byte) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    wgpu::Color {
+        r: srgb_to_linear(background[0]),
+        g: srgb_to_linear(background[1]),
+        b: srgb_to_linear(background[2]),
+        a: f64::from(background[3]) / 255.0,
+    }
 }
 
 /// Why a frame did not make it to the screen.
@@ -113,6 +129,14 @@ pub struct FrameParams<'a> {
     pub overlay: &'a [OverlayVertex],
     /// The CPU-raster HUD readout, if any.
     pub hud: HudUpload<'a>,
+    /// The cached shell layer: keep it, replace it, or release it.
+    pub ui: UiUpload<'a>,
+    /// Display effects (checkerboard, grayscale).
+    pub flags: FrameFlags,
+    /// The clear colour.
+    pub background: [u8; 4],
+    /// A pixel to read back after drawing, in physical window coordinates.
+    pub pick: Option<(u32, u32)>,
 }
 
 impl FrameParams<'_> {
@@ -175,7 +199,12 @@ impl GpuSurface {
         .ok()?;
 
         let config = match surface.get_default_config(&adapter, size.0.max(1), size.1.max(1)) {
-            Some(config) => config,
+            Some(mut config) => {
+                // The colour picker reads one pixel back from the presented
+                // surface; that requires COPY_SRC on the swapchain texture.
+                config.usage |= wgpu::TextureUsages::COPY_SRC;
+                config
+            }
             None => {
                 tracing::error!("the surface supports no usable configuration");
                 return None;
@@ -266,7 +295,11 @@ impl GpuSurface {
     /// timeout are normal (a minimized window owes no frame) and return `Ok`.
     /// Outdated reconfigures and requests another redraw through the error;
     /// lost/validated surfaces are fatal and logged by the caller.
-    pub fn render(&mut self, frame: &FrameParams) -> Result<(), FrameError> {
+    ///
+    /// When [`FrameParams::pick`] names a pixel, the same frame's colour is
+    /// copied to a readback buffer and returned as straight sRGB bytes — that
+    /// is the colour picker, reading exactly what the user sees.
+    pub fn render(&mut self, frame: &FrameParams) -> Result<Option<[u8; 4]>, FrameError> {
         let _frame_span = tracing::debug_span!("frame").entered();
         let acquired = self.surface.get_current_texture();
         let frame_texture = match acquired {
@@ -280,7 +313,7 @@ impl GpuSurface {
                 return Err(FrameError::NeedsReconfigure);
             }
             wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
-                return Ok(());
+                return Ok(None);
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 return Err(FrameError::Fatal("surface lost".into()));
@@ -290,6 +323,21 @@ impl GpuSurface {
             }
         };
 
+        let pick = frame.pick.map(|(x, y)| {
+            (
+                x.min(self.config.width.saturating_sub(1)),
+                y.min(self.config.height.saturating_sub(1)),
+            )
+        });
+        let readback = pick.map(|_| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rizref-pick-readback"),
+                size: 256,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+
         self.canvas.set_globals(
             &self.queue,
             frame.camera,
@@ -297,6 +345,7 @@ impl GpuSurface {
             frame.physical_scale,
             frame.scene_rect,
             frame.hud_size(),
+            frame.flags,
         );
         for item in frame.items {
             self.textures.touch(item.asset);
@@ -312,6 +361,7 @@ impl GpuSurface {
         self.canvas
             .set_overlay(&self.device, &self.queue, frame.overlay);
         self.canvas.set_hud(&self.device, &self.queue, frame.hud);
+        self.canvas.set_ui(&self.device, &self.queue, frame.ui);
 
         let mut encoder = self
             .device
@@ -328,7 +378,7 @@ impl GpuSurface {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color()),
+                        load: wgpu::LoadOp::Clear(clear_color(frame.background)),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -339,6 +389,33 @@ impl GpuSurface {
             self.canvas.draw_items(&mut pass, &bind_groups);
             self.canvas.draw_overlay(&mut pass);
             self.canvas.draw_hud(&mut pass);
+            self.canvas.draw_ui(&mut pass);
+        }
+
+        if let (Some((x, y)), Some(buffer)) = (pick, readback.as_ref()) {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        // Row pitch must be a multiple of 256 for texture→buffer
+                        // copies; one pixel is copied, the padding is ignored.
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
 
         {
@@ -346,13 +423,51 @@ impl GpuSurface {
             self.queue.submit(Some(encoder.finish()));
             self.queue.present(frame_texture);
         }
-        Ok(())
+
+        let Some(buffer) = readback else {
+            return Ok(None);
+        };
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        if let Err(error) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
+            tracing::warn!(%error, "cannot wait for the pick readback");
+            return Ok(None);
+        }
+        if receiver
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err()
+        {
+            tracing::warn!("the pick readback did not complete");
+            return Ok(None);
+        }
+        let mapped = match slice.get_mapped_range() {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                tracing::warn!(%error, "cannot read the pick buffer");
+                return Ok(None);
+            }
+        };
+        let mut pixel = [mapped[0], mapped[1], mapped[2], mapped[3]];
+        // BGRA swapchains report their bytes in display order, not RGBA.
+        if matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            pixel.swap(0, 2);
+        }
+        drop(mapped);
+        buffer.unmap();
+        Ok(Some(pixel))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{clear_color, describe_backends, preferred_backends};
+    use crate::app::CANVAS_BACKGROUND;
 
     #[test]
     fn this_build_prefers_vulkan_then_dx12() {
@@ -383,10 +498,18 @@ mod tests {
 
     #[test]
     fn the_clear_color_is_opaque_and_matches_the_board() {
-        let c = clear_color();
+        let c = clear_color(CANVAS_BACKGROUND);
         assert_eq!(c.a, 1.0, "an opaque board, not a ghost");
-        assert!((c.r - 24.0 / 255.0).abs() < f64::EPSILON);
-        assert!((c.g - 24.0 / 255.0).abs() < f64::EPSILON);
-        assert!((c.b - 28.0 / 255.0).abs() < f64::EPSILON);
+        assert!((c.r - 0.009_134).abs() < 1.0e-5, "sRGB 24 is linear 0.0091");
+        assert!((c.g - 0.009_134).abs() < 1.0e-5);
+        assert!((c.b - 0.011_612).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn a_paper_theme_clears_to_its_own_colour() {
+        let c = clear_color([232, 226, 214, 255]);
+        assert!((c.r - 0.806_952).abs() < 1.0e-5);
+        assert!((c.g - 0.760_525).abs() < 1.0e-5);
+        assert!((c.b - 0.672_443).abs() < 1.0e-5);
     }
 }
