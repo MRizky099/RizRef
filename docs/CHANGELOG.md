@@ -4,8 +4,8 @@ Summary of what each delivery phase landed. One section per phase; newest at the
 
 ## Phase 06 — The `.rizref` file format (done)
 
-On branch `feat/phase-06-rizref-format`. Closes issue #7. Format specification:
-[`format.md`](format.md).
+Merged 2026-10-29 in PR #18 (branch `feat/phase-06-rizref-format`, merge commit
+`9b44501`). Closes issue #7. Format specification: [`format.md`](format.md).
 
 - `rizref-format`: the complete v1 container. A fixed 64-byte header carries a UUID v4
   scene id, revision, writer version and creation/modification times. Chunks use a
