@@ -4,7 +4,8 @@ Summary of what each delivery phase landed. One section per phase; newest at the
 
 ## Phase 05 — UI Shell (done)
 
-Implemented 2026-10-29 on branch `feat/phase-05-ui-shell` (issue #6).
+Merged 2026-10-29 in PR #17 (branch `feat/phase-05-ui-shell`, merge commit
+`0335105`). Closes issue #6.
 
 - `rizref`: custom-painted UI shell instead of native menus. `ui/menu.rs` is a
   data-driven `Action`/`MenuEntry` tree (File, Edit, Image, View, Canvas, Tools, Help)
