@@ -76,6 +76,14 @@ image = { version = "0.25.10", default-features = false, features = [
 
 # --- window, GPU, clipboard, dialogs: rizref (bin) -------------------------
 winit = "0.30.13"
+# The native window handle, needed by the Win32 window-mode glue (HWND) and by
+# the AccessKit winit adapter. Same major version winit itself uses.
+raw-window-handle = "0.6.2"
+# Accessibility: AccessKit builds the UI Automation tree for the custom-painted
+# shell. Pure Rust; on Windows its adapter is a `windows`-crate client. The
+# winit adapter means no hand-rolled COM provider interfaces.
+accesskit = "0.24.1"
+accesskit_winit = { version = "0.32.2", default-features = false, features = ["rwh_06"] }
 # The import worker pool: std threads coordinated by bounded/unbounded MPMC
 # channels. Pure Rust, no async runtime.
 crossbeam-channel = "0.5.17"
@@ -136,6 +144,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

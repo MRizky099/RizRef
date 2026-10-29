@@ -2,6 +2,102 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Phase 05 — UI Shell (done)
+
+Implemented 2026-10-29 on branch `feat/phase-05-ui-shell` (issue #6).
+
+- `rizref`: custom-painted UI shell instead of native menus. `ui/menu.rs` is a
+  data-driven `Action`/`MenuEntry` tree (File, Edit, Image, View, Canvas, Tools, Help)
+  with submenus, check marks, disabled state, accelerators read from the live shortcut
+  table, mouse and full keyboard navigation, and dismissal on Escape or focus loss.
+  Right-click opens it at the cursor after selecting the item underneath.
+- `rizref`: `ui/paint.rs` (`Painter` over tiny-skia, scale-aware in logical pixels) and
+  `ui/mod.rs` (`Shell`, toasts, mode indicators). The shell rasterises into one cached
+  viewport-sized RGBA layer; a new `vs_ui`/`fs_ui` pass in `canvas.wgsl` uploads and
+  draws it as a single quad only when the revision changes.
+- `rizref`: start view (`ui/start.rs`) with wordmark, drop zone, New board / Open
+  images… / Open board… buttons and recent-board cards; a responsive compact layout
+  for windows under 560 px tall. `recents.rs` stores path, edited-at, item count and
+  optional preview in `%APPDATA%\RizRef\recents.json`, dedupes case-insensitively,
+  prunes missing files and caps at 12 entries. Opening a board and recording recents
+  wait for the `.rizref` reader in phase 06.
+- `rizref`: shortcut system (`shortcuts.rs`): 65 actions, 64 bound by default, exact
+  modifier matching, aliases for redo, `ctrl+shift+U` for ungroup, conflicts rejected
+  at bind time, and persisted overrides keyed kebab-case. `panels.rs` renders the F1
+  overlay with search, selection, scrolling, Enter-to-rebind, Delete-to-reset and an
+  inline conflict message, plus the pending chord prompt ("Press a chord…").
+- `rizref`: `settings.rs` + settings dialog: decode cap, grid/snap/HUD/border/
+  checkerboard/grayscale, canvas theme (Charcoal/Slate/Black/Paper), always-on-top,
+  opacity preset and ghost opacity. `sanitize()` guards hand-edited values; saves are
+  atomic; a malformed shortcut override is skipped without discarding the rest of the
+  file. `paths.rs` centralises `%APPDATA%\RizRef`.
+- `rizref`: `platform/window_modes.rs` composes always-on-top (`SetWindowPos`),
+  uniform opacity (`WS_EX_LAYERED` + `SetLayeredWindowAttributes`), click-through
+  (`WS_EX_TRANSPARENT`), borderless fullscreen and ghost mode. The pure
+  `styled_ex_style` plus a state matrix test pin the `WS_EX_*` juggling, including
+  ghost mode restoring the exact pre-ghost opacity/click-through state.
+- `rizref`: **ghost mode** (`ctrl+shift+G`, requested after the phase review): 15 %
+  window alpha (configurable 10–40 %) with whole-window click-through. Because the
+  window can no longer receive input, the chord is polled through
+  `GetAsyncKeyState` every 50 ms while ghost/click-through is active; the loop returns
+  to `ControlFlow::Wait` otherwise. An accent border and a "GHOST MODE · Ctrl+Shift+G
+  to restore" pill make the state legible. Ghost opacity is session-only, never
+  persisted.
+- `rizref`: **custom auto-hiding title bar** (requested after the phase was closed):
+  the window is created frameless (`.with_decorations(false)`) and `ui/titlebar.rs`
+  paints its own 34 px bar into the cached shell layer. The bar stays hidden until the
+  pointer enters the title-bar strip; it hides again on leave, focus loss, picker arm,
+  ghost/click-through activation and borderless fullscreen. Controls are the always-on-top
+  pin (accent state, persisted through `ToggleAlwaysOnTop`), minimize, maximize/
+  restore and close, with Windows-style hover feedback (red close). Dragging the empty
+  bar calls `Window::drag_window`, double-click toggles maximize, and the left, right,
+  bottom and bottom-corner edges get a 5 px `drag_resize_window` band with matching
+  resize cursors. `Painter::line` draws the crisp vector glyphs.
+- `rizref`: **document title and unsaved close guard** (requested after the phase was
+  closed): `document.rs` carries the open document's file name and dirty flag. New
+  boards are `DocumentN.rizref`; the title bar's left side shows only that name (no
+  application icon) and inserts `*` before the extension while dirty —
+  `Document1*.rizref`. The start view stays blank, and the display title is mirrored
+  to the native window title/taskbar and the UIA root. Every board effect marks the
+  document dirty; imports from the start view create the document when queued. Close
+  requests from the title-bar X, `ctrl+Q`, the menu's Quit and the native
+  `WM_CLOSE`/Alt+F4 all call one guarded path: a dirty document opens a modal
+  "Unsaved changes" panel with Cancel (default) and Close without saving. Escape
+  cancels, arrows/Tab switch, Enter confirms; UIA publishes the dialog and both
+  buttons and moves focus to it. The Save choice arrives with the phase-06 writer.
+- `rizref`: color picker (`I`): the surface gains `COPY_SRC`; renderer copies the 1×1
+  pixel under the cursor with a 256-byte row pitch and returns RGBA after a blocking
+  poll. The pick frame hides HUD and shell so the crosshair cannot be sampled; the
+  toast shows `#RRGGBB` plus RGB/HSV and a click copies the hex.
+- `rizref`: canvas lock (`L`) blocks item mutations while navigation still works, with
+  a `LOCKED` HUD badge; HUD status also reports `GHOST` and `CLICK-THROUGH`.
+- `rizref`: framebuffer effects — checkerboard backdrop and grayscale item shading in
+  `canvas.wgsl`; clear colors are now converted sRGB→linear (fixes the washed-out
+  phase-02 background), and grid minor/major lines fade in over zoom instead of
+  saturating every pixel.
+- `rizref`: accessibility (`accessibility.rs`) via AccessKit: Window → a "Window
+  controls" group (always-on-top switch, minimize, maximize/restore, close) → MenuBar
+  → menu/submenu leaves with names, accelerators, checkable toggle state, disabled
+  state and click actions routed back into `Action`. While the close guard is open the
+  tree also carries the "Unsaved changes" dialog with its Cancel and Close without
+  saving buttons, and focus moves to the dialog. Verified with a UIAutomation client
+  (same tree Inspect.exe shows), unlike PureRef's empty tree.
+- Deferred: glyph-atlas text pipeline (shell uses one cached layer), tray icon,
+  dragging the window by empty canvas background, opacity slider (presets are used),
+  board save/open and recents recording (phase 06). Replacing a dirty board through
+  New/Open will reuse the close guard once phase 06 owns the document lifecycle.
+- Verification: 462 workspace tests, clippy and rustfmt clean. Live checks covered
+  the start view, context menu and submenu navigation, F1 rebinding persistence,
+  settings dialog, ghost mode style/alpha flip and global-chord restore, color picker
+  values against screenshots, and the UIA tree. The title bar was checked live:
+  hidden/revealed screenshots, pin flipping `WS_EX_TOPMOST` and persisting, drag and
+  edge resize changing `GetWindowRect`, double-click maximize/restore, ghost mode
+  keeping it hidden, close exiting, and UIA exposing all four controls. The document
+  feature was checked live: blank start-view title, `Document1*.rizref` in the custom
+  bar and native title after New board, the unsaved dialog from the title-bar X and
+  from `WM_CLOSE`, Cancel and Escape keeping the app open, Close without saving
+  exiting, and UIA listing the dialog and both buttons.
+
 ## Phase 04 — Items & Manipulation (done)
 
 Merged 2026-10-29 in PR #16 (branch `feat/phase-04-items-and-manipulation`,

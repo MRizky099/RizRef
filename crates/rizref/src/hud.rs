@@ -105,23 +105,28 @@ impl HudSurface {
     /// tiny-skia stores premultiplied pixels; the divide-back is rounded, which
     /// for antialiased HUD glyphs is well inside any visible tolerance.
     pub fn straight_rgba(&self) -> Vec<u8> {
-        let mut out = self.pixmap.data().to_vec();
-        for pixel in out.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
-            let alpha = u16::from(pixel[3]);
-            match alpha {
-                0 => {
-                    pixel[..3].fill(0);
-                }
-                255 => {}
-                _ => {
-                    for channel in pixel.iter_mut().take(3) {
-                        *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
-                    }
+        straight_rgba(&self.pixmap)
+    }
+}
+
+/// Converts a tiny-skia pixmap into straight-alpha RGBA bytes.
+pub fn straight_rgba(pixmap: &Pixmap) -> Vec<u8> {
+    let mut out = pixmap.data().to_vec();
+    for pixel in out.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
+        let alpha = u16::from(pixel[3]);
+        match alpha {
+            0 => {
+                pixel[..3].fill(0);
+            }
+            255 => {}
+            _ => {
+                for channel in pixel.iter_mut().take(3) {
+                    *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
                 }
             }
         }
-        out
     }
+    out
 }
 
 /// The stored premultiplied bytes of a surface (test helper).

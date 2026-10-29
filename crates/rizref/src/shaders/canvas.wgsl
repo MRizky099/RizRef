@@ -1,8 +1,8 @@
-// The canvas shaders: background (grid, origin cross, scene-rect border),
-// items (instanced world quads with texture array), and the HUD layer
-// (screen-space textured quad).
+// The canvas shaders: background (grid, origin cross, scene-rect border,
+// checkerboard), items (instanced world quads), the overlay pass (selection),
+// the HUD layer and the shell UI layer (screen-space textured quads).
 //
-// One module, three pipeline pairs, sharing the Globals uniform at group 0.
+// One module, five pipeline pairs, sharing the Globals uniform at group 0.
 // All coordinates start in logical viewport pixels — device pixels only
 // appear where the HUD sizes itself and where the grid width is expressed.
 
@@ -14,8 +14,10 @@ struct Globals {
     physical_scale: f32,  // device px per logical px
     scene_min: vec2f,
     scene_max: vec2f,
-    flags: vec2f,         // x: grid visible, y: scene border visible
+    // x: grid visible, y: scene border visible, z: checkerboard, w: grayscale
+    flags: vec4f,
     hud_size: vec2f,      // HUD texture size in device px
+    _pad: vec2f,
 }
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -82,6 +84,16 @@ fn fs_background(in: BgOut) -> @location(0) vec4f {
     let world = screen_to_world(in.screen);
     var color = vec4f(0.0, 0.0, 0.0, 0.0);
 
+    // Checkerboard backdrop: subtle world-space cells, so it pans and zooms
+    // with the board instead of crawling under the cursor.
+    if g.flags.z > 0.5 {
+        let cell = floor(world / vec2f(16.0));
+        let parity = cell.x + cell.y;
+        let even = parity - 2.0 * floor(parity / 2.0);
+        let shade = select(0.012, 0.035, even > 0.5);
+        color = blend_over(vec4f(vec3f(1.0), shade), color);
+    }
+
     // Grid: world-space lines at integer coordinates with a screen-space width
     // of about one logical pixel, so the grid never thins out with zoom. Major
     // lines every 8 units. Hidden above 400% zoom by the CPU-side flag.
@@ -89,14 +101,23 @@ fn fs_background(in: BgOut) -> @location(0) vec4f {
         let near = fract(world + vec2f(0.5)) - vec2f(0.5);
         let dpx = abs(near) * g.zoom;
         let minor = 1.0 - smoothstep(0.4, 0.9, min(dpx.x, dpx.y));
+        // A one-unit grid is one pixel apart at 100% zoom: without this fade
+        // every pixel centre sits half a line-width away and the whole canvas
+        // brightens uniformly. Minor lines appear once they are readable, and
+        // major lines (every 8 units) carry the grid when zoomed out.
+        let minor_fade = smoothstep(2.0, 8.0, g.zoom);
 
         let near8 = fract(world / vec2f(8.0) + vec2f(0.5)) - vec2f(0.5);
-        let dpx8 = abs(near8) * g.zoom;
+        let dpx8 = abs(near8) * g.zoom * 8.0;
         let major = 1.0 - smoothstep(0.4, 0.9, min(dpx8.x, dpx8.y));
+        let major_fade = smoothstep(2.0, 8.0, g.zoom * 8.0);
 
         let grid_rgb = vec3f(1.0, 1.0, 1.0);
-        color = blend_over(vec4f(grid_rgb, 0.05 * minor * (1.0 - major)), color);
-        color = blend_over(vec4f(grid_rgb, 0.10 * major), color);
+        color = blend_over(
+            vec4f(grid_rgb, 0.05 * minor * (1.0 - major) * minor_fade),
+            color,
+        );
+        color = blend_over(vec4f(grid_rgb, 0.10 * major * major_fade), color);
 
         // Origin cross, slightly brighter than the major lines.
         let to_axis = min(abs(world.x), abs(world.y)) * g.zoom;
@@ -184,6 +205,11 @@ fn fs_items(in: ItemOut) -> @location(0) vec4f {
         let shade = select(0.05, 0.10, even > 0.5);
         color = vec4f(mix(vec3f(shade), color.rgb, color.a), 1.0);
     }
+    // Reference study mode: luminance only, alpha preserved.
+    if g.flags.w > 0.5 {
+        let luma = dot(color.rgb, vec3f(0.2126, 0.7152, 0.0722));
+        color = vec4f(luma, luma, luma, color.a);
+    }
     return color;
 }
 
@@ -252,4 +278,39 @@ fn vs_hud(@builtin(vertex_index) vi: u32) -> HudOut {
 @fragment
 fn fs_hud(in: HudOut) -> @location(0) vec4f {
     return textureSample(hud_tex, hud_samp, in.uv);
+}
+
+// ---------------------------------------------------------------------------
+// Shell UI: one viewport-sized textured quad, sampling the cached CPU-raster
+// shell layer 1:1. Re-uploaded only when the shell revision changes.
+// ---------------------------------------------------------------------------
+
+struct UiOut {
+    @builtin(position) clip: vec4f,
+    @location(0) uv: vec2f,
+}
+
+@group(1) @binding(0) var ui_tex: texture_2d<f32>;
+@group(1) @binding(1) var ui_samp: sampler;
+
+@vertex
+fn vs_ui(@builtin(vertex_index) vi: u32) -> UiOut {
+    var corners = array(
+        vec2f(0.0, 0.0),
+        vec2f(1.0, 0.0),
+        vec2f(0.0, 1.0),
+        vec2f(1.0, 1.0),
+    );
+    let corner = corners[vi];
+    let position = corner * g.viewport;
+
+    var out: UiOut;
+    out.clip = screen_to_clip(position);
+    out.uv = corner;
+    return out;
+}
+
+@fragment
+fn fs_ui(in: UiOut) -> @location(0) vec4f {
+    return textureSample(ui_tex, ui_samp, in.uv);
 }

@@ -47,11 +47,6 @@ impl DecodeCache {
         }
     }
 
-    /// The cache at the default two-gigabyte cap.
-    pub fn with_default_cap() -> Self {
-        Self::new(DEFAULT_DECODE_CACHE_BYTES)
-    }
-
     /// Stores `image`, evicting least-recently-used entries to respect the cap.
     ///
     /// Returns the evicted assets so the caller can log or re-plan uploads.
@@ -107,7 +102,6 @@ impl DecodeCache {
     }
 
     /// Drops one asset's bitmap, returning whether it was present.
-    #[cfg(test)]
     pub fn remove(&mut self, asset: AssetId) -> bool {
         match self.entries.remove(&asset) {
             Some(entry) => {
@@ -141,14 +135,12 @@ impl DecodeCache {
     }
 
     /// Changes the cap, evicting down to it immediately.
-    #[cfg(test)]
     pub fn set_max_bytes(&mut self, max_bytes: u64) {
         self.max_bytes = max_bytes;
         self.trim();
     }
 
     /// Evicts LRU entries until the cap holds, keeping at least one.
-    #[cfg(test)]
     pub fn trim(&mut self) {
         while self.bytes > self.max_bytes && self.entries.len() > 1 {
             let Some(victim) = self

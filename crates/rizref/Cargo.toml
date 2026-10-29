@@ -20,6 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 winit.workspace = true
+raw-window-handle.workspace = true
+accesskit.workspace = true
+accesskit_winit.workspace = true
 crossbeam-channel.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
