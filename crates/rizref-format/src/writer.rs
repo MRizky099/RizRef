@@ -971,7 +971,7 @@ mod tests {
             assets.push(scene.insert_asset(asset).0);
         }
         let mut item_ids = Vec::new();
-        for index in 0..200 {
+        for index in 0..198 {
             let asset = assets[index % assets.len()];
             let id = scene
                 .insert_image(
@@ -980,6 +980,14 @@ mod tests {
                     Vec2::new(80.0, 60.0),
                 )
                 .expect("asset");
+            item_ids.push(id);
+        }
+        for index in 0..2 {
+            let id = scene.insert_note(
+                format!("study note {index}"),
+                Vec2::new(1_700.0 + index as f32 * 200.0, 0.0),
+                Vec2::splat(120.0),
+            );
             item_ids.push(id);
         }
         for index in 0..10 {
@@ -1339,7 +1347,7 @@ mod tests {
             .expect("note")
             .id();
         let mut modes = Vec::new();
-        for index in 0..80 {
+        for index in 0..100 {
             scene
                 .item_mut(note)
                 .expect("note")
