@@ -5,6 +5,7 @@
 #   rizref-format   the `.rizref` container — the only writer of scene files
 #   rizref-codecs   image decode/encode dispatch on pure-Rust codec backends
 #   rizref          the application binary: window, renderer, input, platform glue
+#   rizref-thumb    the Explorer thumbnail provider DLL (reads through rizref-format)
 
 [workspace]
 resolver = "3"
@@ -13,6 +14,7 @@ members = [
     "crates/rizref-core",
     "crates/rizref-format",
     "crates/rizref-codecs",
+    "crates/rizref-thumb",
 ]
 # The fuzz crate needs a nightly toolchain and its own pinned dependencies; it
 # is built by the dedicated CI job, never by `cargo test --workspace`.
@@ -144,6 +146,11 @@ pollster = "0.4.0"
 # The Windows FFI surface, in one place so no crate has to guess a version:
 # the single-instance mutex and args pipe, the panic message box, the native
 # dialogs, and the OLE drop target (`IDropTarget`, CF_HDROP plus virtual files).
+# Phase 07 adds the crash minidump (Diagnostics_Debug + Kernel: the unhandled
+# exception filter and dbghelp's MiniDumpWriteDump), the per-user file-type
+# registration (Registry), the parent-console attach for the GUI-subsystem
+# release build (Console), and the Explorer thumbnail provider in `rizref-thumb`
+# (Shell_PropertiesSystem: IInitializeWithStream; LibraryLoader: its own path).
 # The GDI/StructuredStorage/SystemServices/DataExchange/Memory features exist for
 # the COM pieces: STGMEDIUM and ReleaseStgMedium, the IDropTarget vtable,
 # RegisterClipboardFormatW and the HGLOBAL payloads.
@@ -154,17 +161,23 @@ windows = { version = "0.62.2", features = [
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Console",
     "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # The `#[implement]` macro expands to absolute `::windows_core::` paths, so a

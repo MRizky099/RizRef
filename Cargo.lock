@@ -2351,6 +2351,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rizref-thumb"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "rizref-codecs",
+ "rizref-core",
+ "rizref-format",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
