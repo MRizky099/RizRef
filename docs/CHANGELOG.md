@@ -59,7 +59,13 @@ contract: [`format.md` → scene document](format.md) (`origin`, `source_path`,
   gesture). Explorer `/select` with an 8.3 short path (`MRIZKY~1`) opened the folder
   without selecting the file; paths are expanded with `GetLongPathNameW` first. The
   info dialog's keyboard hint overlapped the buttons in a small window; it now shortens.
-- Tests: 629 workspace tests pass (3 ignored), up from 571; clippy `-D warnings` and fmt
+  **Show grid** and **Scene border** were toggled in the menu but never reached the
+  renderer, so the grid, its origin axis and the border always drew; `FrameFlags` now
+  carries both.
+- `rizref`: the grid and origin axis are hidden on first launch (`grid_visible`
+  defaults to `false`); View → Grid → Show grid turns them on, and a saved choice still
+  wins.
+- Tests: 630 workspace tests pass (3 ignored), up from 571; clippy `-D warnings` and fmt
   clean; no dependency changes and no new `-sys` crate.
 - Hand-tested with Edge on Windows 10: copy image → `Ctrl+V` records the `<img src>`
   URL (origin `clipboard`); dragging the image delivers a virtual `images.jpg` and
