@@ -32,9 +32,12 @@ const CLOSE_ICON: [u8; 4] = [255, 255, 255, 255];
 /// Document title text.
 const TITLE_TEXT: [u8; 4] = [206, 209, 218, 255];
 
-/// The four window controls, left to right.
+/// The title-bar controls: the main-menu button at the left edge, then the
+/// four window controls at the right, left to right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleBarButton {
+    /// ☰: opens the full command menu with a left click.
+    Menu,
     /// Toggle always-on-top.
     Pin,
     /// Minimize the window.
@@ -50,6 +53,8 @@ pub enum TitleBarButton {
 pub struct TitleBarLayout {
     /// The whole bar.
     pub bar: UiRect,
+    /// The ☰ main-menu button.
+    pub menu: UiRect,
     /// Always-on-top pin.
     pub pin: UiRect,
     /// Minimize.
@@ -74,20 +79,25 @@ impl TitleBarLayout {
         let minimize_width = (maximize_x - minimize_x).max(0.0);
         let pin_x = (minimize_x - BUTTON_WIDTH).max(0.0);
         let pin_width = (minimize_x - pin_x).max(0.0);
+        // The menu button never overlaps the window controls on a very
+        // narrow window: it shrinks to whatever is left of the pin.
+        let menu_width = BUTTON_WIDTH.min(pin_x);
 
         Self {
             bar: UiRect::new(0.0, 0.0, width, HEIGHT),
+            menu: UiRect::new(0.0, 0.0, menu_width, HEIGHT),
             pin: UiRect::new(pin_x, 0.0, pin_width, HEIGHT),
             minimize: UiRect::new(minimize_x, 0.0, minimize_width, HEIGHT),
             maximize: UiRect::new(maximize_x, 0.0, maximize_width, HEIGHT),
             close: UiRect::new(close_x, 0.0, close_width, HEIGHT),
-            drag: UiRect::new(0.0, 0.0, pin_x, HEIGHT),
+            drag: UiRect::new(menu_width, 0.0, (pin_x - menu_width).max(0.0), HEIGHT),
         }
     }
 
     /// The rectangle of one button.
     pub fn rect(&self, button: TitleBarButton) -> UiRect {
         match button {
+            TitleBarButton::Menu => self.menu,
             TitleBarButton::Pin => self.pin,
             TitleBarButton::Minimize => self.minimize,
             TitleBarButton::Maximize => self.maximize,
@@ -104,6 +114,7 @@ impl TitleBarLayout {
     pub fn button_at(&self, point: DVec2) -> Option<TitleBarButton> {
         let (x, y) = (point.x as f32, point.y as f32);
         [
+            TitleBarButton::Menu,
             TitleBarButton::Pin,
             TitleBarButton::Minimize,
             TitleBarButton::Maximize,
@@ -240,14 +251,16 @@ impl TitleBar {
         );
 
         if let Some(title) = &self.title {
-            let available = (layout.pin.x - 24.0).max(0.0);
+            let left = layout.menu.right() + 6.0;
+            let available = (layout.pin.x - left - 12.0).max(0.0);
             if available >= 24.0 {
                 let shown = elide(painter, title, available, 12.0);
-                painter.text(&shown, 12.0, 10.0, 12.0, TITLE_TEXT);
+                painter.text(&shown, left, 10.0, 12.0, TITLE_TEXT);
             }
         }
 
         for button in [
+            TitleBarButton::Menu,
             TitleBarButton::Pin,
             TitleBarButton::Minimize,
             TitleBarButton::Maximize,
@@ -288,6 +301,11 @@ fn draw_icon(
     let cx = rect.x + rect.width * 0.5;
     let cy = rect.y + rect.height * 0.5;
     match button {
+        TitleBarButton::Menu => {
+            for dy in [-4.0, 0.0, 4.0] {
+                painter.line((cx - 6.0, cy + dy), (cx + 6.0, cy + dy), 1.3, rgba);
+            }
+        }
         TitleBarButton::Minimize => painter.line((cx - 5.0, cy), (cx + 5.0, cy), 1.1, rgba),
         TitleBarButton::Close => {
             painter.line((cx - 4.6, cy - 4.6), (cx + 4.6, cy + 4.6), 1.1, rgba);
@@ -357,6 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn the_menu_button_sits_at_the_left_and_is_not_a_drag_area() {
+        let layout = TitleBarLayout::new(viewport());
+        assert_eq!(layout.menu.x, 0.0);
+        assert_eq!(layout.menu.width, BUTTON_WIDTH);
+        assert_eq!(layout.drag.x, layout.menu.right());
+        assert_eq!(
+            layout.button_at(DVec2::new(20.0, 17.0)),
+            Some(TitleBarButton::Menu)
+        );
+        // A window narrower than the controls never overlaps them.
+        let narrow = TitleBarLayout::new(DVec2::new(150.0, 400.0));
+        assert!(narrow.menu.right() <= narrow.pin.x);
+        assert!(narrow.drag.width >= 0.0);
+    }
+
+    #[test]
     fn hit_testing_matches_the_buttons() {
         let layout = TitleBarLayout::new(viewport());
         let center = |rect: super::UiRect| {
@@ -373,8 +407,8 @@ mod tests {
             layout.button_at(center(layout.close)),
             Some(TitleBarButton::Close)
         );
-        assert_eq!(layout.button_at(DVec2::new(40.0, 12.0)), None);
-        assert!(layout.contains(DVec2::new(40.0, 12.0)));
+        assert_eq!(layout.button_at(DVec2::new(140.0, 12.0)), None);
+        assert!(layout.contains(DVec2::new(140.0, 12.0)));
         assert!(!layout.contains(DVec2::new(40.0, f64::from(HEIGHT) + 1.0)));
     }
 

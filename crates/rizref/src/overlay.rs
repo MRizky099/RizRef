@@ -10,6 +10,8 @@
 //! hundred items is a few thousand vertices — nothing next to one present.
 
 use glam::{DVec2, Vec2};
+
+use crate::note_chrome::{NoteChrome, PillButton, ScreenRect, ToolbarButton};
 use rizref_core::{
     Camera, Guide, Handle as SelectionHandle, Item, Rect, Scene, Selection, SelectionFrame,
     SnapAxis,
@@ -88,6 +90,11 @@ pub struct OverlayState<'a> {
     pub marquee: Option<Rect>,
     /// The smart guides of the current drag.
     pub guides: &'a [Guide],
+    /// Whether the selection may be rotated (false for note-only
+    /// selections: notes are never rotated, so they get no rotate handle).
+    pub rotatable: bool,
+    /// The note toolbar or edit pill, drawn on top of everything.
+    pub chrome: Option<NoteChrome>,
 }
 
 impl OverlayState<'_> {
@@ -143,14 +150,18 @@ pub fn build(state: &OverlayState) -> Vec<OverlayVertex> {
         let rotate_offset = ROTATE_GAP / state.camera.zoom as f32;
         let north = state.screen(frame.handle_position(SelectionHandle::N, 0.0));
         let rotate = state.screen(frame.handle_position(SelectionHandle::Rotate, rotate_offset));
-        line(&mut vertices, north, rotate, 1.0, ACCENT);
+        if state.rotatable {
+            line(&mut vertices, north, rotate, 1.0, ACCENT);
+        }
         for handle in SelectionHandle::SCALE {
             let center = state.screen(frame.handle_position(handle, 0.0));
             square(&mut vertices, center, HANDLE_HALF, HANDLE_BODY);
             square(&mut vertices, center, HANDLE_ACCENT_HALF, ACCENT);
         }
-        diamond(&mut vertices, rotate, ROTATE_RADIUS, HANDLE_BODY);
-        diamond(&mut vertices, rotate, ROTATE_RADIUS - 1.0, ACCENT);
+        if state.rotatable {
+            diamond(&mut vertices, rotate, ROTATE_RADIUS, HANDLE_BODY);
+            diamond(&mut vertices, rotate, ROTATE_RADIUS - 1.0, ACCENT);
+        }
     }
 
     // The marquee: a translucent fill and a border.
@@ -187,7 +198,147 @@ pub fn build(state: &OverlayState) -> Vec<OverlayVertex> {
         line(&mut vertices, a - extend, b + extend, 1.0, GUIDE);
     }
 
+    if let Some(chrome) = &state.chrome {
+        note_chrome(&mut vertices, chrome);
+    }
+
     vertices
+}
+
+/// The chrome pill colour.
+const CHROME_PILL: [f32; 4] = [0.08, 0.08, 0.10, 0.82];
+/// A hovered chrome button.
+const CHROME_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 0.16];
+/// Chrome icon strokes.
+const CHROME_ICON: [f32; 4] = [0.95, 0.93, 0.90, 1.0];
+/// The confirm tick.
+const CHROME_CONFIRM: [f32; 4] = [0.45, 0.85, 0.50, 1.0];
+
+/// Draws the note toolbar or the edit pill as screen-space geometry.
+fn note_chrome(vertices: &mut Vec<OverlayVertex>, chrome: &NoteChrome) {
+    let fill = |vertices: &mut Vec<OverlayVertex>, rect: ScreenRect, color| {
+        fill_rect(vertices, rect.min, rect.max, color);
+    };
+    match chrome {
+        NoteChrome::Toolbar {
+            layout,
+            background,
+            hovered,
+        } => {
+            fill(vertices, layout.pill, CHROME_PILL);
+            for (button, rect) in layout.buttons {
+                if *hovered == Some(button) {
+                    fill(vertices, rect, CHROME_HOVER);
+                }
+                let c = (rect.min + rect.max) * 0.5;
+                match button {
+                    ToolbarButton::Background => {
+                        let swatch = ScreenRect {
+                            min: c - Vec2::splat(8.0),
+                            max: c + Vec2::splat(8.0),
+                        };
+                        let rgb = background.map(|v| f32::from(v) / 255.0);
+                        fill(vertices, swatch, [rgb[0], rgb[1], rgb[2], 1.0]);
+                        let corners = [
+                            swatch.min,
+                            Vec2::new(swatch.max.x, swatch.min.y),
+                            swatch.max,
+                            Vec2::new(swatch.min.x, swatch.max.y),
+                        ];
+                        rect_outline(vertices, corners, 1.0, CHROME_ICON);
+                    }
+                    ToolbarButton::Edit => {
+                        // A pencil: a slanted body and its tip.
+                        let a = c + Vec2::new(5.0, -6.0);
+                        let b = c + Vec2::new(-4.0, 3.0);
+                        line(vertices, a, b, 3.0, CHROME_ICON);
+                        line(vertices, b, c + Vec2::new(-6.0, 6.0), 1.5, CHROME_ICON);
+                    }
+                    ToolbarButton::Delete => {
+                        // A trash can: lid, handle, body and ribs.
+                        line(
+                            vertices,
+                            c + Vec2::new(-6.0, -5.0),
+                            c + Vec2::new(6.0, -5.0),
+                            1.5,
+                            CHROME_ICON,
+                        );
+                        line(
+                            vertices,
+                            c + Vec2::new(-2.0, -7.0),
+                            c + Vec2::new(2.0, -7.0),
+                            1.5,
+                            CHROME_ICON,
+                        );
+                        rect_outline(
+                            vertices,
+                            [
+                                c + Vec2::new(-4.5, -4.0),
+                                c + Vec2::new(4.5, -4.0),
+                                c + Vec2::new(4.0, 7.0),
+                                c + Vec2::new(-4.0, 7.0),
+                            ],
+                            1.5,
+                            CHROME_ICON,
+                        );
+                        line(
+                            vertices,
+                            c + Vec2::new(0.0, -2.0),
+                            c + Vec2::new(0.0, 5.0),
+                            1.0,
+                            CHROME_ICON,
+                        );
+                    }
+                }
+            }
+        }
+        NoteChrome::Pill { layout, hovered } => {
+            fill(vertices, layout.pill, CHROME_PILL);
+            for (button, rect) in [
+                (PillButton::Cancel, layout.cancel),
+                (PillButton::Confirm, layout.confirm),
+            ] {
+                if *hovered == Some(button) {
+                    fill(vertices, rect, CHROME_HOVER);
+                }
+                let c = (rect.min + rect.max) * 0.5;
+                match button {
+                    PillButton::Cancel => {
+                        line(
+                            vertices,
+                            c - Vec2::splat(6.0),
+                            c + Vec2::splat(6.0),
+                            2.0,
+                            CHROME_ICON,
+                        );
+                        line(
+                            vertices,
+                            c + Vec2::new(-6.0, 6.0),
+                            c + Vec2::new(6.0, -6.0),
+                            2.0,
+                            CHROME_ICON,
+                        );
+                    }
+                    PillButton::Confirm => {
+                        line(
+                            vertices,
+                            c + Vec2::new(-7.0, 0.0),
+                            c + Vec2::new(-2.0, 5.0),
+                            2.5,
+                            CHROME_CONFIRM,
+                        );
+                        line(
+                            vertices,
+                            c + Vec2::new(-2.0, 5.0),
+                            c + Vec2::new(7.0, -6.0),
+                            2.5,
+                            CHROME_CONFIRM,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Appends one item's outline.
@@ -308,6 +459,8 @@ mod tests {
             hover: None,
             marquee: None,
             guides: &[],
+            rotatable: true,
+            chrome: None,
         }
     }
 

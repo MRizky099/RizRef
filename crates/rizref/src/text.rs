@@ -165,6 +165,7 @@ impl TextEngine {
         cursor_color: [u8; 4],
         selection_color: [u8; 4],
         selected_text_color: [u8; 4],
+        clip: [i32; 4],
     ) {
         let offset_x = x as i32;
         let offset_y = y as i32;
@@ -195,7 +196,11 @@ impl TextEngine {
             |gx, gy, _, _, pixel| {
                 let px = offset_x + gx;
                 let py = offset_y + gy;
-                if px < 0 || py < 0 || px >= width || py >= height {
+                if px < clip[0].max(0)
+                    || py < clip[1].max(0)
+                    || px >= width.min(clip[2])
+                    || py >= height.min(clip[3])
+                {
                     return;
                 }
                 blend_premultiplied(
@@ -208,6 +213,60 @@ impl TextEngine {
                 );
             },
         );
+    }
+
+    /// Paints a buffer shaped in world units at `scale` pixels per world unit.
+    ///
+    /// The glyphs are not re-shaped: each laid-out glyph is rasterised at the
+    /// scaled size (`LayoutGlyph::physical`), so line breaks and positions are
+    /// exactly the ones the layout measured. `origin` is the buffer's top-left
+    /// in pixels, `clip` is `[x0, y0, x1, y1]` in pixels, and `color` maps a
+    /// glyph's metadata (its span index) to straight RGBA.
+    pub fn draw_scaled(
+        &mut self,
+        pixmap: &mut Pixmap,
+        buffer: &Buffer,
+        origin: (f32, f32),
+        scale: f32,
+        clip: [i32; 4],
+        mut color: impl FnMut(usize) -> Option<[u8; 4]>,
+    ) {
+        let width = pixmap.width() as i32;
+        let height = pixmap.height() as i32;
+        let x0 = clip[0].max(0);
+        let y0 = clip[1].max(0);
+        let x1 = clip[2].min(width);
+        let y1 = clip[3].min(height);
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                let Some(rgba) = color(glyph.metadata) else {
+                    continue;
+                };
+                let physical = glyph.physical((origin.0, origin.1 + run.line_y * scale), scale);
+                let base = Color::rgba(rgba[0], rgba[1], rgba[2], rgba[3]);
+                let data = pixmap.data_mut();
+                self.swash.with_pixels(
+                    &mut self.fonts,
+                    physical.cache_key,
+                    base,
+                    |gx, gy, pixel| {
+                        let px = physical.x + gx;
+                        let py = physical.y + gy;
+                        if px < x0 || py < y0 || px >= x1 || py >= y1 {
+                            return;
+                        }
+                        blend_premultiplied(
+                            data,
+                            (py as usize * width as usize + px as usize) * 4,
+                            pixel.r(),
+                            pixel.g(),
+                            pixel.b(),
+                            pixel.a(),
+                        );
+                    },
+                );
+            }
+        }
     }
 
     /// The font system, for callers that drive a cosmic-text [`Editor`].

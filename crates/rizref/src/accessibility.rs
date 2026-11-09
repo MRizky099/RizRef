@@ -49,8 +49,29 @@ const MINIMIZE_ID: u64 = 11;
 const MAXIMIZE_ID: u64 = 12;
 /// Close.
 const CLOSE_ID: u64 = 13;
+/// The ☰ main-menu button.
+const MAIN_MENU_ID: u64 = 14;
+/// The note chrome group (hover toolbar or edit pill).
+const NOTE_GROUP_ID: u64 = 6;
+/// The edited note's source, as a multi-line text value.
+const NOTE_SOURCE_ID: u64 = 7;
+/// First note-chrome button id.
+const FIRST_NOTE_BUTTON_ID: u64 = 30;
 /// First dynamically allocated menu node id.
 const FIRST_MENU_ID: u64 = 100;
+
+/// The note chrome as accessibility sees it: the visible buttons, by name
+/// and action, and the source text of a note being edited.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NoteControls {
+    /// Toolbar or edit-pill buttons, in visual order.
+    pub buttons: Vec<(&'static str, Action)>,
+    /// The markdown source while a note is being edited.
+    ///
+    /// Published read-only: a set-value request from an assistive tool is
+    /// not applied yet (documented gap; typing goes through the editor).
+    pub source: Option<String>,
+}
 
 /// The accessibility adapter and the node→action map for the published tree.
 pub struct Accessibility {
@@ -86,8 +107,10 @@ impl Accessibility {
         window: &Window,
         title_bar: &TitleBar,
         confirm_close: Option<&ConfirmClose>,
+        notes: &NoteControls,
     ) {
-        let (update, actions) = build_update(menus, status, window, title_bar, confirm_close);
+        let (update, actions) =
+            build_update(menus, status, window, title_bar, confirm_close, notes);
         self.actions = actions;
         self.adapter.update_if_active(|| update);
     }
@@ -114,6 +137,7 @@ fn build_update(
     window: &Window,
     title_bar: &TitleBar,
     confirm_close: Option<&ConfirmClose>,
+    notes: &NoteControls,
 ) -> (TreeUpdate, HashMap<u64, Action>) {
     let size = window.inner_size();
     let mut nodes: Vec<(NodeId, Node)> = Vec::new();
@@ -130,16 +154,48 @@ fn build_update(
     root.push_child(NodeId(TITLEBAR_ID));
     root.push_child(NodeId(MENUBAR_ID));
     root.push_child(NodeId(STATUS_ID));
+    if !notes.buttons.is_empty() || notes.source.is_some() {
+        root.push_child(NodeId(NOTE_GROUP_ID));
+    }
     if confirm_close.is_some() {
         root.push_child(NodeId(CONFIRM_ID));
     }
 
     let mut controls = Node::new(Role::Group);
     controls.set_label("Window controls");
-    for id in [PIN_ID, MINIMIZE_ID, MAXIMIZE_ID, CLOSE_ID] {
+    for id in [MAIN_MENU_ID, PIN_ID, MINIMIZE_ID, MAXIMIZE_ID, CLOSE_ID] {
         controls.push_child(NodeId(id));
     }
     nodes.push((NodeId(TITLEBAR_ID), controls));
+
+    let mut main_menu = Node::new(Role::Button);
+    main_menu.set_label("Main menu");
+    main_menu.add_action(A11yAction::Click);
+    actions.insert(MAIN_MENU_ID, Action::OpenMainMenu);
+    nodes.push((NodeId(MAIN_MENU_ID), main_menu));
+
+    if !notes.buttons.is_empty() || notes.source.is_some() {
+        let mut group = Node::new(Role::Toolbar);
+        group.set_label("Note controls");
+        if let Some(source) = &notes.source {
+            let mut editor = Node::new(Role::MultilineTextInput);
+            editor.set_label("Note source");
+            editor.set_value(source.as_str());
+            editor.set_read_only();
+            group.push_child(NodeId(NOTE_SOURCE_ID));
+            nodes.push((NodeId(NOTE_SOURCE_ID), editor));
+        }
+        for (index, (label, action)) in notes.buttons.iter().enumerate() {
+            let id = FIRST_NOTE_BUTTON_ID + index as u64;
+            let mut button = Node::new(Role::Button);
+            button.set_label(*label);
+            button.add_action(A11yAction::Click);
+            actions.insert(id, action.clone());
+            group.push_child(NodeId(id));
+            nodes.push((NodeId(id), button));
+        }
+        nodes.push((NodeId(NOTE_GROUP_ID), group));
+    }
 
     let mut pin = Node::new(Role::Switch);
     pin.set_label("Always on top");

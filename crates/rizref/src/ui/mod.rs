@@ -8,6 +8,7 @@
 //! costing a full-screen upload every mouse event.
 
 pub mod menu;
+pub mod note_color;
 pub mod paint;
 pub mod panels;
 pub mod start;
@@ -62,6 +63,10 @@ pub struct Shell {
     pub confirm_close: Option<panels::ConfirmClose>,
     /// The current toast, if any.
     pub toast: Option<Toast>,
+    /// The note background popover, if open.
+    pub note_color: Option<note_color::NoteColorPopover>,
+    /// The hover-toolbar tooltip: its text and logical anchor.
+    pub tooltip: Option<(String, DVec2)>,
     /// Whether the colour picker is armed.
     pub picker: bool,
     /// Whether item editing is locked.
@@ -82,6 +87,8 @@ impl Shell {
             settings: None,
             confirm_close: None,
             toast: None,
+            note_color: None,
+            tooltip: None,
             picker: false,
             locked: false,
             title_bar: titlebar::TitleBar::new(),
@@ -100,6 +107,8 @@ impl Shell {
         self.menu = None;
         self.shortcuts = None;
         self.settings = None;
+        self.note_color = None;
+        self.tooltip = None;
         self.picker = false;
         self.title_bar.hide();
         self.touch();
@@ -118,6 +127,7 @@ impl Shell {
     /// Whether any overlay currently owns input.
     pub fn has_overlay(&self) -> bool {
         self.menu.is_some()
+            || self.note_color.is_some()
             || self.shortcuts.is_some()
             || self.settings.is_some()
             || self.confirm_close.is_some()
@@ -160,6 +170,7 @@ impl Shell {
     /// Opens a menu and closes the other overlays.
     pub fn open_menu(&mut self, entries: Vec<menu::MenuEntry>, position: DVec2, viewport: DVec2) {
         self.menu = Some(menu::MenuState::open(entries, position, viewport));
+        self.note_color = None;
         self.shortcuts = None;
         self.settings = None;
         self.touch();
@@ -229,6 +240,7 @@ impl Shell {
     pub fn escape(&mut self) -> bool {
         let closed = self.confirm_close.take().is_some()
             || self.menu.take().is_some()
+            || self.note_color.take().is_some()
             || self.shortcuts.take().is_some()
             || self.settings.take().is_some();
         if closed {
@@ -334,6 +346,12 @@ impl UiLayer {
         {
             paint_picker_hint(&mut painter, viewport, cursor);
         }
+        if let Some((text, anchor)) = &shell.tooltip {
+            paint_tooltip(&mut painter, viewport, text, *anchor);
+        }
+        if let Some(popover) = &shell.note_color {
+            popover.paint(&mut painter);
+        }
         if let Some(menu) = &shell.menu {
             menu.paint(&mut painter);
         }
@@ -395,6 +413,17 @@ fn paint_mode_indicator(painter: &mut Painter, viewport: DVec2, modes: WindowMod
     );
     painter.fill_round_rect(pill, 6.0, [18, 18, 22, 220]);
     painter.text_centered(message, pill, pill.y + 5.0, 11.0, alpha);
+}
+
+/// Paints a small tooltip below `anchor`, kept inside the viewport.
+fn paint_tooltip(painter: &mut Painter, viewport: DVec2, text: &str, anchor: DVec2) {
+    let width = painter.measure(text, 11.0) + 16.0;
+    let x = (anchor.x as f32).clamp(4.0, (viewport.x as f32 - width - 4.0).max(4.0));
+    let y = (anchor.y as f32 + 6.0).min(viewport.y as f32 - 26.0);
+    let pill = UiRect::new(x, y, width, 22.0);
+    painter.fill_round_rect(pill, 5.0, [18, 18, 22, 235]);
+    painter.stroke_round_rect(pill, 5.0, 1.0, paint::PANEL_BORDER);
+    painter.text(text, x + 8.0, y + 5.0, 11.0, paint::TEXT);
 }
 
 /// Paints a toast at the bottom centre.
