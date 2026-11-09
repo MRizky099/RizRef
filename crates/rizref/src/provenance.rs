@@ -433,6 +433,17 @@ pub fn bytes_until_nul(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
+/// A text payload of unknown width: browsers write `text/x-moz-url` as
+/// UTF-16 and `text/uri-list` as either. A zero second byte means UTF-16
+/// (every URL starts with an ASCII scheme letter).
+pub fn text_payload(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[1] == 0 && bytes[0] != 0 {
+        utf16_until_nul(bytes)
+    } else {
+        bytes_until_nul(bytes)
+    }
+}
+
 /// The first URL of a `text/uri-list` (RFC 2483): lines starting with `#`
 /// are comments.
 pub fn first_uri(list: &str) -> Option<String> {
@@ -915,6 +926,17 @@ EndFragment:{end_fragment:010}
         assert_eq!(utf16_until_nul(&[0x68]), "", "an odd trailing byte is dropped");
         assert_eq!(bytes_until_nul(b"https://e.com/a\0junk"), "https://e.com/a");
         assert_eq!(bytes_until_nul(b"no terminator"), "no terminator");
+
+        let moz: Vec<u8> = "https://e.com/a.png\nA cat\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            moz_url(&text_payload(&moz)).as_deref(),
+            Some("https://e.com/a.png")
+        );
+        assert_eq!(text_payload(b"https://e.com/b\r\n\0"), "https://e.com/b\r\n");
+        assert_eq!(text_payload(b""), "");
     }
 
     #[test]

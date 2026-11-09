@@ -25,8 +25,10 @@
 //! stating the invariant that makes the call sound. Keeping that confined to
 //! this module is the point: the rest of the application stays safe Rust.
 
+pub mod clipboard_html;
 pub mod drop_target;
 pub mod imaging;
+pub mod launch;
 pub mod message_box;
 pub mod single_instance;
 pub mod window_modes;

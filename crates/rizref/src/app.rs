@@ -29,7 +29,7 @@ use glam::{DVec2, Vec2};
 use rizref_core::{
     Asset, AssetId, Camera, Item, ItemBody, ItemId, Rect, Scene, SceneId, Selection,
 };
-use rizref_format::{AssetOrigin, AssetProvenance, SaveMode, SaveRequest};
+use rizref_format::{AssetProvenance, SaveMode, SaveRequest};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -44,7 +44,7 @@ use crate::clipboard::{self, ClipboardContent};
 use crate::dialogs;
 use crate::document::Document;
 use crate::hud::HudSurface;
-use crate::import::{ImportOutcome, ImportPurpose, ImportRequest, Importer};
+use crate::import::{ImportOutcome, ImportPurpose, ImportRequest, ImportSource, Importer};
 use crate::input::{self, Button as InputButton, Command, Trigger};
 use crate::memory::DecodeCache;
 use crate::note::{self, NoteRenderer, NoteSession};
@@ -53,6 +53,7 @@ use crate::note_chrome::{
 };
 use crate::overlay::{self, OverlayState, OverlayVertex};
 use crate::placement;
+use crate::provenance;
 use crate::platform::window_modes::WindowModes;
 use crate::platform::{
     self, DropEvent, DropRegistration, SingleInstance, forward_args_to_primary,
@@ -1956,9 +1957,21 @@ impl App {
         let drop_world = self.drop_world();
         match clipboard::read() {
             Ok(ClipboardContent::Files(paths)) => self.import_paths(paths, drop_world),
-            Ok(ClipboardContent::Image { name, png }) => {
+            Ok(ClipboardContent::Image {
+                name,
+                png,
+                source_url,
+            }) => {
                 self.shell.set_mode(Mode::Canvas);
-                self.submit_import(ImportRequest::bytes(name, png, drop_world));
+                let source = ImportSource::bytes(name, png).with_source_url(source_url);
+                self.submit_import(ImportRequest::new(source, drop_world));
+            }
+            Err(clipboard::PasteError::LinkOnly) => {
+                tracing::info!("the clipboard holds HTML without pixels; nothing downloaded");
+                self.shell.toast(
+                    "The clipboard holds a link, not an image",
+                    Instant::now(),
+                );
             }
             Err(reason) => {
                 tracing::warn!(%reason, "nothing pasteable on the clipboard");
@@ -2003,7 +2016,20 @@ impl App {
     /// Turns one OLE drop into import requests around the drop point.
     fn apply_drop(&mut self, event: DropEvent) {
         let drop_world = self.world_from_physical(event.client_physical);
-        if !event.paths.is_empty() {
+        // The drop target attaches a URL only to a single-image drop. A
+        // browser drag that also wrote a cache file arrives as one path plus
+        // the URL; the importer then records the URL, not the cache path.
+        let source_url = event.source_url;
+        if let (Some(url), [path]) = (&source_url, event.paths.as_slice()) {
+            if looks_like_image(path) {
+                tracing::info!(path = %path.display(), url = %url, "browser drag with a source URL");
+                self.shell.set_mode(Mode::Canvas);
+                let source = ImportSource::path(path.clone()).with_source_url(Some(url.clone()));
+                self.submit_import(ImportRequest::new(source, drop_world));
+            } else {
+                self.import_paths(event.paths, drop_world);
+            }
+        } else if !event.paths.is_empty() {
             self.import_paths(event.paths, drop_world);
         }
         for file in event.virtual_files {
@@ -2017,7 +2043,10 @@ impl App {
                 ?drop_world,
                 "virtual file dropped"
             );
-            self.submit_import(ImportRequest::bytes(file.name, file.bytes, drop_world));
+            self.shell.set_mode(Mode::Canvas);
+            let source =
+                ImportSource::bytes(file.name, file.bytes).with_source_url(source_url.clone());
+            self.submit_import(ImportRequest::new(source, drop_world));
         }
         self.redraw();
     }
@@ -2087,20 +2116,16 @@ impl App {
             asset = asset.with_animation(animation);
         }
         let encoded_len = asset.encoded().len();
-        let source_path = imported.source_path.clone();
+        let record = provenance::record_for(&provenance::ImportProvenance {
+            source_path: imported
+                .source_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            source_url: imported.source_url.clone(),
+        });
         let (asset_id, was_new) = self.board.scene_mut().insert_asset(asset);
-        self.provenance.insert(
-            asset_id,
-            AssetProvenance {
-                origin: if source_path.is_some() {
-                    AssetOrigin::File
-                } else {
-                    AssetOrigin::Clipboard
-                },
-                source_path: source_path.map(|path| path.display().to_string()),
-                source_url: None,
-            },
-        );
+        let merged = provenance::merge(self.provenance.get(&asset_id), record);
+        self.provenance.insert(asset_id, merged);
         if was_new {
             tracing::info!(
                 asset = %asset_id,
