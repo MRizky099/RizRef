@@ -53,15 +53,25 @@ contract: [`format.md` → scene document](format.md) (`origin`, `source_path`,
   appended saves (local path, web URL, a hostile `javascript:` URL kept verbatim, and an
   asset without a record) and a v1 asset entry without provenance members loading and
   re-saving without them.
-- Tests: 627 workspace tests pass (3 ignored), up from 571; clippy `-D warnings` and fmt
-  clean; no dependency changes and no new `-sys` crate. The app launches cleanly.
-- Deferred: the manual browser matrix (drag and copy/paste from Chrome, Edge and
-  Firefox, a PNG-only payload, a multi-file drop, the HTML-only clipboard toast) and a
-  hand click-through of the dialog and the Explorer/browser launches were not run —
-  they need an interactive desktop, so only the parsers, planners and widgets are
-  covered by unit tests. `CF_DIBV5`-only drags stay unsupported, as planned. An OS drop
-  while the info dialog is open still imports behind it, as it does behind the close
-  guard.
+- Fixes found by hand testing: a left-button release always resolved to `EndPan` and
+  never reached `Board::pointer_up`, so a clicked item stayed stuck to the cursor and
+  could not be deselected (a phase 04 bug; the release now ends the pan and the board
+  gesture). Explorer `/select` with an 8.3 short path (`MRIZKY~1`) opened the folder
+  without selecting the file; paths are expanded with `GetLongPathNameW` first. The
+  info dialog's keyboard hint overlapped the buttons in a small window; it now shortens.
+- Tests: 629 workspace tests pass (3 ignored), up from 571; clippy `-D warnings` and fmt
+  clean; no dependency changes and no new `-sys` crate.
+- Hand-tested with Edge on Windows 10: copy image → `Ctrl+V` records the `<img src>`
+  URL (origin `clipboard`); dragging the image delivers a virtual `images.jpg` and
+  records the same URL; Image info shows every field, Copy URL copies the full URL,
+  Open URL opens it in the browser; Open file location selects a file whose folder and
+  name contain spaces, commas and `&`; click, drag-move and click-to-deselect work.
+- Deferred: the rest of the browser matrix (Chrome, Firefox, a PNG-only payload, a
+  multi-file drop, the HTML-only clipboard toast) was not run by hand; those paths are
+  covered by the parser and planner unit tests only. In the default 600 × 400 window
+  the info dialog clips its last row (Group) rather than growing. `CF_DIBV5`-only drags
+  stay unsupported, as planned. An OS drop while the info dialog is open still imports
+  behind it, as it does behind the close guard.
 
 ## Phase 06a — Markdown notes (done)
 
