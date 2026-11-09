@@ -10,7 +10,6 @@
 //! asset's identity (BLAKE3), its provenance, and later the BLOB a `.rizref`
 //! file stores, so re-encoding them anywhere on this path would be a bug.
 
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -262,13 +261,12 @@ fn process(request: ImportRequest) -> ImportOutcome {
     } = request;
     let label = source.label.clone();
 
-    let result =
-        std::panic::catch_unwind(AssertUnwindSafe(|| import(&source))).unwrap_or_else(|payload| {
-            Err(ImportError {
-                label: label.clone(),
-                reason: format!("decoder panicked: {}", panic_message(payload.as_ref())),
-            })
-        });
+    let result = crate::contain::contain(|| import(&source)).unwrap_or_else(|message| {
+        Err(ImportError {
+            label: label.clone(),
+            reason: format!("decoder panicked: {message}"),
+        })
+    });
 
     let latency = queued_at.elapsed();
     match &result {
@@ -433,16 +431,6 @@ fn format_for(bytes: &[u8], path: Option<&Path>) -> Option<ImageFormat> {
             .and_then(|extension| extension.to_str())
             .and_then(ImageFormat::from_extension)
     })
-}
-
-fn panic_message(payload: &dyn std::any::Any) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_owned()
-    }
 }
 
 #[cfg(test)]
