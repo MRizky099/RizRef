@@ -30,7 +30,10 @@ and a UIA accessibility tree) and phase 06 (the complete `.rizref` container: he
 chunk stream, JSON scene document, content-addressed image blobs, asset previews,
 board thumbnails, atomic fresh saves, incremental appends, recovery and compaction,
 `rizref inspect --verify`, and Save/Open/Export wiring in the application) have
-landed. The workspace builds, tests and lints clean.
+landed. Phase 06a (markdown notes: rendered rich text, inline/display math, note
+chrome and additive `.rizref` note fields) and phase 06b (image provenance: open file
+location or image URL, image info dialog, browser source-URL capture) are planned next,
+before phase 07. The workspace builds, tests and lints clean.
 
 ## Design principles
 
@@ -90,8 +93,8 @@ between crates. These are the pinned versions:
 | Native dialogs | `rfd` | 0.17.2 | COM `IFileDialog` FFI |
 | Import workers | `crossbeam-channel` | 0.5.17 | pure Rust, no async runtime |
 | Serialization | `serde` / `serde_json` | 1.0.229 / 1.0.154 | pure Rust |
-| Compression | `lz4_flex` | 0.14.0 | pure Rust |asset identity and container checksums
-| Hashing | `blake3` | 1.8.7 | `features = ["pure"]` — see below |
+| Compression | `lz4_flex` | 0.14.0 | pure Rust |
+| Hashing | `blake3` | 1.8.7 | asset identity and container checksums; `features = ["pure"]` — see below |
 | Logging | `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | pure Rust |
 | Platform FFI | `windows` | 0.62.2 | Win32/COM declarations: mutex, pipe, dialogs, OLE drop target |
 | COM support | `windows-core` | 0.62.2 | required by the `#[implement]` macro; pure Rust |
