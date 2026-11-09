@@ -18,8 +18,18 @@
 //! Textures are content-addressed (`rizref-note-v2`): the id hashes everything
 //! that changes pixels, so identical notes share one GPU texture and an edited
 //! note simply gets a new id.
+//!
+//! Phase 07 performance: the text, decorations and equations of a markdown
+//! note are painted once into a cached layer (keyed by source, wrap width,
+//! density and palette) and blitted onto a freshly drawn card, so a re-render
+//! that keeps the wrap width costs the card and a copy; the card is drawn
+//! analytically and the straight-alpha conversion is table-driven. Renders run
+//! on the note worker (`note_worker`), never on the UI thread, except the
+//! live editor's.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use cosmic_text::{
     Action, Attrs, Buffer, Cursor, Edit as _, Editor, Metrics, Selection as TextSelection, Shaping,
@@ -28,7 +38,7 @@ use cosmic_text::{
 use glam::Vec2;
 use rizref_codecs::ImageBuffer;
 use rizref_core::{AssetId, Item, ItemId, NoteContent, NoteFormat, checksum};
-use tiny_skia::{Color, FillRule, Paint as SkPaint, Path, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{Color, FillRule, Paint as SkPaint, Path, PathBuilder, Pixmap, Transform};
 
 use crate::markdown::layout::{BASE_FONT_SIZE, Fill, NoteLayout, Paint, layout};
 use crate::markdown::math::MathCache;
@@ -273,11 +283,68 @@ fn texture_size(size: Vec2, pixels_per_world: f32) -> (u32, u32) {
     )
 }
 
-/// Parsed-and-laid-out notes plus the math cache, shared by every note.
+/// Bytes of rasterised text layers kept for re-renders.
+const LAYER_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// What a rasterised text layer depends on: the source, how it wraps, the
+/// texture density and the palette (auto-contrast ink follows the
+/// background). The box size is not part of it — a resize that keeps the
+/// wrap width re-uses the layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LayerKey {
+    source: u64,
+    source_len: usize,
+    wrap: u32,
+    density: u32,
+    background: [u8; 3],
+}
+
+/// A markdown note's text, math and decorations, painted once onto a
+/// transparent premultiplied pixmap. `origin` is the integer pixel the
+/// layer's top-left goes to in the note texture; the fractional part of the
+/// padding is baked into the layer, so the blit is an exact copy.
+struct TextLayer {
+    pixmap: Pixmap,
+    origin: i32,
+    /// Per row, the `[first, last)` columns holding any ink: most rows are
+    /// the gaps between lines, and the blit skips them outright.
+    spans: Vec<(u32, u32)>,
+}
+
+/// The inked column range of every row of `pixmap`; `(0, 0)` for an empty row.
+fn ink_spans(pixmap: &Pixmap) -> Vec<(u32, u32)> {
+    let width = pixmap.width() as usize;
+    pixmap
+        .data()
+        .chunks_exact(width * 4)
+        .map(|row| {
+            let pixels = row.as_chunks::<4>().0;
+            let inked = |pixel: &[u8; 4]| pixel[3] != 0;
+            match pixels.iter().position(inked) {
+                Some(first) => {
+                    let last = pixels.iter().rposition(inked).unwrap_or(first);
+                    (first as u32, last as u32 + 1)
+                }
+                None => (0, 0),
+            }
+        })
+        .collect()
+}
+
+/// Parsed-and-laid-out notes, the math cache and the rasterised text layers,
+/// shared by every note.
+///
+/// Phase 07: a re-render of an unchanged note — a resize that keeps the wrap
+/// width, a background change of another note, a texture evicted and wanted
+/// again — blits the cached text layer onto a fresh card instead of
+/// re-painting every glyph and equation (35 ms for 4,000 characters before).
 #[derive(Default)]
 pub struct NoteRenderer {
     math: MathCache,
     layouts: HashMap<(String, u32), NoteLayout>,
+    layers: HashMap<LayerKey, (u64, Arc<TextLayer>)>,
+    layer_bytes: usize,
+    layer_clock: u64,
 }
 
 impl NoteRenderer {
@@ -362,26 +429,150 @@ impl NoteRenderer {
                 ink,
             ),
             (None, NoteFormat::Markdown) => {
-                let wrap = wrap_width(content, size);
-                // Split the borrow: the layout lives in `self.layouts`, the
-                // math masks in `self.math`.
-                let key = (content.text.clone(), wrap.to_bits());
-                self.layout(engine, &content.text, wrap);
-                let laid_out = &self.layouts[&key];
-                paint_layout(
-                    engine,
-                    &mut self.math,
-                    &mut pixmap,
-                    laid_out,
-                    &colours,
-                    padding,
-                    pixels_per_world,
-                    clip,
-                );
+                let layer = self.text_layer(engine, content, size, pixels_per_world, &colours);
+                if let Some(layer) = layer {
+                    blit(&mut pixmap, &layer.pixmap, &layer.spans, layer.origin, clip);
+                }
             }
         }
 
         ImageBuffer::from_rgba(width, height, straight_rgba(&pixmap))
+    }
+}
+
+impl NoteRenderer {
+    /// The cached text layer for a markdown note, painting it on a miss.
+    fn text_layer(
+        &mut self,
+        engine: &mut TextEngine,
+        content: &NoteContent,
+        size: Vec2,
+        pixels_per_world: f32,
+        colours: &NotePalette,
+    ) -> Option<Arc<TextLayer>> {
+        let wrap = wrap_width(content, size);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        content.text.hash(&mut hasher);
+        let key = LayerKey {
+            source: hasher.finish(),
+            source_len: content.text.len(),
+            wrap: wrap.to_bits(),
+            density: pixels_per_world.to_bits(),
+            background: colours.background,
+        };
+        self.layer_clock += 1;
+        let now = self.layer_clock;
+        if let Some((used, layer)) = self.layers.get_mut(&key) {
+            *used = now;
+            return Some(Arc::clone(layer));
+        }
+
+        // Split the borrow: the layout lives in `self.layouts`, the math
+        // masks in `self.math`.
+        let layout_key = (content.text.clone(), wrap.to_bits());
+        self.layout(engine, &content.text, wrap);
+        let laid_out = &self.layouts[&layout_key];
+        let padding = NOTE_PADDING * pixels_per_world;
+        let origin = padding.floor();
+        let fraction = padding - origin;
+        // Everything the layout draws lies within its wrap width and height;
+        // the slack covers italic overhang and a trailing equation.
+        let slack = 8.0 * pixels_per_world;
+        let width = (wrap * pixels_per_world + fraction + slack)
+            .ceil()
+            .clamp(1.0, NOTE_MAX_SIDE * 2.0) as u32;
+        let height = (laid_out.height * pixels_per_world + fraction + slack)
+            .ceil()
+            .clamp(1.0, NOTE_MAX_SIDE * 8.0) as u32;
+        let mut pixmap = Pixmap::new(width, height)?;
+        paint_layout(
+            engine,
+            &mut self.math,
+            &mut pixmap,
+            laid_out,
+            colours,
+            fraction,
+            pixels_per_world,
+            [0, 0, width as i32, height as i32],
+        );
+        let spans = ink_spans(&pixmap);
+        let layer = Arc::new(TextLayer {
+            pixmap,
+            origin: origin as i32,
+            spans,
+        });
+
+        let bytes = layer.pixmap.data().len();
+        while self.layer_bytes + bytes > LAYER_CACHE_BYTES && !self.layers.is_empty() {
+            let oldest = self
+                .layers
+                .iter()
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(key, _)| *key)
+                .expect("non-empty");
+            if let Some((_, gone)) = self.layers.remove(&oldest) {
+                self.layer_bytes -= gone.pixmap.data().len();
+            }
+        }
+        self.layer_bytes += bytes;
+        self.layers.insert(key, (now, Arc::clone(&layer)));
+        Some(layer)
+    }
+
+    /// Number of cached text layers.
+    #[cfg(test)]
+    fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+}
+
+/// Composites premultiplied `layer` over `pixmap` with its top-left at
+/// `(origin, origin)`, inside `clip` — an integer copy, never resampled.
+fn blit(pixmap: &mut Pixmap, layer: &Pixmap, spans: &[(u32, u32)], origin: i32, clip: [i32; 4]) {
+    let target_width = pixmap.width() as i32;
+    let target_height = pixmap.height() as i32;
+    let x0 = clip[0].max(0).max(origin);
+    let y0 = clip[1].max(0).max(origin);
+    let x1 = clip[2].min(target_width).min(origin + layer.width() as i32);
+    let y1 = clip[3]
+        .min(target_height)
+        .min(origin + layer.height() as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let source = layer.data();
+    let source_width = layer.width() as usize;
+    let data = pixmap.data_mut();
+    for y in y0..y1 {
+        let (first, last) = spans
+            .get((y - origin) as usize)
+            .copied()
+            .unwrap_or((0, layer.width()));
+        if first >= last {
+            continue;
+        }
+        let source_row = (y - origin) as usize * source_width;
+        let target_row = y as usize * target_width as usize;
+        let row_start = x0.max(origin + first as i32);
+        let row_end = x1.min(origin + last as i32);
+        for x in row_start..row_end {
+            let s = (source_row + (x - origin) as usize) * 4;
+            let alpha = source[s + 3];
+            if alpha == 0 {
+                continue;
+            }
+            let d = (target_row + x as usize) * 4;
+            if alpha == 255 {
+                data[d..d + 4].copy_from_slice(&source[s..s + 4]);
+                continue;
+            }
+            let inverse = 255 - u32::from(alpha);
+            for channel in 0..4 {
+                let under = u32::from(data[d + channel]);
+                data[d + channel] =
+                    (u32::from(source[s + channel]) + (under * inverse + 127) / 255).min(255) as u8;
+            }
+        }
     }
 }
 
@@ -605,6 +796,40 @@ fn blend(data: &mut [u8], offset: usize, colour: [u8; 4], alpha: u8) {
     data[offset + 3] = (alpha + u16::from(data[offset + 3]) * inverse / 255).min(255) as u8;
 }
 
+/// Longest side of a note's placeholder and of its low-resolution copy.
+pub const NOTE_LOW_SIDE: f32 = 256.0;
+
+/// The card alone — background and border, no text — at a low density: what
+/// a note shows for the moment between appearing and its worker render
+/// arriving. Costs well under a millisecond, so it is safe on the UI thread.
+pub fn render_placeholder(content: &NoteContent, size: Vec2) -> Option<ImageBuffer> {
+    let density = (NOTE_LOW_SIDE / size.x.max(size.y).max(1.0)).min(NOTE_SUPERSAMPLE);
+    let (width, height) = texture_size(size, density);
+    let mut pixmap = Pixmap::new(width, height)?;
+    draw_background(&mut pixmap, density, &palette(content));
+    ImageBuffer::from_rgba(width, height, straight_rgba(&pixmap))
+}
+
+/// A note texture downscaled to [`NOTE_LOW_SIDE`]: kept on the CPU so an
+/// evicted note can show it, slightly soft, until its full texture is back.
+pub fn low_resolution(image: &ImageBuffer) -> ImageBuffer {
+    match rizref_core::fit_to_side(image, NOTE_LOW_SIDE as u32) {
+        rizref_core::Fitted::Original(original) => original.clone(),
+        rizref_core::Fitted::Resized(resized) => resized,
+    }
+}
+
+/// A texture id derived from `texture` for one of its stand-ins (`tag`
+/// names which), so a placeholder or low-resolution copy never shares an id
+/// with a full render.
+pub fn derived_texture_id(texture: AssetId, tag: &[u8]) -> AssetId {
+    let mut bytes = Vec::with_capacity(48);
+    bytes.extend_from_slice(b"rizref-note-derived\0");
+    bytes.extend_from_slice(tag);
+    bytes.extend_from_slice(texture.as_bytes());
+    AssetId::from_checksum(checksum(&bytes))
+}
+
 /// The content-addressed texture id for a note.
 pub fn texture_id(content: &NoteContent, size: Vec2, pixels_per_world: f32) -> AssetId {
     let mut bytes = Vec::with_capacity(content.text.len() + 48);
@@ -624,44 +849,96 @@ pub fn texture_id(content: &NoteContent, size: Vec2, pixels_per_world: f32) -> A
 }
 
 /// Paints the rounded card and its border.
+///
+/// Drawn analytically rather than through tiny-skia's anti-aliased path
+/// fill and stroke, which cost 33 ms for a 626 x 2048 card — most of a warm
+/// re-render. Interior runs of each row are a plain fill; only pixels near
+/// the outline evaluate the rounded rectangle's signed distance, which gives
+/// the same anti-aliased edge (coverage = distance clamped to one pixel).
 fn draw_background(pixmap: &mut Pixmap, pixels_per_world: f32, colours: &NotePalette) {
-    let width = pixmap.width() as f32;
-    let height = pixmap.height() as f32;
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
     let inset = (pixels_per_world * 1.5).max(1.0);
-    let Some(rect) = tiny_skia::Rect::from_xywh(
-        inset,
-        inset,
-        (width - 2.0 * inset).max(1.0),
-        (height - 2.0 * inset).max(1.0),
-    ) else {
-        return;
+    let rect_w = (width as f32 - 2.0 * inset).max(1.0);
+    let rect_h = (height as f32 - 2.0 * inset).max(1.0);
+    let radius = (NOTE_RADIUS * pixels_per_world)
+        .min(rect_w.min(rect_h) * 0.5)
+        .max(0.0);
+    let half_border = (1.5 * pixels_per_world).max(1.0) * 0.5;
+    let centre = (inset + rect_w * 0.5, inset + rect_h * 0.5);
+    let half = (rect_w * 0.5, rect_h * 0.5);
+
+    let premultiply = |rgb: [u8; 3], alpha: u8| -> [u8; 4] {
+        let a = u16::from(alpha);
+        [
+            ((u16::from(rgb[0]) * a + 127) / 255) as u8,
+            ((u16::from(rgb[1]) * a + 127) / 255) as u8,
+            ((u16::from(rgb[2]) * a + 127) / 255) as u8,
+            alpha,
+        ]
     };
-    let radius = (NOTE_RADIUS * pixels_per_world).min(rect.width().min(rect.height()) * 0.5);
-    let Some(path) = rounded_rect(rect, radius) else {
-        return;
+    let card = premultiply(colours.background, CARD_ALPHA);
+    let border = colours.border;
+
+    // Signed distance from a pixel centre to the rounded rectangle's edge,
+    // negative inside.
+    let distance = |x: f32, y: f32| -> f32 {
+        let qx = (x - centre.0).abs() - (half.0 - radius);
+        let qy = (y - centre.1).abs() - (half.1 - radius);
+        let outside = qx.max(0.0).hypot(qy.max(0.0));
+        outside + qx.max(qy).min(0.0) - radius
+    };
+    // One pixel of the card at signed distance `d`: the fill, then the
+    // border stroke centred on the edge over it (source-over, premultiplied).
+    let shade = |d: f32| -> [u8; 4] {
+        let fill = (0.5 - d).clamp(0.0, 1.0);
+        let stroke = (half_border + 0.5 - d.abs()).clamp(0.0, 1.0);
+        let mut out = [0.0_f32; 4];
+        for channel in 0..4 {
+            out[channel] = f32::from(card[channel]) * fill;
+        }
+        let a = stroke;
+        for channel in 0..3 {
+            out[channel] = f32::from(border[channel]) * a + out[channel] * (1.0 - a);
+        }
+        out[3] = 255.0 * a + out[3] * (1.0 - a);
+        out.map(|value| value.round().clamp(0.0, 255.0) as u8)
     };
 
-    let mut paint = SkPaint {
-        anti_alias: true,
-        ..SkPaint::default()
-    };
-    let [r, g, b] = colours.background;
-    paint.set_color(Color::from_rgba8(r, g, b, CARD_ALPHA));
-    pixmap.fill_path(
-        &path,
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
-
-    let [r, g, b] = colours.border;
-    paint.set_color(Color::from_rgba8(r, g, b, 255));
-    let stroke = Stroke {
-        width: (1.5 * pixels_per_world).max(1.0),
-        ..Stroke::default()
-    };
-    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    // Pixels farther than this inside the edge are plain card.
+    let solid = half_border + 1.0;
+    // One row of plain card, copied in a single memcpy per row.
+    let card_row: Vec<u8> = card.iter().copied().cycle().take(width * 4).collect();
+    let data = pixmap.data_mut();
+    for y in 0..height {
+        let py = y as f32 + 0.5;
+        let row = &mut data[y * width * 4..(y + 1) * width * 4];
+        // Away from the corner rows, the edge is the rectangle's side: the
+        // interior run between the side bands is plain card.
+        let in_straight_rows = (py - centre.1).abs() <= half.1 - radius - solid;
+        let (run_start, run_end) = if in_straight_rows {
+            (
+                (inset + solid).ceil() as usize,
+                ((inset + rect_w - solid).floor() as usize).min(width),
+            )
+        } else {
+            (0, 0)
+        };
+        if run_end > run_start {
+            row[run_start * 4..run_end * 4].copy_from_slice(&card_row[run_start * 4..run_end * 4]);
+        }
+        for x in 0..width {
+            if x >= run_start && x < run_end {
+                continue;
+            }
+            let pixel = &mut row[x * 4..x * 4 + 4];
+            let d = distance(x as f32 + 0.5, py);
+            if d > half_border + 0.5 {
+                continue;
+            }
+            pixel.copy_from_slice(&shade(d));
+        }
+    }
 }
 
 /// Builds a rounded rectangle path.
@@ -683,19 +960,43 @@ fn rounded_rect(rect: tiny_skia::Rect, radius: f32) -> Option<Path> {
 }
 
 /// Converts tiny-skia's premultiplied pixels to straight-alpha RGBA.
+///
+/// Through a table of every `(alpha, channel)` result, built once: the
+/// per-channel division cost 17 ms on a 626 x 2048 note. The table holds the
+/// exact rounded quotient, so the output is unchanged.
 fn straight_rgba(pixmap: &Pixmap) -> Vec<u8> {
+    static TABLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = vec![0_u8; 256 * 256];
+        for alpha in 1..256_u16 {
+            for channel in 0..256_u16 {
+                table[usize::from(alpha) * 256 + usize::from(channel)] =
+                    ((channel * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+        table
+    });
     let mut out = pixmap.data().to_vec();
+    // A card is mostly one colour: a pixel equal to the previous input takes
+    // the previous output without a lookup.
+    let (mut last_in, mut last_out) = ([0_u8; 4], [0_u8; 4]);
     for pixel in out.as_chunks_mut::<4>().0 {
-        let alpha = u16::from(pixel[3]);
-        match alpha {
+        if *pixel == last_in {
+            *pixel = last_out;
+            continue;
+        }
+        last_in = *pixel;
+        match pixel[3] {
             0 => pixel[..3].fill(0),
             255 => {}
-            _ => {
+            alpha => {
+                let row = &table[usize::from(alpha) * 256..usize::from(alpha) * 256 + 256];
                 for channel in pixel.iter_mut().take(3) {
-                    *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+                    *channel = row[usize::from(*channel)];
                 }
             }
         }
+        last_out = *pixel;
     }
     out
 }
@@ -870,6 +1171,99 @@ mod tests {
     }
 
     #[test]
+    fn a_resize_that_keeps_the_wrap_reuses_the_painted_layer() {
+        let mut engine = TextEngine::new();
+        let mut renderer = NoteRenderer::new();
+        let mut note = content(&"Some **bold** words that wrap. ".repeat(10), None);
+        note.wrap_width = Some(200.0);
+
+        let small = renderer
+            .render(&mut engine, &note, Vec2::new(228.0, 300.0), None)
+            .expect("renders");
+        assert_eq!(renderer.layer_count(), 1);
+        let large = renderer
+            .render(&mut engine, &note, Vec2::new(400.0, 500.0), None)
+            .expect("renders");
+        assert_eq!(
+            renderer.layer_count(),
+            1,
+            "same wrap and density: one layer"
+        );
+
+        // The text sits at the same pixels in both: compare a band of the
+        // first line, inside the smaller card.
+        let density = pixels_per_world(Vec2::new(228.0, 300.0));
+        assert_eq!(density, pixels_per_world(Vec2::new(400.0, 500.0)));
+        let row = ((NOTE_PADDING + 8.0) * density) as u32;
+        let band = |image: &ImageBuffer| {
+            let start = ((row * image.width()) * 4) as usize;
+            let len = (150.0 * density) as usize * 4;
+            image.pixels()[start..start + len].to_vec()
+        };
+        assert_eq!(band(&small), band(&large));
+        assert_ne!(
+            band(&small).iter().max(),
+            band(&small).iter().min(),
+            "the band holds text, not just card"
+        );
+    }
+
+    #[test]
+    fn the_layer_cache_matches_a_direct_paint() {
+        // The cached path blits a layer painted at the padding's fraction;
+        // it must match painting straight into the card.
+        let mut engine = TextEngine::new();
+        let mut renderer = NoteRenderer::new();
+        let note = content("# Title\n\nSome *text* and $x^2$ here.", Some([30, 30, 60]));
+        let size = Vec2::new(300.0, 160.0);
+        let cached = renderer
+            .render(&mut engine, &note, size, None)
+            .expect("renders");
+
+        let density = pixels_per_world(size);
+        let (width, height) = super::texture_size(size, density);
+        let colours = super::palette(&note);
+        let mut direct = tiny_skia::Pixmap::new(width, height).expect("pixmap");
+        super::draw_background(&mut direct, density, &colours);
+        let padding = NOTE_PADDING * density;
+        let clip = [
+            padding.floor() as i32,
+            padding.floor() as i32,
+            (width as f32 - padding).ceil() as i32,
+            (height as f32 - padding).ceil() as i32,
+        ];
+        let wrap = super::wrap_width(&note, size);
+        let key = (note.text.clone(), wrap.to_bits());
+        let mut fresh = NoteRenderer::new();
+        fresh.layout(&mut engine, &note.text, wrap);
+        let laid_out = &fresh.layouts[&key];
+        let mut math = crate::markdown::math::MathCache::default();
+        super::paint_layout(
+            &mut engine,
+            &mut math,
+            &mut direct,
+            laid_out,
+            &colours,
+            padding,
+            density,
+            clip,
+        );
+        let direct = super::straight_rgba(&direct);
+
+        let differing = cached
+            .pixels()
+            .iter()
+            .zip(&direct)
+            .filter(|(a, b)| a.abs_diff(**b) > 2)
+            .count();
+        assert!(
+            differing * 1000 < direct.len(),
+            "{differing} of {} bytes differ by more than rounding",
+            direct.len()
+        );
+    }
+
+    #[test]
     fn plain_notes_keep_the_phase_04_path() {
         let mut engine = TextEngine::new();
         let mut renderer = NoteRenderer::new();
@@ -960,15 +1354,23 @@ mod tests {
         assert!(warm > 0, "the caret is visible at the text origin");
     }
 
-    /// The phase-06a budgets, measured rather than asserted (timings vary by
-    /// machine). Run with
+    /// The note budgets (phase 06a, met in phase 07), measured rather than
+    /// asserted (timings vary by machine). Run with
     /// `cargo test -p rizref --release -- --ignored --nocapture note_budgets`.
     #[test]
     #[ignore = "a timing report, not a correctness check"]
     fn note_budgets() {
-        use std::time::Instant;
-        let mut engine = TextEngine::new();
-        let mut renderer = NoteRenderer::new();
+        use std::time::{Duration, Instant};
+        let best = |runs: u32, mut work: Box<dyn FnMut() + '_>| {
+            (0..runs)
+                .map(|_| {
+                    let start = Instant::now();
+                    work();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap_or(Duration::ZERO)
+        };
         let paragraph = "Some **bold** text, *italic* text, `code` and a [link](x). ";
         let mut source = String::from("# Study notes\n\n");
         while source.len() < 4000 {
@@ -979,17 +1381,30 @@ mod tests {
         note.wrap_width = Some(400.0);
         let size = Vec2::new(428.0, 1400.0);
 
+        // Cold: a fresh renderer (no layout, no masks, no layer).
+        let mut engine = TextEngine::new();
+        let mut renderer = NoteRenderer::new();
         let start = Instant::now();
         renderer.layout(&mut engine, &note.text, 400.0);
         let cold_layout = start.elapsed();
-        renderer.render(&mut engine, &note, size, None);
         let start = Instant::now();
         renderer.render(&mut engine, &note, size, None);
-        let warm_render = start.elapsed();
-        let start = Instant::now();
+        let cold_paint = start.elapsed();
+        // Warm: the same note again (an evicted texture coming back), and a
+        // resize that keeps the wrap width.
+        let warm_render = best(
+            5,
+            Box::new(|| {
+                renderer.render(&mut engine, &note, size, None);
+            }),
+        );
         let resized = Vec2::new(600.0, 900.0);
-        let _ = renderer.layout(&mut engine, &note.text, super::wrap_width(&note, resized));
-        let resize_layout = start.elapsed();
+        let resize_render = best(
+            5,
+            Box::new(|| {
+                renderer.render(&mut engine, &note, resized, None);
+            }),
+        );
 
         let maths: String = (0..20)
             .map(|i| format!("$x_{i}^2 + \\frac{{{i}}}{{y}}$ "))
@@ -999,14 +1414,26 @@ mod tests {
         let start = Instant::now();
         renderer.render(&mut engine, &maths, math_size, None);
         let math_cold = start.elapsed();
-        let start = Instant::now();
-        renderer.render(&mut engine, &maths, math_size, None);
-        let math_warm = start.elapsed();
+        let math_warm = best(
+            5,
+            Box::new(|| {
+                renderer.render(&mut engine, &maths, math_size, None);
+            }),
+        );
+
+        // What the UI thread pays for a note whose render is on the worker.
+        let placeholder = best(
+            5,
+            Box::new(|| {
+                super::render_placeholder(&note, size);
+            }),
+        );
 
         println!(
-            "4,000-char note: cold layout {cold_layout:?}, warm re-render {warm_render:?}; \
-             resize (layout cache hit) {resize_layout:?}; 20 equations: cold {math_cold:?}, \
-             cached {math_warm:?}"
+            "4,000-char note: cold layout {cold_layout:?}, cold paint {cold_paint:?}, \
+             warm re-render {warm_render:?}, resize re-render {resize_render:?}; \
+             20 equations: cold {math_cold:?}, warm {math_warm:?}; \
+             UI-thread placeholder {placeholder:?}"
         );
     }
 }

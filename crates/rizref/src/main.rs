@@ -43,6 +43,7 @@ mod markdown;
 mod memory;
 mod note;
 mod note_chrome;
+mod note_worker;
 mod overlay;
 mod paths;
 mod perf;

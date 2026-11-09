@@ -147,6 +147,34 @@ Reliability:
     drops a relative entry that does not resolve to a board.
   - A failed import was logged twice, by the worker and by the application; the
     worker's line is debug now. A failed full-resolution decode is a warning.
+  - Sixth run: the two note budgets phase 06a deferred are met.
+    - Rendering: the text, decorations and equations of a markdown note are painted
+      once into a cached layer (keyed by source hash, wrap width, density and
+      palette; 64 MiB) and blitted onto a fresh card; the card is drawn analytically
+      (tiny-skia's anti-aliased path fill and stroke took 33 ms of a 626 x 2048
+      card) and the straight-alpha conversion is table-driven (17 ms before).
+    - Off the UI thread: every note render except the live editor's runs on a note
+      worker with its own font system; requests coalesce per note, a panic is
+      contained, and the note shows its last texture or a card-only placeholder
+      (0.11 ms) meanwhile. Notes more than half a viewport away are not rendered.
+    - Budget: full-resolution note textures stay within 64 MiB; off-screen notes,
+      least recently seen first, drop to a 256 px copy kept from their last render
+      and come back sharp, without a blank frame, when they return.
+    - Measured with `note_budgets` (release, reference laptop), before (`32892e0`)
+      and after: warm re-render of a 4,000-character note 61.1 ms to **7.1 ms**
+      (budget 8 ms); a resize that keeps the wrap width 11.7 ms (it re-used
+      the layout before but repainted everything); 20 equations cold 35.7 ms to
+      14.3 ms and cached 26.3 ms to 4.0 ms; cold layout ~100 ms, unchanged but
+      on the worker. A board of four 3.8k-character notes with 20 equations each
+      reaches its first interactive frame in 252 to 340 ms instead of 557 to 764
+      ms (`--bench-frames`, three runs each); steady pan/zoom frame work is
+      unchanged (p95 0.7 ms).
+  - Menu items publish their shortcut as AccessKit `keyboard_shortcut`, from the
+    live table, so a rebinding shows up. UIA `AcceleratorKey` still reads empty:
+    no `accesskit_windows` release (0.32.1 here, 0.35.2 newest) maps any node
+    property to it, so the shortcut also stays in the description, which Narrator
+    reads as the full description. Tests: Save gives `Ctrl+S`, and a rebound Undo
+    gives the new chord.
   - The colour picker: no path was found by which it drops the next key or the
     dirty mark (it changes neither selection nor history, and the dirty mark comes
     from the board's effects); not reproduced, left unchanged.
@@ -170,7 +198,7 @@ Packaging and docs:
 - `docs/demo.rizref` (`examples/make_demo_board.rs`): four images drawn in code (CC0)
   and three markdown notes. README: status, layout, measured budgets, install and
   integration, releasing, licence. `LICENSE-MIT`, `LICENSE-APACHE`.
-- Tests: 679 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
+- Tests: 705 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
   clean; no new dependency crate and no new `-sys` crate (audit: `windows-sys`,
   `renderdoc-sys`).
 - Not verified here, by design or by environment: `register`/`unregister` and Explorer

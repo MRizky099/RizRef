@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glam::{DVec2, Vec2};
+use rizref_codecs::ImageBuffer;
 use rizref_core::{
     Asset, AssetId, Camera, Item, ItemBody, ItemId, Rect, Scene, SceneId, Selection,
 };
@@ -54,6 +55,7 @@ use crate::note::{self, NoteRenderer, NoteSession};
 use crate::note_chrome::{
     NoteChrome, PillButton, PillLayout, ScreenRect, ToolbarButton, ToolbarLayout,
 };
+use crate::note_worker::{NOTE_TEXTURE_BUDGET, NoteJob, NoteRendered, NoteWorker, Resident};
 use crate::overlay::{self, OverlayState, OverlayVertex};
 use crate::perf::{self, FrameBench, FrameStats, Milestone, StartupClock};
 use crate::placement;
@@ -455,6 +457,8 @@ pub(crate) enum AppEvent {
     Accessibility(accesskit_winit::Event),
     /// The background GPU initialisation finished (successfully or not).
     GpuReady,
+    /// The note worker finished one render.
+    NoteRendered(Box<NoteRendered>),
 }
 
 impl From<accesskit_winit::Event> for AppEvent {
@@ -464,12 +468,21 @@ impl From<accesskit_winit::Event> for AppEvent {
 }
 
 /// One note's resident texture.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct NoteTexture {
-    /// Content-addressed texture id.
+    /// The texture drawn now: the full render, its low-resolution copy, or
+    /// the card-only placeholder.
     id: AssetId,
     /// World size the texture was rendered for.
     world_size: Vec2,
+    /// Bytes of the full-resolution texture, counted against
+    /// [`NOTE_TEXTURE_BUDGET`]; 0 for a placeholder or low-resolution copy.
+    bytes: usize,
+    /// The render at most 256 px, shown after eviction until the full
+    /// texture is back.
+    low: Option<Arc<ImageBuffer>>,
+    /// The note-frame counter when the note was last near the viewport.
+    last_seen: u64,
 }
 
 /// Everything the event loop owns: the window, its surface, the board state
@@ -516,6 +529,12 @@ struct App {
     pick_for_note: Option<ItemId>,
     /// Resident note textures.
     note_textures: HashMap<ItemId, NoteTexture>,
+    /// Renders every note except the one being edited, off the UI thread.
+    note_worker: Option<NoteWorker>,
+    /// The texture each note's in-flight worker render will produce.
+    pending_notes: HashMap<ItemId, AssetId>,
+    /// Counts `ensure_note_textures` passes, for least-recently-seen eviction.
+    note_frame: u64,
     /// Notes whose texture must be re-rendered on the next frame.
     dirty_notes: BTreeSet<ItemId>,
     /// The last click, for double-click detection.
@@ -632,6 +651,15 @@ impl App {
             }
         });
         tracing::info!(workers = importer.worker_count(), "import pool started");
+        let note_proxy = proxy.clone();
+        let note_worker = NoteWorker::spawn(move |done| {
+            if note_proxy
+                .send_event(AppEvent::NoteRendered(Box::new(done)))
+                .is_err()
+            {
+                tracing::debug!("the event loop is gone; dropping a note render");
+            }
+        });
 
         // The camera belongs to the board document; a session with no board
         // starts at the default view.
@@ -672,6 +700,9 @@ impl App {
             note_hover: None,
             pick_for_note: None,
             note_textures: HashMap::new(),
+            note_worker: Some(note_worker),
+            pending_notes: HashMap::new(),
+            note_frame: 0,
             dirty_notes: BTreeSet::new(),
             last_click: None,
             last_title_click: None,
@@ -987,7 +1018,17 @@ impl App {
         self.decode_cache = DecodeCache::new(self.settings.max_decode_bytes);
         self.playbacks.clear();
         self.pending_textures.clear();
-        self.note_textures.clear();
+        let note_textures: Vec<AssetId> = self
+            .note_textures
+            .drain()
+            .map(|(_, entry)| entry.id)
+            .collect();
+        if let Some(renderer) = self.renderer.as_mut() {
+            for id in note_textures {
+                renderer.remove_texture(id);
+            }
+        }
+        self.pending_notes.clear();
         self.dirty_notes.clear();
         self.provenance.clear();
         self.loaded_document = None;
@@ -2737,13 +2778,33 @@ impl App {
         self.redraw();
     }
 
-    /// Renders any note whose content or size changed, and uploads it.
+    /// Keeps every note near the view textured.
+    ///
+    /// Phase 07: only the note being edited renders here; every other render
+    /// goes to the note worker, and the note shows its last texture (or a
+    /// card-only placeholder) until the result arrives — no frame waits on a
+    /// layout or an equation. Off-screen notes are not rendered until they
+    /// come within half a viewport, and full textures stay within the 64 MiB
+    /// budget by dropping the least recently seen off-screen notes to their
+    /// low-resolution copies.
     fn ensure_note_textures(&mut self) {
         if self.renderer.is_none() {
             return;
         }
+        self.note_frame += 1;
+        let frame = self.note_frame;
         let active = self.note_session.as_ref().map(NoteSession::item);
         let gesture = self.board.is_gesture_active();
+        // Notes within half a viewport of the screen count as seen: they are
+        // rendered just before they scroll in, and kept resident.
+        let visible = self.view.camera.visible_world_rect(self.view.viewport());
+        let near = Rect::from_min_size(visible.min - visible.size * 0.5, visible.size * 2.0);
+        let near_ids: BTreeSet<ItemId> = self
+            .board
+            .scene()
+            .visible_items(&near)
+            .map(Item::id)
+            .collect();
         let notes: Vec<(ItemId, rizref_core::NoteContent, Vec2)> = self
             .board
             .scene()
@@ -2756,63 +2817,255 @@ impl App {
             .collect();
 
         for (id, content, size) in notes {
-            let density = match self.note_session.as_ref().filter(|s| s.item() == id) {
-                Some(session) => session.pixels_per_world(),
-                None => note::pixels_per_world(size),
-            };
-            let wanted = note::texture_id(&content, size, density);
-            let current = self.note_textures.get(&id).copied();
-            let resident = self
-                .renderer
-                .as_ref()
-                .is_some_and(|renderer| renderer.has_texture(wanted));
-            let stale = current.is_none_or(|entry| entry.id != wanted || entry.world_size != size)
-                || self.dirty_notes.contains(&id)
-                || !resident;
+            let on_screen = near_ids.contains(&id) || active == Some(id);
+            if on_screen && let Some(entry) = self.note_textures.get_mut(&id) {
+                entry.last_seen = frame;
+            }
+            if active == Some(id) {
+                self.render_note_now(id, &content, size);
+                continue;
+            }
+            let wanted = note::texture_id(&content, size, note::pixels_per_world(size));
+            let current = self.note_textures.get(&id).map(|entry| entry.id);
+            let resident = current.is_some_and(|current| {
+                self.renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.has_texture(current))
+            });
+            let stale = current != Some(wanted) || self.dirty_notes.contains(&id) || !resident;
             if !stale {
                 continue;
             }
             // During a drag a note keeps its existing texture stretched; it is
             // re-rendered once at the final size instead of every mouse move.
-            if gesture && active != Some(id) && current.is_some() {
+            if gesture && resident {
                 continue;
             }
-
-            let session = self
-                .note_session
-                .as_mut()
-                .filter(|session| session.item() == id);
-            let session = match session {
-                Some(session) => {
-                    // A resize changes the visible area, never the wrap width.
-                    session.resize(size);
-                    Some(session)
-                }
-                None => None,
-            };
-            let Some(image) = self
-                .note_renderer
-                .render(&mut self.text, &content, size, session)
-            else {
+            // Off-screen notes are rendered when they come near the view.
+            if !on_screen || self.pending_notes.get(&id) == Some(&wanted) {
                 continue;
+            }
+            let job = NoteJob {
+                note: id,
+                texture: wanted,
+                content: content.clone(),
+                size,
             };
+            let submitted = self
+                .note_worker
+                .as_ref()
+                .is_some_and(|worker| worker.submit(job));
+            if !submitted {
+                // No worker thread (it could not start): render here.
+                self.render_note_now(id, &content, size);
+                continue;
+            }
+            self.pending_notes.insert(id, wanted);
             self.dirty_notes.remove(&id);
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.upload_texture(wanted, &image, false);
+            if !resident {
+                self.show_note_placeholder(id, &content, size, wanted);
             }
-            let previous = self.note_textures.insert(
-                id,
-                NoteTexture {
-                    id: wanted,
-                    world_size: size,
-                },
-            );
-            // One resident texture per note: the superseded one is freed as
-            // soon as no other note shares it, so typing or resizing never
-            // accumulates GPU memory.
-            if let Some(previous) = previous {
-                self.release_note_texture(previous.id);
+        }
+        self.enforce_note_budget();
+    }
+
+    /// Renders one note on the UI thread: the note being edited (its caret
+    /// and selection change every keystroke, and the editor lives here), or
+    /// any note when the worker could not start.
+    fn render_note_now(&mut self, id: ItemId, content: &rizref_core::NoteContent, size: Vec2) {
+        let density = match self.note_session.as_ref().filter(|s| s.item() == id) {
+            Some(session) => session.pixels_per_world(),
+            None => note::pixels_per_world(size),
+        };
+        let wanted = note::texture_id(content, size, density);
+        let current = self.note_textures.get(&id);
+        let resident = current.is_some_and(|entry| {
+            self.renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.has_texture(entry.id))
+        });
+        let fresh = current.is_some_and(|entry| entry.id == wanted && entry.world_size == size);
+        if fresh && resident && !self.dirty_notes.contains(&id) {
+            return;
+        }
+        let session = self
+            .note_session
+            .as_mut()
+            .filter(|session| session.item() == id);
+        let session = match session {
+            Some(session) => {
+                // A resize changes the visible area, never the wrap width.
+                session.resize(size);
+                Some(session)
             }
+            None => None,
+        };
+        let Some(image) = self
+            .note_renderer
+            .render(&mut self.text, content, size, session)
+        else {
+            return;
+        };
+        self.dirty_notes.remove(&id);
+        self.pending_notes.remove(&id);
+        let low = Arc::new(note::low_resolution(&image));
+        self.install_note_texture(id, wanted, size, &image, Some(low));
+    }
+
+    /// Uploads a full note render and makes it the note's texture.
+    fn install_note_texture(
+        &mut self,
+        id: ItemId,
+        texture: AssetId,
+        size: Vec2,
+        image: &ImageBuffer,
+        low: Option<Arc<ImageBuffer>>,
+    ) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.upload_texture(texture, image, false);
+        }
+        let previous = self.note_textures.insert(
+            id,
+            NoteTexture {
+                id: texture,
+                world_size: size,
+                bytes: image.width() as usize * image.height() as usize * 4,
+                low,
+                last_seen: self.note_frame,
+            },
+        );
+        // One resident texture per note: the superseded one is freed as soon
+        // as no other note shares it, so typing or resizing never
+        // accumulates GPU memory.
+        if let Some(previous) = previous
+            && previous.id != texture
+        {
+            self.release_note_texture(previous.id);
+        }
+    }
+
+    /// Gives a note with nothing to show its card-only placeholder until the
+    /// worker's render arrives.
+    fn show_note_placeholder(
+        &mut self,
+        id: ItemId,
+        content: &rizref_core::NoteContent,
+        size: Vec2,
+        wanted: AssetId,
+    ) {
+        let Some(image) = note::render_placeholder(content, size) else {
+            return;
+        };
+        let texture = note::derived_texture_id(wanted, b"placeholder");
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.upload_texture(texture, &image, false);
+        }
+        let previous = self.note_textures.insert(
+            id,
+            NoteTexture {
+                id: texture,
+                world_size: size,
+                bytes: 0,
+                low: None,
+                last_seen: self.note_frame,
+            },
+        );
+        if let Some(previous) = previous
+            && previous.id != texture
+        {
+            self.release_note_texture(previous.id);
+        }
+    }
+
+    /// Takes a finished worker render: uploaded if it is still what the note
+    /// wants, dropped if the note changed (a newer render is on its way).
+    fn apply_note_render(&mut self, done: NoteRendered) {
+        if done.image.is_none() {
+            // A failed render keeps its pending mark, so the same content is
+            // not retried every frame; an edit or resize asks again.
+            tracing::warn!(note = ?done.note, "note render failed; keeping the placeholder");
+            return;
+        }
+        if self.pending_notes.get(&done.note) == Some(&done.texture) {
+            self.pending_notes.remove(&done.note);
+        }
+        let Some(item) = self.board.scene().item(done.note) else {
+            return;
+        };
+        let Some(content) = item.note_content() else {
+            return;
+        };
+        let size = item.size();
+        let editing = self
+            .note_session
+            .as_ref()
+            .is_some_and(|session| session.item() == done.note);
+        let wanted = note::texture_id(&content, size, note::pixels_per_world(size));
+        if editing || wanted != done.texture {
+            return;
+        }
+        let Some(image) = done.image else {
+            return;
+        };
+        tracing::debug!(
+            note = ?done.note,
+            ms = perf::ms(done.elapsed),
+            width = image.width(),
+            height = image.height(),
+            "note rendered on the worker"
+        );
+        self.install_note_texture(
+            done.note,
+            done.texture,
+            size,
+            &image,
+            done.low.map(Arc::new),
+        );
+        self.enforce_note_budget();
+        self.redraw();
+    }
+
+    /// Keeps full-resolution note textures within [`NOTE_TEXTURE_BUDGET`]:
+    /// off-screen notes, least recently seen first, drop to their
+    /// low-resolution copies (a note without one drops its texture).
+    fn enforce_note_budget(&mut self) {
+        let frame = self.note_frame;
+        let active = self.note_session.as_ref().map(NoteSession::item);
+        let residents: Vec<Resident> = self
+            .note_textures
+            .iter()
+            .map(|(id, entry)| Resident {
+                note: *id,
+                bytes: entry.bytes,
+                last_seen: entry.last_seen,
+                pinned: entry.last_seen == frame || active == Some(*id),
+            })
+            .collect();
+        for id in crate::note_worker::plan_evictions(&residents, NOTE_TEXTURE_BUDGET) {
+            let Some(entry) = self.note_textures.get(&id).cloned() else {
+                continue;
+            };
+            match &entry.low {
+                Some(low) => {
+                    let texture = note::derived_texture_id(entry.id, b"low");
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.upload_texture(texture, low, false);
+                    }
+                    self.note_textures.insert(
+                        id,
+                        NoteTexture {
+                            id: texture,
+                            bytes: 0,
+                            ..entry.clone()
+                        },
+                    );
+                }
+                None => {
+                    self.note_textures.remove(&id);
+                }
+            }
+            self.release_note_texture(entry.id);
+            tracing::debug!(note = ?id, bytes = entry.bytes, "note texture evicted");
         }
     }
 
@@ -4616,6 +4869,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.import_paths(paths, drop_world);
             }
             AppEvent::GpuReady => self.attach_gpu(true, event_loop),
+            AppEvent::NoteRendered(done) => self.apply_note_render(*done),
             AppEvent::Import(outcome) => self.apply_import(*outcome),
             AppEvent::Dropped(event) => self.apply_drop(*event),
             AppEvent::Accessibility(event) => match event.window_event {
