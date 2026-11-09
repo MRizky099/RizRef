@@ -2,10 +2,15 @@
 //!
 //! Layout is computed once per size ([`StartLayout`]) and used by both the
 //! painter and hit-testing, so a button can never be drawn in one place and
-//! clicked in another. Cards read the [`Recents`] store; a card without a stored
-//! preview draws a monogram placeholder. The save path records the board
-//! thumbnail in that store, so a preview tile is available to the card renderer
-//! and the Explorer provider.
+//! clicked in another. Cards read the [`Recents`] store and draw the board
+//! thumbnail recorded there; a card without one (or whose bytes do not
+//! decode) draws a monogram placeholder.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
+use tiny_skia::Pixmap;
 
 use crate::recents::Recents;
 use crate::ui::menu::Action;
@@ -257,7 +262,13 @@ pub fn paint(
             .chars()
             .next()
             .map_or("R".to_owned(), |first| first.to_uppercase().to_string());
-        painter.thumbnail_placeholder(preview, &monogram);
+        match entry.preview.as_deref().and_then(preview_pixmap) {
+            Some(pixmap) => {
+                painter.fill_round_rect(preview, 6.0, [46, 49, 60, 255]);
+                painter.image(&pixmap, preview);
+            }
+            None => painter.thumbnail_placeholder(preview, &monogram),
+        }
         painter.text(
             &entry.display_name(),
             rect.x + 10.0,
@@ -305,8 +316,53 @@ pub fn action_for(control: StartControl, recents: &Recents) -> Option<Action> {
     }
 }
 
+thread_local! {
+    /// Decoded card previews, keyed by a hash of their encoded bytes, so a
+    /// repaint does not decode a dozen JPEGs. Painting happens on the UI
+    /// thread only.
+    static PREVIEWS: RefCell<HashMap<u64, Option<Pixmap>>> = RefCell::new(HashMap::new());
+}
+
+/// The card picture for a recent entry's stored preview bytes, decoded once.
+fn preview_pixmap(bytes: &[u8]) -> Option<Pixmap> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let key = hasher.finish();
+    PREVIEWS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() > 4 * crate::recents::RECENT_LIMIT {
+            cache.clear();
+        }
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                let image = rizref_codecs::decode(bytes).ok()?;
+                // An empty board saves a 1 x 1 thumbnail: the monogram says
+                // more than a flat colour.
+                if image.width() < 2 || image.height() < 2 {
+                    return None;
+                }
+                crate::ui::paint::pixmap_from_rgba(image.width(), image.height(), image.pixels())
+            })
+            .clone()
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stored_preview_decodes_for_its_card_and_garbage_does_not() {
+        let image = rizref_codecs::ImageBuffer::filled(40, 20, [200, 30, 30, 255]);
+        let jpeg = rizref_codecs::encode_jpeg(&image, 80).expect("jpeg");
+
+        let pixmap = super::preview_pixmap(&jpeg).expect("decodes");
+        assert_eq!((pixmap.width(), pixmap.height()), (40, 20));
+        assert!(
+            super::preview_pixmap(b"not an image").is_none(),
+            "monogram instead"
+        );
+    }
+
     use super::{StartControl, StartLayout};
     use crate::recents::Recents;
     use glam::DVec2;

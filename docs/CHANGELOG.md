@@ -127,6 +127,19 @@ Reliability:
   - Grid arrange packs row by row (selection order, rows as tall as their tallest
     item, even gaps, near-square wrap) instead of uniform cells sized to the largest
     item; still one undo step.
+  - Fourth run: an embedded TGA stayed on its 512 px preview after the board was
+    reopened. The full-resolution decode got the bytes alone and TGA has no
+    signature; it now gets the asset's recorded `format` (already in every asset
+    entry, so no format change), then the file extension, then a TGA header check.
+    Dropped virtual files (Outlook attachments) pass their name's extension too. A
+    test round-trips TGA, PPM, QOI and ICO through import, save, load and a
+    full-resolution decode.
+  - Recent-board cards draw the stored board thumbnail (the monogram is the
+    fallback, also for an empty board's 1 x 1 picture). `recents.json` stores the
+    preview as base64 instead of a JSON array of numbers, about a third of the
+    size; the array form is still read.
+  - A failed import was logged twice, by the worker and by the application; the
+    worker's line is debug now. A failed full-resolution decode is a warning.
   - The colour picker: no path was found by which it drops the next key or the
     dirty mark (it changes neither selection nor history, and the dirty mark comes
     from the board's effects); not reproduced, left unchanged.

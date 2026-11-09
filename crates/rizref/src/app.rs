@@ -2516,8 +2516,17 @@ impl App {
                 "virtual file dropped"
             );
             self.shell.set_mode(Mode::Canvas);
-            let source =
+            // A virtual file has a name but no path: its extension is the
+            // only way to recognise a signature-less format such as TGA.
+            let hint = Path::new(&file.name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(rizref_codecs::ImageFormat::from_extension);
+            let mut source =
                 ImportSource::bytes(file.name, file.bytes).with_source_url(source_url.clone());
+            if let Some(format) = hint {
+                source = source.with_format_hint(format);
+            }
             self.submit_import(ImportRequest::new(source, drop_world));
         }
         self.redraw();
@@ -2546,7 +2555,7 @@ impl App {
                 }
                 // Keep the request recorded: a corrupt original would
                 // otherwise be decoded again on every visible frame.
-                Err(error) => tracing::debug!(
+                Err(error) => tracing::warn!(
                     asset = %asset_id,
                     reason = %error.reason,
                     "full-resolution decode failed; keeping the preview"
@@ -2866,7 +2875,8 @@ impl App {
             let Some(asset) = self.board.scene().asset(asset_id) else {
                 continue;
             };
-            let request = ImportRequest::texture(asset_id, Arc::clone(asset.encoded()));
+            let request =
+                ImportRequest::texture(asset_id, Arc::clone(asset.encoded()), asset.format());
             if self
                 .importer
                 .as_ref()

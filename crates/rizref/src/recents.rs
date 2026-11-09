@@ -28,9 +28,82 @@ pub struct RecentEntry {
     pub edited_at: u64,
     /// Item count at the last edit.
     pub item_count: u32,
-    /// Encoded preview bytes, when the board carried one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Encoded preview bytes, when the board carried one. Written as base64;
+    /// files from before phase 07 hold a JSON array of numbers, which is
+    /// still read (it took about three times the space).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "preview_bytes"
+    )]
     pub preview: Option<Vec<u8>>,
+}
+
+/// Serde for the preview: a base64 string out, base64 or a number array in.
+mod preview_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::ref_option)] // serde's `with` hands the field by reference
+    pub fn serialize<S: Serializer>(value: &Option<Vec<u8>>, out: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(bytes) => out.serialize_some(&super::base64_encode(bytes)),
+            None => out.serialize_none(),
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Base64(String),
+        Numbers(Vec<u8>),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<Option<Vec<u8>>, D::Error> {
+        Ok(match Option::<Stored>::deserialize(input)? {
+            Some(Stored::Base64(text)) => super::base64_decode(&text),
+            Some(Stored::Numbers(bytes)) => Some(bytes),
+            None => None,
+        })
+    }
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding (RFC 4648 §4).
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let triple = chunk
+            .iter()
+            .enumerate()
+            .fold(0_u32, |acc, (i, b)| acc | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(BASE64[(triple >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Decodes standard base64; `None` for anything malformed (a bad preview
+/// only costs the card its picture).
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim_end_matches('=');
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0_u32, 0);
+    for byte in text.bytes() {
+        let value = BASE64.iter().position(|c| *c == byte)? as u32;
+        acc = acc << 6 | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits & 0xFF) as u8);
+        }
+    }
+    Some(out)
 }
 
 impl RecentEntry {
@@ -234,5 +307,29 @@ mod tests {
         assert_eq!(back, recents);
         assert_eq!(back.entries[0].edited_at, 42);
         assert_eq!(back.entries[0].preview, Some(vec![1, 2, 3]));
+        assert!(
+            body.contains("\"preview\":\"AQID\""),
+            "base64 on disk: {body}"
+        );
+    }
+
+    #[test]
+    fn base64_round_trips_every_length_and_byte() {
+        for len in 0..70 {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let text = super::base64_encode(&bytes);
+            assert_eq!(text.len() % 4, 0);
+            assert_eq!(super::base64_decode(&text), Some(bytes));
+        }
+        assert_eq!(super::base64_encode(b"Man"), "TWFu");
+        assert_eq!(super::base64_encode(b"Ma"), "TWE=");
+        assert_eq!(super::base64_decode("not base64!"), None);
+    }
+
+    #[test]
+    fn a_recents_file_with_number_array_previews_still_loads() {
+        let body = r#"{"entries":[{"path":"C:/b.rizref","edited_at":5,"item_count":2,"preview":[255,216,255,224]}]}"#;
+        let recents: Recents = serde_json::from_str(body).expect("old form parses");
+        assert_eq!(recents.entries[0].preview, Some(vec![255, 216, 255, 224]));
     }
 }
