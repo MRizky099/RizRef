@@ -3986,6 +3986,8 @@ impl ApplicationHandler<AppEvent> for App {
                         hud,
                         ui,
                         flags: FrameFlags {
+                            grid: self.settings.grid_visible,
+                            scene_border: self.settings.scene_border,
                             checkerboard: self.settings.checkerboard,
                             grayscale: self.settings.grayscale,
                         },

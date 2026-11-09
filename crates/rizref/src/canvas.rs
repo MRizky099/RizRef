@@ -68,6 +68,20 @@ impl Globals {
     /// Zoom above which the grid hides (400%).
     const GRID_MAX_ZOOM: f64 = 4.0;
 
+    /// Applies the user's view settings. Grid (with its origin axis) and
+    /// border can only be switched off here: the zoom range and an empty
+    /// board still hide them when the settings ask for them.
+    fn apply_flags(&mut self, flags: FrameFlags) {
+        if !flags.grid {
+            self.grid_visible = 0.0;
+        }
+        if !flags.scene_border {
+            self.border_visible = 0.0;
+        }
+        self.checkerboard = if flags.checkerboard { 1.0 } else { 0.0 };
+        self.grayscale = if flags.grayscale { 1.0 } else { 0.0 };
+    }
+
     /// Builds the block from the camera and the frame's fixed facts.
     pub fn new(
         camera: &Camera,
@@ -524,8 +538,7 @@ impl Canvas {
     ) {
         let mut globals = Globals::new(camera, viewport, physical_scale, scene_rect);
         globals.hud_size = [hud_size.0, hud_size.1];
-        globals.checkerboard = if flags.checkerboard { 1.0 } else { 0.0 };
-        globals.grayscale = if flags.grayscale { 1.0 } else { 0.0 };
+        globals.apply_flags(flags);
         queue.write_buffer(&self.globals_buffer, 0, &globals.bytes());
     }
 
@@ -823,6 +836,11 @@ impl Canvas {
 /// Per-frame display-effect flags.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameFlags {
+    /// Draw the grid and its origin axis (still hidden outside the zoom
+    /// range the grid is legible in).
+    pub grid: bool,
+    /// Draw the dashed scene-rect border (when the board has content).
+    pub scene_border: bool,
     /// Draw the checkerboard backdrop.
     pub checkerboard: bool,
     /// Draw items in grayscale.
@@ -881,6 +899,43 @@ mod tests {
             )),
         );
         assert_eq!(globals.bytes().len(), 80);
+    }
+
+    #[test]
+    fn the_view_settings_gate_the_grid_axis_and_border() {
+        let rect = Rect::from_min_size(glam::Vec2::ZERO, glam::Vec2::splat(10.0));
+        let fresh = || Globals::new(&Camera::default(), DVec2::ONE, 1.0, Some(rect));
+
+        let mut off = fresh();
+        off.apply_flags(super::FrameFlags::default());
+        assert_eq!(off.grid_visible, 0.0, "grid and origin axis hidden");
+        assert_eq!(off.border_visible, 0.0);
+
+        let mut on = fresh();
+        on.apply_flags(super::FrameFlags {
+            grid: true,
+            scene_border: true,
+            checkerboard: true,
+            grayscale: true,
+        });
+        assert_eq!(on.grid_visible, 1.0);
+        assert_eq!(on.border_visible, 1.0);
+        assert_eq!((on.checkerboard, on.grayscale), (1.0, 1.0));
+
+        // The settings never force on what the zoom range or an empty board hides.
+        let mut zoomed = Globals::new(
+            &Camera::new(DVec2::ZERO, Globals::GRID_MAX_ZOOM * 2.0, 0.0),
+            DVec2::ONE,
+            1.0,
+            None,
+        );
+        zoomed.apply_flags(super::FrameFlags {
+            grid: true,
+            scene_border: true,
+            ..super::FrameFlags::default()
+        });
+        assert_eq!(zoomed.grid_visible, 0.0);
+        assert_eq!(zoomed.border_visible, 0.0);
     }
 
     #[test]
@@ -1003,6 +1058,8 @@ mod tests {
             None,
             (0.0, 0.0),
             super::FrameFlags {
+                grid: true,
+                scene_border: true,
                 checkerboard: true,
                 grayscale: true,
             },
