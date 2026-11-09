@@ -4,8 +4,9 @@ Summary of what each delivery phase landed. One section per phase; newest at the
 
 ## Phase 06a — Markdown notes (done)
 
-Delivered on branch `feat/phase-06a-markdown-notes`; closes issue #19. On-disk
-contract: [`format.md` → Note payloads](format.md#note-payloads-v11--phase-06a).
+Merged 2026-11-09 in PR #21 (branch `feat/phase-06a-markdown-notes`, merge commit
+`0901881`). Closes issue #19. On-disk contract:
+[`format.md` → Note payloads](format.md#note-payloads-v11--phase-06a).
 
 - `rizref-core`: `NoteFormat` (`plain` | `markdown`) and `NoteContent` (text, format,
   optional opaque background, optional wrap width). `ItemBody::Note` carries all four;
