@@ -84,12 +84,16 @@ pub fn render<S: Read + Seek>(source: S, max_side: u32) -> Result<Thumbnail, Str
 /// Board pictures carry no corner badge: tried at 30% of the long side, the
 /// mark covered a note on a wide board at 256 px and dominated at 96 px.
 pub fn render_or_artwork<S: Read + Seek>(source: S, max_side: u32) -> Thumbnail {
+    to_bgra(&image_or_artwork(source, max_side))
+}
+
+/// [`render_or_artwork`] as straight-alpha RGBA: what the freedesktop
+/// thumbnailer (`rizref thumbnail`) encodes to PNG on Linux.
+pub fn image_or_artwork<S: Read + Seek>(source: S, max_side: u32) -> ImageBuffer {
     match board_image(source) {
         // A board with no items saves a 1 x 1 background pixel.
-        Ok(image) if image.width() > 1 && image.height() > 1 => {
-            to_bgra(&scale_to_fit(&image, max_side))
-        }
-        _ => to_bgra(&document_artwork(max_side)),
+        Ok(image) if image.width() > 1 && image.height() > 1 => scale_to_fit(&image, max_side),
+        _ => document_artwork(max_side),
     }
 }
 
@@ -121,8 +125,10 @@ pub fn document_artwork(max_side: u32) -> ImageBuffer {
     }
 }
 
-/// `(side, png)` for each image of an ICO whose images are PNGs.
-fn ico_pngs(ico: &[u8]) -> Vec<(u32, &[u8])> {
+/// `(side, png)` for each image of an ICO whose images are PNGs (both
+/// committed icons are; the Linux `rizref register` installs them as the
+/// hicolor theme's sizes).
+pub fn ico_pngs(ico: &[u8]) -> Vec<(u32, &[u8])> {
     let u32_at = |at: usize| {
         ico.get(at..at + 4)
             .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))

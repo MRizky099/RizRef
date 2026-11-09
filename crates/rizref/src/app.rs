@@ -36,6 +36,7 @@ use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+#[cfg(windows)]
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
@@ -201,8 +202,10 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 pub fn run(args: Vec<String>) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("inspect") => return crate::inspect::run(&args[1..]),
-        Some("register") => return platform::registry::run(true, &args[1..]),
-        Some("unregister") => return platform::registry::run(false, &args[1..]),
+        Some("register") => return platform::register::run(true, &args[1..]),
+        Some("unregister") => return platform::register::run(false, &args[1..]),
+        #[cfg(unix)]
+        Some("thumbnail") => return crate::thumbnail::run(&args[1..]),
         _ => {}
     }
     match args.first().map(String::as_str) {
@@ -327,17 +330,12 @@ fn print_help() {
 // Logging and panic reporting
 // ---------------------------------------------------------------------------
 
-/// Where RizRef writes its logs and panic reports.
-///
-/// The user's local-appdata directory, taken from the environment at runtime;
-/// when the environment does not provide it (unusual, stripped service
-/// contexts) logs land in the temp directory rather than being lost.
+/// Where RizRef writes its logs and panic reports: the per-OS log directory
+/// from [`crate::paths`] (`%LOCALAPPDATA%\RizRef\logs` on Windows), falling
+/// back to the temp directory when the environment does not provide one
+/// (unusual, stripped service contexts) rather than losing the logs.
 fn logs_dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("rizref"))
-        .join("RizRef")
-        .join("logs")
+    crate::paths::logs_dir()
 }
 
 /// Picks which rotated log files to delete so `keep` newest remain.
@@ -1678,12 +1676,21 @@ impl App {
             ghost: self.window_modes.ghost(),
             click_through: self.window_modes.click_through,
             always_on_top: self.window_modes.always_on_top,
+            capabilities: self.capabilities(),
             opacity_percent: self.window_modes.opacity_percent,
             note_selected: self.board.selected_note().is_some(),
             selected_image: self
                 .selected_image()
                 .map(|(_, provenance)| provenance.and_then(location::location_kind)),
         }
+    }
+
+    /// What the window system offers, for the menus and the mode commands.
+    fn capabilities(&self) -> platform::capabilities::Capabilities {
+        self.window.as_ref().map_or_else(
+            || platform::capabilities::for_backend(platform::capabilities::Backend::Unknown),
+            |window| platform::capabilities::for_window(window),
+        )
     }
 
     /// The one selected image and its provenance record, if any.
@@ -1965,6 +1972,11 @@ impl App {
                 self.shell.toast(about_line(), now);
             }
             Action::Quit => self.request_close(event_loop),
+            Action::ToggleAlwaysOnTop if !self.capabilities().always_on_top => {
+                self.shell
+                    .toast("Always on top is not available on Wayland", now);
+                self.redraw();
+            }
             Action::ToggleAlwaysOnTop => {
                 self.window_modes.always_on_top = !self.window_modes.always_on_top;
                 self.settings.always_on_top = self.window_modes.always_on_top;
@@ -4157,8 +4169,21 @@ impl ApplicationHandler<AppEvent> for App {
         let (small_icon, big_icon) = platform::icon::app_icons();
         let attributes = Window::default_attributes()
             .with_title(self.plan.title)
-            .with_window_icon(small_icon)
-            .with_taskbar_icon(big_icon)
+            .with_window_icon(small_icon);
+        #[cfg(windows)]
+        let attributes = attributes.with_taskbar_icon(big_icon);
+        #[cfg(not(windows))]
+        let _ = big_icon;
+        // X11 `WM_CLASS` / the Wayland `app_id`: what the desktop entry's
+        // `StartupWMClass=rizref` matches, so the dock shows RizRef's icon.
+        #[cfg(target_os = "linux")]
+        let attributes = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            let attributes = WindowAttributesExtX11::with_name(attributes, "rizref", "rizref");
+            WindowAttributesExtWayland::with_name(attributes, "rizref", "rizref")
+        };
+        let attributes = attributes
             .with_inner_size(self.plan.size)
             // The window draws its own auto-hiding title bar; a native frame
             // would sit above the board permanently.

@@ -29,10 +29,14 @@ repository = "https://github.com/MRizky099/RizRef"
 # ---------------------------------------------------------------------------
 # Workspace dependencies.
 #
-# Pure-Rust rule: a dependency that vendors or links C/C++ is rejected. Win32 /
-# COM FFI binding crates (`windows`, `windows-sys`) are the only accepted
-# exception, because they contain nothing but declarations. `cargo tree` is
-# audited for any other `*-sys` crate as part of the phase-00 verification.
+# Pure-Rust rule: a dependency that vendors or links C/C++ is rejected. OS
+# binding crates that contain nothing but declarations, or reach a system
+# library through `dlopen`, are the only accepted exception: Win32 / COM
+# (`windows`, `windows-sys`) on Windows; `wayland-sys` (dlopen), `x11-dl`,
+# `xkbcommon-dl` and `ash`'s loader on Linux; the `objc2` / `core-foundation`
+# declaration families on macOS. CI audits `cargo tree` for any other `*-sys`
+# crate, and for C compiled by a build script, on all three targets
+# (`scripts/audit-native.sh`; the README lists every accepted crate).
 #
 # Every dependency is declared once here and opted into by a member with
 # `dep.workspace = true`, so a version can never drift between crates.
@@ -130,10 +134,20 @@ ratex-parser = "=0.1.15"
 ratex-layout = "=0.1.15"
 ratex-types = "=0.1.15"
 ratex-render = { version = "=0.1.15", features = ["embed-fonts"] }
+# The KaTeX fonts ratex-render already embeds (SIL OFL 1.1). Named directly
+# for one face: KaTeX_SansSerif is the UI's last-resort font on Linux and
+# macOS, so a minimal system with no fonts installed still renders text.
+ratex-katex-fonts = "=0.1.15"
 
 # Clipboard text plus PNG/BMP image data. arboard already builds its own `image`
 # dependency with `default-features = false`, so this does not pull rav1e in.
-arboard = "3.7.0"
+# `wayland-data-control` (Linux only): read the clipboard on Wayland without
+# holding keyboard focus, through `wl-clipboard-rs` (pure Rust; libwayland is
+# reached through `wayland-sys`'s `dlopen`, never linked).
+arboard = { version = "3.7.0", features = ["wayland-data-control"] }
+# Native dialogs. On Linux the default `xdg-portal` backend talks D-Bus to the
+# desktop portal through `ashpd`/`zbus` (pure Rust) — the `gtk3` backend, a C
+# library, stays off. `common-controls-v6` only affects Windows.
 rfd = { version = "0.17.2", features = ["common-controls-v6"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

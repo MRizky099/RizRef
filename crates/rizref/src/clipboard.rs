@@ -92,9 +92,7 @@ pub fn read() -> Result<ClipboardContent, PasteError> {
     let png = png_from_rgba(width, height, image.bytes.into_owned()).map_err(PasteError::Other)?;
     // Release arboard's handle before the raw HTML read opens the clipboard.
     drop(clipboard);
-    let source_url = crate::platform::clipboard_html::read_html()
-        .as_deref()
-        .and_then(crate::provenance::url_from_cf_html);
+    let source_url = crate::platform::clipboard_html::source_url();
 
     Ok(ClipboardContent::Image {
         name: "clipboard.png".to_owned(),

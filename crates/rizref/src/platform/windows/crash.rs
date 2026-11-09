@@ -1,4 +1,6 @@
-//! Crash minidumps: Crashpad parity without Crashpad.
+//! Crash minidumps, Windows half: the unhandled-exception filter and
+//! dbghelp's `MiniDumpWriteDump`. Naming and pruning are shared
+//! (`platform::crash`).
 //!
 //! A Rust panic is reported by the panic hook in `app`. What the hook cannot
 //! see is a *structured exception*: an access violation inside a GPU driver, a
@@ -35,36 +37,13 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PCWSTR;
 
-/// How many dumps to keep; older ones are pruned at install time.
-pub const DUMPS_KEPT: usize = 10;
+use crate::platform::crash::dump_file_name;
 
 /// `EXCEPTION_EXECUTE_HANDLER`: the process ends after the filter returns.
 const EXECUTE_HANDLER: i32 = 1;
 
 /// The NUL-terminated dump path, fixed at install time.
 static DUMP_PATH: OnceLock<Vec<u16>> = OnceLock::new();
-
-/// `%LOCALAPPDATA%\RizRef\crashes`.
-pub fn crashes_dir() -> PathBuf {
-    crate::paths::local_dir().join("crashes")
-}
-
-/// The dump file name for one process: unique per launch, sortable by time.
-pub fn dump_file_name(unix_seconds: u64, pid: u32) -> String {
-    format!("rizref-{unix_seconds:011}-{pid}.dmp")
-}
-
-/// Which dump files to delete so `keep` newest remain. Pure; names sort
-/// chronologically thanks to the zero-padded timestamp.
-pub fn stale_dumps(names: &[String], keep: usize) -> Vec<String> {
-    let mut dumps: Vec<&String> = names
-        .iter()
-        .filter(|n| n.starts_with("rizref-") && n.ends_with(".dmp"))
-        .collect();
-    dumps.sort_unstable();
-    dumps.reverse();
-    dumps.into_iter().skip(keep).cloned().collect()
-}
 
 /// Installs the unhandled-exception filter, writing dumps into `dir`.
 /// Returns the path a dump would be written to. Calling it twice keeps the
@@ -74,7 +53,7 @@ pub fn stale_dumps(names: &[String], keep: usize) -> Vec<String> {
 #[allow(unsafe_code)]
 pub fn install(dir: &Path) -> PathBuf {
     let _ = std::fs::create_dir_all(dir);
-    prune(dir);
+    crate::platform::crash::prune(dir);
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -85,20 +64,6 @@ pub fn install(dir: &Path) -> PathBuf {
         SetUnhandledExceptionFilter(Some(write_dump));
     }
     path
-}
-
-fn prune(dir: &Path) {
-    let names: Vec<String> = std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    for name in stale_dumps(&names, DUMPS_KEPT) {
-        let _ = std::fs::remove_file(dir.join(name));
-    }
 }
 
 /// The filter: write the dump, then let Windows end the process.
@@ -152,31 +117,4 @@ pub fn raise_access_violation() -> ! {
         std::ptr::null_mut::<u8>().write_volatile(1);
     }
     std::process::abort()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{dump_file_name, stale_dumps};
-
-    #[test]
-    fn dump_names_sort_by_time() {
-        let early = dump_file_name(9, 4);
-        let late = dump_file_name(1_700_000_000, 4);
-
-        assert_eq!(early, "rizref-00000000009-4.dmp");
-        assert!(early < late);
-    }
-
-    #[test]
-    fn only_the_newest_dumps_survive() {
-        let names: Vec<String> = [5_u64, 1, 3, 2, 4]
-            .iter()
-            .map(|&t| dump_file_name(t, 1))
-            .chain(["panic-1.log".to_owned()])
-            .collect();
-
-        let stale = stale_dumps(&names, 3);
-
-        assert_eq!(stale, vec![dump_file_name(2, 1), dump_file_name(1, 1)]);
-    }
 }

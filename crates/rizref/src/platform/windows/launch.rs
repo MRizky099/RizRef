@@ -1,4 +1,5 @@
-//! Launching an image's source: Explorer for a file, the browser for a URL.
+//! Launching an image's source on Windows: Explorer for a file, the browser
+//! for a URL.
 //!
 //! This is a security boundary. Both inputs come from a board file, which is
 //! untrusted, so:
@@ -25,16 +26,8 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, w};
 
+use crate::platform::launch::LaunchError;
 use crate::provenance;
-
-/// Why a launch did not happen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LaunchError {
-    /// The value failed validation and was never passed to the OS.
-    Refused,
-    /// The OS refused or failed the launch.
-    Failed(String),
-}
 
 /// The single raw argument that makes Explorer select `path`.
 ///
@@ -202,23 +195,5 @@ mod tests {
             folder_argument(Path::new(r"C:\My Refs")).as_deref(),
             Some(r#""C:\My Refs""#)
         );
-    }
-
-    #[test]
-    fn open_url_refuses_non_web_schemes_without_launching() {
-        for hostile in [
-            "javascript:alert(1)",
-            "file:///C:/Windows/System32/calc.exe",
-            "calc.exe",
-            r"C:\Windows\System32\calc.exe",
-            "ms-settings:",
-            "https://e.com/\u{7}",
-        ] {
-            assert_eq!(
-                super::open_url(hostile),
-                Err(super::LaunchError::Refused),
-                "{hostile:?}"
-            );
-        }
     }
 }

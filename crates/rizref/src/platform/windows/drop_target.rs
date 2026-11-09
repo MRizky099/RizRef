@@ -54,6 +54,7 @@ use windows::core::{PCWSTR, Ref, Result as WinResult, implement, w};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
+use crate::platform::drop_target::{DropEvent, VirtualFile};
 use crate::provenance::{self, DropUrlPayloads};
 
 /// Largest `FileGroupDescriptorW` block accepted, bytes. The block is four
@@ -77,35 +78,6 @@ const FD_FILESIZE: u32 = 0x40;
 /// Largest registered `PNG` payload accepted, bytes; read on the UI thread
 /// like a virtual file.
 const MAX_PNG_BYTES: usize = MAX_VIRTUAL_FILE_BYTES;
-
-/// One file delivered by a drag & drop, either as a path or as bytes.
-#[derive(Debug, Clone)]
-pub struct DropEvent {
-    /// Drop position in the window's client area, physical pixels.
-    ///
-    /// Physical because that is what OLE and `ScreenToClient` speak; the
-    /// application divides by the window's scale factor before touching the
-    /// camera.
-    pub client_physical: (f32, f32),
-    /// Files that exist on disk.
-    pub paths: Vec<PathBuf>,
-    /// Files that only exist inside the drag source.
-    pub virtual_files: Vec<VirtualFile>,
-    /// The web address of the dragged image, when the source exposed one
-    /// and the drop carries exactly one image. A browser drag that also
-    /// produced a temporary cache file reports both; the importer records
-    /// the URL and not the cache path.
-    pub source_url: Option<String>,
-}
-
-/// A file whose contents arrived without a path, such as an Outlook attachment.
-#[derive(Debug, Clone)]
-pub struct VirtualFile {
-    /// Name the drag source gave the file, used as its import label.
-    pub name: String,
-    /// The contents, exactly as delivered.
-    pub bytes: Arc<[u8]>,
-}
 
 /// A registered drop target; dropping this value unregisters it.
 ///

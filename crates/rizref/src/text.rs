@@ -26,8 +26,12 @@ impl TextEngine {
     /// fallback. A board full of images should not refuse to open because a font
     /// directory is unreadable.
     pub fn new() -> Self {
+        #[cfg_attr(windows, allow(unused_mut))]
+        let mut fonts = FontSystem::new();
+        #[cfg(unix)]
+        add_fallback_font(&mut fonts);
         Self {
-            fonts: FontSystem::new(),
+            fonts,
             swash: SwashCache::new(),
         }
     }
@@ -322,6 +326,22 @@ fn blend_premultiplied(data: &mut [u8], offset: usize, r: u8, g: u8, b: u8, a: u
     data[offset + 1] = blend(data[offset + 1], g);
     data[offset + 2] = blend(data[offset + 2], b);
     data[offset + 3] = blend(data[offset + 3], 255);
+}
+
+/// Adds the bundled last-resort UI face on Linux and macOS.
+///
+/// `cosmic-text` (with `fontconfig` off) scans the system font directories
+/// itself; a minimal or headless Linux may have none at all, and then every
+/// label would be boxes. KaTeX_SansSerif (SIL OFL 1.1) is already compiled
+/// into the binary for math notes, so it costs nothing to register it as the
+/// face shaping falls back to when nothing else covers a glyph. Windows always
+/// has Segoe UI and keeps its phase-07 font list exactly.
+#[cfg(unix)]
+fn add_fallback_font(fonts: &mut FontSystem) {
+    match ratex_katex_fonts::ttf_bytes("KaTeX_SansSerif-Regular.ttf") {
+        Some(bytes) => fonts.db_mut().load_font_data(bytes.into_owned()),
+        None => tracing::warn!("the bundled fallback font is missing"),
+    }
 }
 
 #[cfg(test)]

@@ -324,6 +324,8 @@ pub struct MenuContext<'a> {
     pub click_through: bool,
     /// Whether the window is always-on-top.
     pub always_on_top: bool,
+    /// What the window system offers; unsupported modes are greyed out.
+    pub capabilities: crate::platform::capabilities::Capabilities,
     /// The ordinary opacity percent.
     pub opacity_percent: u8,
     /// Whether exactly one note is selected (enables the note commands).
@@ -631,17 +633,22 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
     // Ghost mode is its own Canvas entry: since phase 07 transparency is the
     // canvas background, while ghost mode still fades the whole window.
 
+    let mut always_on_top = MenuEntry::shortcut(
+        "Always on top",
+        S::ToggleAlwaysOnTop,
+        Action::ToggleAlwaysOnTop,
+    )
+    .check(context.always_on_top);
+    if !context.capabilities.always_on_top {
+        // Wayland: the compositor alone decides stacking.
+        always_on_top = always_on_top.disabled();
+    }
     let canvas = vec![
         MenuEntry::submenu("Background", themes),
         MenuEntry::shortcut("Lock canvas", S::LockCanvas, Action::ToggleCanvasLock)
             .check(context.locked),
         MenuEntry::separator(),
-        MenuEntry::shortcut(
-            "Always on top",
-            S::ToggleAlwaysOnTop,
-            Action::ToggleAlwaysOnTop,
-        )
-        .check(context.always_on_top),
+        always_on_top,
         MenuEntry::submenu("Transparency", transparency),
         MenuEntry::shortcut(
             "Click-through",
@@ -1171,6 +1178,7 @@ mod tests {
             ghost: false,
             click_through: false,
             always_on_top: false,
+            capabilities: crate::platform::capabilities::Capabilities::WIN32,
             opacity_percent: 100,
             note_selected: false,
             selected_image: None,
@@ -1183,6 +1191,29 @@ mod tests {
             .find(|entry| entry.label == "Image")
             .expect("Image menu")
             .children
+    }
+
+    #[test]
+    fn always_on_top_is_greyed_out_where_the_window_system_has_none() {
+        use crate::platform::capabilities::{Backend, for_backend};
+        let settings = Settings::default();
+        let shortcuts = Shortcuts::new();
+        let recents = Recents::default();
+        let always_on_top = |context: &MenuContext<'_>| {
+            build(context)
+                .into_iter()
+                .find(|entry| entry.label == "Canvas")
+                .expect("Canvas menu")
+                .children
+                .into_iter()
+                .find(|entry| entry.label == "Always on top")
+                .expect("Always on top")
+                .enabled
+        };
+        let mut wayland = context(&settings, &shortcuts, &recents);
+        wayland.capabilities = for_backend(Backend::Wayland);
+        assert!(!always_on_top(&wayland));
+        assert!(always_on_top(&context(&settings, &shortcuts, &recents)));
     }
 
     #[test]

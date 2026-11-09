@@ -62,6 +62,8 @@ mod settings;
 mod shortcuts;
 mod text;
 mod textures;
+#[cfg(unix)]
+mod thumbnail;
 mod ui;
 mod view;
 

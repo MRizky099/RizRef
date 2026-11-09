@@ -1,30 +1,53 @@
-//! Windows platform glue: everything that talks to the operating system.
+//! Platform glue: everything that talks to the operating system.
 //!
-//! This module is where the `windows` crate is used. Three things the window
-//! needs come from the OS rather than from winit:
+//! # Layout (phase 08)
 //!
-//! * **Single-instance guard.** A named mutex decides who is primary; a named
-//!   pipe carries the arguments of a second launch — typically a board to open
-//!   — to the running instance, which logs them and (from phase 05 on) opens
-//!   them, so double-clicking a `.rizref` file never starts a second app.
-//! * **Panic reporting.** A native message box next to the log file, because an
-//!   application without a console has nowhere else to say that it died.
-//! * **Logging location.** The user's local-appdata directory, queried from the
-//!   environment at runtime — never a hardcoded path.
+//! This module is a facade of free functions and plain types. Each submodule
+//! named here (`single_instance`, `window_modes`, `launch`, …) holds the part
+//! that is the same everywhere — wire formats, mode policy, argument
+//! validation, file naming — together with its tests, and re-exports the
+//! operating-system half from one of:
 //!
-//! Drag and drop is owned by [`drop_target`]: winit's own OLE target handles
-//! only `CF_HDROP`, so this crate registers a target that also accepts the
-//! virtual-file formats (Outlook attachments, files inside a compressed
-//! folder). The Explorer thumbnail provider belongs here too in later phases.
+//! * `windows` (`platform/windows/`) — the Win32/COM code of phases
+//!   01–07, unchanged in behaviour;
+//! * `unix` (`platform/unix/`) — what Linux and macOS share: the
+//!   Unix-domain-socket single instance, winit-level window modes, the
+//!   `rfd`/`arboard` paths;
+//! * `linux` (`platform/linux/`) and `macos` (`platform/macos/`) — what
+//!   differs between the two: launching (`xdg-open` / `open`) and file-type
+//!   registration (XDG desktop entries / the app bundle).
+//!
+//! There are no traits: every function has one body per `#[cfg]`, so a call
+//! site reads the same on every system and a missing counterpart is a
+//! compile error on that target, not a runtime surprise. A feature an OS
+//! cannot offer is a documented stub that reports so through
+//! [`capabilities`], and the UI greys the command out instead of offering
+//! something that silently does nothing.
 //!
 //! # Unsafe code
 //!
-//! Every crate in this workspace sets `#![deny(unsafe_code)]`. Win32 calls are
-//! `unsafe`, so each function in the submodules carries a narrow, documented
-//! `#[allow(unsafe_code)]` on the smallest possible item, with a safety note
-//! stating the invariant that makes the call sound. Keeping that confined to
-//! this module is the point: the rest of the application stays safe Rust.
+//! Every crate in this workspace sets `#![deny(unsafe_code)]`. OS calls are
+//! `unsafe`, so each function in the OS submodules carries a narrow,
+//! documented `#[allow(unsafe_code)]` on the smallest possible item, with a
+//! safety note stating the invariant that makes the call sound. The Unix
+//! backends need none: they are built on `std`, winit, `rfd` and `arboard`.
 
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+compile_error!("RizRef supports Windows, Linux and macOS");
+
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+mod unix;
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+pub mod capabilities;
 pub mod clipboard_html;
 pub mod console;
 pub mod crash;
@@ -34,7 +57,7 @@ pub mod icon;
 pub mod imaging;
 pub mod launch;
 pub mod message_box;
-pub mod registry;
+pub mod register;
 pub mod single_instance;
 pub mod window_modes;
 
