@@ -18,7 +18,7 @@ use std::fmt::Debug;
 use std::time::{Duration, Instant};
 
 use crate::group::{Group, GroupChild, GroupId};
-use crate::item::{Item, ItemState};
+use crate::item::{Item, ItemState, NoteContent};
 use crate::scene::{ItemId, Scene};
 
 /// What a command changed, for the renderer and the dirty flag.
@@ -556,57 +556,74 @@ impl Command for ReorderItems {
     impl_as_any!(ReorderItems);
 }
 
-/// Replaces one note's text.
+/// Replaces one note's content: text, format, background and wrap width.
 #[derive(Debug)]
-pub struct SetNoteText {
+pub struct SetNoteContent {
     item: ItemId,
-    before: String,
-    after: String,
+    before: NoteContent,
+    after: NoteContent,
+    coalesce: bool,
 }
 
-impl SetNoteText {
-    /// Builds a text command from both sides.
-    pub fn new(item: ItemId, before: impl Into<String>, after: impl Into<String>) -> Self {
+impl SetNoteContent {
+    /// Builds a content command from both sides.
+    pub fn new(item: ItemId, before: NoteContent, after: NoteContent) -> Self {
         Self {
             item,
-            before: before.into(),
-            after: after.into(),
+            before,
+            after,
+            coalesce: false,
         }
+    }
+
+    /// Lets consecutive edits of the same note within the coalescing window
+    /// merge into one step. Off by default: a committed edit session, an
+    /// applied background colour and a reflow are each their own undo step.
+    #[must_use]
+    pub const fn coalescing(mut self) -> Self {
+        self.coalesce = true;
+        self
     }
 
     /// The note the command edits.
     pub const fn item(&self) -> ItemId {
         self.item
     }
+
+    /// The content the command writes.
+    pub const fn after(&self) -> &NoteContent {
+        &self.after
+    }
 }
 
-impl Command for SetNoteText {
+/// Writes `content` and reports the note as changed. Live editing writes the
+/// text before the command runs, so the note is reported even when this write
+/// is a no-op: the renderer still rebuilds it from the committed content.
+fn write_note(scene: &mut Scene, id: ItemId, content: &NoteContent) -> Effects {
+    if let Some(item) = scene.item_mut(id) {
+        item.set_note(content);
+    }
+    Effects {
+        content: std::iter::once(id).collect(),
+        ..Effects::default()
+    }
+}
+
+impl Command for SetNoteContent {
     fn label(&self) -> &str {
         "Edit note"
     }
 
     fn apply(&mut self, scene: &mut Scene) -> Effects {
-        if let Some(item) = scene.item_mut(self.item) {
-            item.set_text(&self.after);
-        }
-        Effects {
-            content: std::iter::once(self.item).collect(),
-            ..Effects::default()
-        }
+        write_note(scene, self.item, &self.after)
     }
 
     fn revert(&mut self, scene: &mut Scene) -> Effects {
-        if let Some(item) = scene.item_mut(self.item) {
-            item.set_text(&self.before);
-        }
-        Effects {
-            content: std::iter::once(self.item).collect(),
-            ..Effects::default()
-        }
+        write_note(scene, self.item, &self.before)
     }
 
     fn coalesce_key(&self) -> Option<CoalesceKey> {
-        Some(CoalesceKey::NoteText(self.item))
+        self.coalesce.then_some(CoalesceKey::NoteText(self.item))
     }
 
     fn try_merge(&mut self, newer: &dyn Any) -> bool {
@@ -620,7 +637,7 @@ impl Command for SetNoteText {
         true
     }
 
-    impl_as_any!(SetNoteText);
+    impl_as_any!(SetNoteContent);
 }
 
 // ---------------------------------------------------------------------------
@@ -749,10 +766,10 @@ impl Command for DissolveGroup {
 mod tests {
     use super::{
         AddGroup, AddItems, CoalesceKey, Command, DissolveGroup, History, RemoveItems,
-        ReorderItems, SetNoteText, SetTransforms,
+        ReorderItems, SetNoteContent, SetTransforms,
     };
     use crate::group::{GroupChild, GroupId};
-    use crate::item::{Item, ItemState};
+    use crate::item::{Item, ItemState, NoteContent, NoteFormat};
     use crate::scene::{ItemId, Scene, SceneId};
     use crate::transform::Transform;
     use glam::Vec2;
@@ -1008,7 +1025,14 @@ mod tests {
         for (step, text) in ["ab", "abc", "abcd"].iter().enumerate() {
             history.apply_at(
                 &mut scene,
-                Box::new(SetNoteText::new(id, "a", *text)),
+                Box::new(
+                    SetNoteContent::new(
+                        id,
+                        NoteContent::markdown("a"),
+                        NoteContent::markdown(*text),
+                    )
+                    .coalescing(),
+                ),
                 now + Duration::from_millis(step as u64 * 10),
             );
         }
@@ -1134,11 +1158,46 @@ mod tests {
 
     #[test]
     fn a_command_reports_its_label_and_coalesce_key() {
-        let command = SetNoteText::new(ItemId::from_raw(3), "a", "b");
+        let plain = SetNoteContent::new(
+            ItemId::from_raw(3),
+            NoteContent::markdown("a"),
+            NoteContent::markdown("b"),
+        );
+        assert_eq!(plain.coalesce_key(), None, "separate steps by default");
+        let command = plain.coalescing();
         assert_eq!(command.label(), "Edit note");
         assert_eq!(
             command.coalesce_key(),
             Some(CoalesceKey::NoteText(ItemId::from_raw(3)))
         );
+    }
+
+    #[test]
+    fn note_content_undo_restores_format_background_and_wrap_width() {
+        let mut scene = scene();
+        let id = note(&mut scene, "a", 0.0);
+        let before = scene.item(id).and_then(Item::note_content).expect("note");
+        let after = NoteContent {
+            text: "# b".into(),
+            format: NoteFormat::Markdown,
+            background: Some([250, 250, 240]),
+            wrap_width: Some(120.0),
+        };
+        let mut history = History::default();
+
+        let effects = history.apply(
+            &mut scene,
+            Box::new(SetNoteContent::new(id, before.clone(), after.clone())),
+        );
+        assert!(effects.content.contains(&id));
+        assert_eq!(
+            scene.item(id).and_then(Item::note_content),
+            Some(after.clone())
+        );
+
+        history.undo(&mut scene).expect("undo");
+        assert_eq!(scene.item(id).and_then(Item::note_content), Some(before));
+        history.redo(&mut scene).expect("redo");
+        assert_eq!(scene.item(id).and_then(Item::note_content), Some(after));
     }
 }
