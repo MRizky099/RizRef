@@ -90,7 +90,9 @@ pub fn open_url(url: &str) -> Result<(), LaunchError> {
     if code > 32 {
         Ok(())
     } else {
-        Err(LaunchError::Failed(format!("ShellExecuteW returned {code}")))
+        Err(LaunchError::Failed(format!(
+            "ShellExecuteW returned {code}"
+        )))
     }
 }
 

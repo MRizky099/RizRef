@@ -57,7 +57,9 @@ pub fn normalize_url(candidate: &str) -> Option<String> {
     }
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let host = if host_port.starts_with('[') {
         // An IPv6 literal keeps its colons; the port follows the bracket.
         host_port.split_once(']').map(|(host, _)| &host[1..])?
@@ -373,7 +375,11 @@ pub fn decode_entities(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let Some(end) = rest[1..].find(';').map(|end| end + 1).filter(|end| *end <= 12) else {
+        let Some(end) = rest[1..]
+            .find(';')
+            .map(|end| end + 1)
+            .filter(|end| *end <= 12)
+        else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -429,7 +435,10 @@ pub fn utf16_until_nul(bytes: &[u8]) -> String {
 /// A NUL-terminated 8-bit string (`UniformResourceLocator`, uri-list).
 pub fn bytes_until_nul(bytes: &[u8]) -> String {
     let bytes = &bytes[..bytes.len().min(MAX_URL_PAYLOAD_BYTES)];
-    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
@@ -641,8 +650,12 @@ EndFragment:{end_fragment:010}
     /// first occurrence of `fragment`.
     fn cf_html_document(document: &str, fragment: &str, source_url: Option<&str>) -> Vec<u8> {
         let source = source_url
-            .map(|url| format!("SourceURL:{url}
-"))
+            .map(|url| {
+                format!(
+                    "SourceURL:{url}
+"
+                )
+            })
             .unwrap_or_default();
         let header_len = header([0; 4], &source).len();
         let start_fragment = header_len + document.find(fragment).expect("fragment");
@@ -657,10 +670,11 @@ EndFragment:{end_fragment:010}
 
     /// Builds a CF_HTML payload with correct offsets, as Chrome writes it.
     fn cf_html(fragment: &str, source_url: Option<&str>) -> Vec<u8> {
-        let document =
-            format!("<html><body>
+        let document = format!(
+            "<html><body>
 <!--StartFragment-->{fragment}<!--EndFragment-->
-</body></html>");
+</body></html>"
+        );
         cf_html_document(&document, fragment, source_url)
     }
 
@@ -746,7 +760,10 @@ EndFragment:{end_fragment:010}
         assert_eq!(resolve_url(None, "a.png"), None);
         assert_eq!(resolve_url(Some("file:///C:/x/"), "a.png"), None);
         assert_eq!(resolve_url(Some("https://e.com/"), "javascript:x"), None);
-        assert_eq!(resolve_url(Some("https://e.com/"), "data:image/png,x"), None);
+        assert_eq!(
+            resolve_url(Some("https://e.com/"), "data:image/png,x"),
+            None
+        );
         assert_eq!(resolve_url(Some("https://e.com/"), "   "), None);
     }
 
@@ -829,7 +846,11 @@ EndFragment:{end_fragment:010}
         assert_eq!(url_from_cf_html(negative.as_bytes()), None);
 
         let truncated = &good[..good.len() - 40];
-        assert_eq!(url_from_cf_html(truncated), None, "EndFragment past the end");
+        assert_eq!(
+            url_from_cf_html(truncated),
+            None,
+            "EndFragment past the end"
+        );
 
         assert_eq!(url_from_cf_html(b"Version:0.9\r\n"), None);
         assert_eq!(url_from_cf_html(b""), None);
@@ -864,8 +885,12 @@ EndFragment:{end_fragment:010}
     #[test]
     fn attribute_scanning_is_tolerant_and_exact() {
         assert_eq!(
-            first_tag_attribute(r#"<image src="no"><img data-src="no" src="yes">"#, "img", "src")
-                .as_deref(),
+            first_tag_attribute(
+                r#"<image src="no"><img data-src="no" src="yes">"#,
+                "img",
+                "src"
+            )
+            .as_deref(),
             Some("yes"),
             "<image> is not <img>, data-src is not src"
         );
@@ -923,7 +948,11 @@ EndFragment:{end_fragment:010}
             .collect();
         wide.extend_from_slice(&[0, 0, b'x', 0]);
         assert_eq!(utf16_until_nul(&wide), "https://e.com/ä.png");
-        assert_eq!(utf16_until_nul(&[0x68]), "", "an odd trailing byte is dropped");
+        assert_eq!(
+            utf16_until_nul(&[0x68]),
+            "",
+            "an odd trailing byte is dropped"
+        );
         assert_eq!(bytes_until_nul(b"https://e.com/a\0junk"), "https://e.com/a");
         assert_eq!(bytes_until_nul(b"no terminator"), "no terminator");
 
@@ -935,7 +964,10 @@ EndFragment:{end_fragment:010}
             moz_url(&text_payload(&moz)).as_deref(),
             Some("https://e.com/a.png")
         );
-        assert_eq!(text_payload(b"https://e.com/b\r\n\0"), "https://e.com/b\r\n");
+        assert_eq!(
+            text_payload(b"https://e.com/b\r\n\0"),
+            "https://e.com/b\r\n"
+        );
         assert_eq!(text_payload(b""), "");
     }
 
@@ -959,13 +991,25 @@ EndFragment:{end_fragment:010}
 
         let mut no_img = all.clone();
         no_img.html = Some(cf_html("<p>x</p>", Some("https://e.com/feed")));
-        assert_eq!(choose_drop_url(&no_img).as_deref(), Some("https://e.com/post"));
+        assert_eq!(
+            choose_drop_url(&no_img).as_deref(),
+            Some("https://e.com/post")
+        );
         no_img.locator_wide = Some("javascript:alert(1)".to_owned());
-        assert_eq!(choose_drop_url(&no_img).as_deref(), Some("https://e.com/ansi"));
+        assert_eq!(
+            choose_drop_url(&no_img).as_deref(),
+            Some("https://e.com/ansi")
+        );
         no_img.locator_ansi = None;
-        assert_eq!(choose_drop_url(&no_img).as_deref(), Some("https://e.com/list"));
+        assert_eq!(
+            choose_drop_url(&no_img).as_deref(),
+            Some("https://e.com/list")
+        );
         no_img.uri_list = None;
-        assert_eq!(choose_drop_url(&no_img).as_deref(), Some("https://e.com/moz"));
+        assert_eq!(
+            choose_drop_url(&no_img).as_deref(),
+            Some("https://e.com/moz")
+        );
         no_img.moz_url = None;
         assert_eq!(
             choose_drop_url(&no_img).as_deref(),
@@ -985,7 +1029,10 @@ EndFragment:{end_fragment:010}
         assert_eq!(png_name_from_url(Some("https://e.com/")), "dropped.png");
         assert_eq!(png_name_from_url(Some("https://e.com")), "dropped.png");
         assert_eq!(png_name_from_url(Some("javascript:x")), "dropped.png");
-        assert_eq!(png_name_from_url(Some("https://e.com/../..")), "dropped.png");
+        assert_eq!(
+            png_name_from_url(Some("https://e.com/../..")),
+            "dropped.png"
+        );
         assert_eq!(png_name_from_url(None), "dropped.png");
         let long = format!("https://e.com/{}.png", "x".repeat(300));
         assert_eq!(png_name_from_url(Some(&long)).len(), 64 + ".png".len());
@@ -1015,7 +1062,10 @@ EndFragment:{end_fragment:010}
             record_for(&import(Some(r"D:\refs\a.png"), None)).origin,
             AssetOrigin::File
         );
-        assert_eq!(record_for(&import(None, None)).origin, AssetOrigin::Clipboard);
+        assert_eq!(
+            record_for(&import(None, None)).origin,
+            AssetOrigin::Clipboard
+        );
         let invalid = record_for(&import(Some(r"D:\refs\a.png"), Some("javascript:x")));
         assert_eq!(invalid.source_url, None, "an invalid URL is not recorded");
         assert_eq!(invalid.source_path.as_deref(), Some(r"D:\refs\a.png"));
@@ -1024,7 +1074,10 @@ EndFragment:{end_fragment:010}
 
     #[test]
     fn the_merge_keeps_the_best_provenance() {
-        let web = record_for(&import(Some(r"C:\Temp\cache.png"), Some("https://e.com/a.png")));
+        let web = record_for(&import(
+            Some(r"C:\Temp\cache.png"),
+            Some("https://e.com/a.png"),
+        ));
         let disk = record_for(&import(Some(r"D:\refs\a.png"), None));
         let pasted = record_for(&import(None, None));
 
@@ -1060,7 +1113,10 @@ EndFragment:{end_fragment:010}
             source_url: None,
         };
         let pasted = record_for(&import(None, None));
-        assert_eq!(merge(Some(&generated), pasted.clone()).origin, AssetOrigin::Generated);
+        assert_eq!(
+            merge(Some(&generated), pasted.clone()).origin,
+            AssetOrigin::Generated
+        );
 
         let unknown = AssetProvenance::default();
         assert_eq!(merge(Some(&unknown), pasted).origin, AssetOrigin::Clipboard);

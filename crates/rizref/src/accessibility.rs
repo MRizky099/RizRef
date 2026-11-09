@@ -23,6 +23,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::window::Window;
 
 use crate::app::AppEvent;
+use crate::ui::image_info::{ImageInfoPanel, InfoButton};
 use crate::ui::menu::{Action, MenuEntry};
 use crate::ui::panels::ConfirmClose;
 use crate::ui::titlebar::TitleBar;
@@ -57,6 +58,12 @@ const NOTE_GROUP_ID: u64 = 6;
 const NOTE_SOURCE_ID: u64 = 7;
 /// First note-chrome button id.
 const FIRST_NOTE_BUTTON_ID: u64 = 30;
+/// The modal image information dialog.
+const IMAGE_INFO_ID: u64 = 8;
+/// First image-info value row.
+const FIRST_INFO_ROW_ID: u64 = 40;
+/// First image-info button.
+const FIRST_INFO_BUTTON_ID: u64 = 70;
 /// First dynamically allocated menu node id.
 const FIRST_MENU_ID: u64 = 100;
 
@@ -100,6 +107,7 @@ impl Accessibility {
     }
 
     /// Publishes the current command tree, window controls and status line.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         menus: &[MenuEntry],
@@ -107,10 +115,18 @@ impl Accessibility {
         window: &Window,
         title_bar: &TitleBar,
         confirm_close: Option<&ConfirmClose>,
+        image_info: Option<&ImageInfoPanel>,
         notes: &NoteControls,
     ) {
-        let (update, actions) =
-            build_update(menus, status, window, title_bar, confirm_close, notes);
+        let (update, actions) = build_update(
+            menus,
+            status,
+            window,
+            title_bar,
+            confirm_close,
+            image_info,
+            notes,
+        );
         self.actions = actions;
         self.adapter.update_if_active(|| update);
     }
@@ -137,6 +153,7 @@ fn build_update(
     window: &Window,
     title_bar: &TitleBar,
     confirm_close: Option<&ConfirmClose>,
+    image_info: Option<&ImageInfoPanel>,
     notes: &NoteControls,
 ) -> (TreeUpdate, HashMap<u64, Action>) {
     let size = window.inner_size();
@@ -159,6 +176,9 @@ fn build_update(
     }
     if confirm_close.is_some() {
         root.push_child(NodeId(CONFIRM_ID));
+    }
+    if image_info.is_some() {
+        root.push_child(NodeId(IMAGE_INFO_ID));
     }
 
     let mut controls = Node::new(Role::Group);
@@ -277,9 +297,22 @@ fn build_update(
         nodes.push((NodeId(CONFIRM_DISCARD_ID), discard));
     }
 
-    // The dialog owns focus while it is open; otherwise the window root does.
+    if let Some(dialog) = image_info {
+        push_image_info(&mut nodes, &mut actions, dialog);
+    }
+
+    // A dialog owns focus while it is open (the close guard above the info
+    // dialog); otherwise the window root does.
     let focus = if confirm_close.is_some() {
         NodeId(CONFIRM_ID)
+    } else if let Some(dialog) = image_info {
+        let index = dialog
+            .info
+            .buttons()
+            .iter()
+            .position(|button| *button == dialog.focused())
+            .unwrap_or(0);
+        NodeId(FIRST_INFO_BUTTON_ID + index as u64)
     } else {
         NodeId(ROOT_ID)
     };
@@ -298,6 +331,50 @@ fn build_update(
         },
         actions,
     )
+}
+
+/// Publishes the image information dialog: a `Dialog` (UIA
+/// `ControlType.Window`) with one label per value row, carrying the full,
+/// un-elided value, and one named button per footer action. Nothing traps
+/// focus: every button is a click target and Close is always present.
+fn push_image_info(
+    nodes: &mut Vec<(NodeId, Node)>,
+    actions: &mut HashMap<u64, Action>,
+    dialog: &ImageInfoPanel,
+) {
+    let info = &dialog.info;
+    let mut node = Node::new(Role::Dialog);
+    node.set_label("Image info");
+    node.set_description(format!("{}. {}", info.title, info.location_note()));
+    node.set_modal();
+
+    for (index, (label, value)) in info.rows().into_iter().enumerate() {
+        let id = FIRST_INFO_ROW_ID + index as u64;
+        let mut row = Node::new(Role::Label);
+        row.set_label(format!("{label}: {value}"));
+        row.set_value(value);
+        node.push_child(NodeId(id));
+        nodes.push((NodeId(id), row));
+    }
+
+    for (index, button) in info.buttons().into_iter().enumerate() {
+        let id = FIRST_INFO_BUTTON_ID + index as u64;
+        let mut control = Node::new(Role::Button);
+        control.set_label(info.button_label(button));
+        control.add_action(A11yAction::Click);
+        actions.insert(
+            id,
+            match button {
+                InfoButton::Open => Action::OpenImageLocation,
+                InfoButton::CopyLocation => Action::CopyImageLocation,
+                InfoButton::CopyId => Action::CopyImageAssetId,
+                InfoButton::Close => Action::CloseImageInfo,
+            },
+        );
+        node.push_child(NodeId(id));
+        nodes.push((NodeId(id), control));
+    }
+    nodes.push((NodeId(IMAGE_INFO_ID), node));
 }
 
 /// Recursively adds `entries` and returns their node ids.
@@ -361,7 +438,69 @@ fn build_children(
 
 #[cfg(test)]
 mod tests {
-    use super::{FIRST_MENU_ID, build_children};
+    use super::{
+        FIRST_INFO_BUTTON_ID, FIRST_INFO_ROW_ID, FIRST_MENU_ID, IMAGE_INFO_ID, build_children,
+        push_image_info,
+    };
+
+    #[test]
+    fn the_image_info_dialog_publishes_rows_and_buttons() {
+        use crate::ui::image_info::{ImageInfo, ImageInfoPanel};
+        use glam::Vec2;
+        use rizref_codecs::{ImageBuffer, ImageFormat};
+        use rizref_core::{Asset, Scene, SceneId};
+        use rizref_format::{AssetOrigin, AssetProvenance};
+
+        let mut scene = Scene::new(SceneId::random());
+        let image = ImageBuffer::filled(2, 2, [0, 0, 0, 255]);
+        let asset = Asset::from_decoded(
+            std::sync::Arc::from(vec![1u8; 4]),
+            ImageFormat::Png,
+            &image,
+            image.clone(),
+        );
+        let (asset, _) = scene.insert_asset(asset);
+        let item = scene
+            .insert_image(asset, Vec2::ZERO, Vec2::ONE)
+            .expect("asset");
+        let url = format!("https://e.com/{}.png", "long".repeat(80));
+        let provenance = AssetProvenance {
+            origin: AssetOrigin::Clipboard,
+            source_path: None,
+            source_url: Some(url.clone()),
+        };
+        let info = ImageInfo::from_scene(&scene, item, Some(&provenance)).expect("image");
+        let dialog = ImageInfoPanel::new(info, None);
+
+        let mut nodes = Vec::new();
+        let mut actions = HashMap::new();
+        push_image_info(&mut nodes, &mut actions, &dialog);
+
+        let node = |id: u64| {
+            nodes
+                .iter()
+                .find(|(node_id, _)| node_id.0 == id)
+                .map(|(_, node)| node)
+                .unwrap_or_else(|| panic!("node {id}"))
+        };
+        assert_eq!(node(IMAGE_INFO_ID).role(), accesskit::Role::Dialog);
+        assert_eq!(
+            node(FIRST_INFO_ROW_ID).value(),
+            Some(url.as_str()),
+            "the full URL, not the elided one"
+        );
+        assert_eq!(actions.len(), 4, "open, copy URL, copy id, close");
+        assert_eq!(
+            actions.get(&FIRST_INFO_BUTTON_ID),
+            Some(&Action::OpenImageLocation)
+        );
+        assert_eq!(
+            actions.get(&(FIRST_INFO_BUTTON_ID + 3)),
+            Some(&Action::CloseImageInfo)
+        );
+        assert_eq!(node(FIRST_INFO_BUTTON_ID + 1).label(), Some("Copy URL"));
+    }
+
     use crate::ui::menu::Action;
     use crate::ui::menu::MenuEntry;
     use std::collections::HashMap;

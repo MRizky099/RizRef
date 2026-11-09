@@ -62,6 +62,8 @@ pub struct Shell {
     pub settings: Option<panels::SettingsPanel>,
     /// The modal unsaved-changes dialog, if closing would lose work.
     pub confirm_close: Option<panels::ConfirmClose>,
+    /// The modal image information dialog, if open.
+    pub image_info: Option<image_info::ImageInfoPanel>,
     /// The current toast, if any.
     pub toast: Option<Toast>,
     /// The note background popover, if open.
@@ -87,6 +89,7 @@ impl Shell {
             shortcuts: None,
             settings: None,
             confirm_close: None,
+            image_info: None,
             toast: None,
             note_color: None,
             tooltip: None,
@@ -108,6 +111,7 @@ impl Shell {
         self.menu = None;
         self.shortcuts = None;
         self.settings = None;
+        self.image_info = None;
         self.note_color = None;
         self.tooltip = None;
         self.picker = false;
@@ -132,6 +136,29 @@ impl Shell {
             || self.shortcuts.is_some()
             || self.settings.is_some()
             || self.confirm_close.is_some()
+            || self.image_info.is_some()
+    }
+
+    /// Opens the image information dialog, closing the other overlays.
+    pub fn open_image_info(&mut self, panel: image_info::ImageInfoPanel) {
+        self.menu = None;
+        self.note_color = None;
+        self.shortcuts = None;
+        self.settings = None;
+        self.tooltip = None;
+        self.picker = false;
+        self.image_info = Some(panel);
+        self.touch();
+    }
+
+    /// Closes the image information dialog. Returns whether it was open.
+    pub fn close_image_info(&mut self) -> bool {
+        if self.image_info.take().is_some() {
+            self.touch();
+            true
+        } else {
+            false
+        }
     }
 
     /// Opens the close guard for `title`, closing the other overlays.
@@ -154,6 +181,7 @@ impl Shell {
         self.menu = None;
         self.shortcuts = None;
         self.settings = None;
+        self.image_info = None;
         self.confirm_close = Some(panels::ConfirmClose::for_action(title, discard_label, note));
         self.touch();
     }
@@ -240,6 +268,7 @@ impl Shell {
     /// Closes whichever overlay is open. Returns whether one was open.
     pub fn escape(&mut self) -> bool {
         let closed = self.confirm_close.take().is_some()
+            || self.image_info.take().is_some()
             || self.menu.take().is_some()
             || self.note_color.take().is_some()
             || self.shortcuts.take().is_some()
@@ -339,6 +368,10 @@ impl UiLayer {
         if let Some(panel) = &shell.settings {
             panel.paint(&mut painter, viewport, settings);
         }
+        if let Some(dialog) = &shell.image_info {
+            dialog.paint(&mut painter, viewport);
+        }
+        // Above the info dialog's backdrop, so "Path copied" stays visible.
         if let Some(toast) = &shell.toast {
             paint_toast(&mut painter, viewport, &toast.text);
         }
@@ -509,6 +542,38 @@ mod tests {
         assert!(shell.escape());
         assert!(shell.confirm_close.is_none());
         assert!(!shell.has_overlay());
+    }
+
+    #[test]
+    fn the_image_info_dialog_is_modal_and_escape_closes_it() {
+        use super::image_info::{ImageInfo, ImageInfoPanel};
+        use glam::Vec2;
+        use rizref_codecs::{ImageBuffer, ImageFormat};
+        use rizref_core::{Asset, Scene, SceneId};
+
+        let mut scene = Scene::new(SceneId::random());
+        let image = ImageBuffer::filled(2, 2, [0, 0, 0, 255]);
+        let asset = Asset::from_decoded(
+            std::sync::Arc::from(vec![1u8; 4]),
+            ImageFormat::Png,
+            &image,
+            image.clone(),
+        );
+        let (asset, _) = scene.insert_asset(asset);
+        let item = scene
+            .insert_image(asset, Vec2::ZERO, Vec2::ONE)
+            .expect("asset");
+        let info = ImageInfo::from_scene(&scene, item, None).expect("image");
+
+        let mut shell = Shell::new(Mode::Canvas);
+        shell.toggle_settings();
+        shell.open_image_info(ImageInfoPanel::new(info, None));
+        assert!(shell.settings.is_none(), "other overlays close");
+        assert!(shell.has_overlay());
+        assert!(shell.escape());
+        assert!(shell.image_info.is_none());
+        assert!(!shell.has_overlay());
+        assert!(!shell.close_image_info());
     }
 
     #[test]

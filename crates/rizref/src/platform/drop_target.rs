@@ -338,10 +338,8 @@ fn url_payloads(data: &IDataObject) -> DropUrlPayloads {
             .map(|bytes| provenance::utf16_until_nul(&bytes)),
         locator_ansi: text(w!("UniformResourceLocator"), small)
             .map(|bytes| provenance::bytes_until_nul(&bytes)),
-        uri_list: text(w!("text/uri-list"), small)
-            .map(|bytes| provenance::text_payload(&bytes)),
-        moz_url: text(w!("text/x-moz-url"), small)
-            .map(|bytes| provenance::text_payload(&bytes)),
+        uri_list: text(w!("text/uri-list"), small).map(|bytes| provenance::text_payload(&bytes)),
+        moz_url: text(w!("text/x-moz-url"), small).map(|bytes| provenance::text_payload(&bytes)),
         html: text(w!("HTML Format"), provenance::MAX_HTML_BYTES)
             .or_else(|| text(w!("text/html"), provenance::MAX_HTML_BYTES)),
     }
@@ -655,7 +653,11 @@ mod tests {
         let url = || Some("https://e.com/a.png".to_owned());
         assert_eq!(attach_url(1, url()), url());
         assert_eq!(attach_url(2, url()), None, "a multi-file drop is ambiguous");
-        assert_eq!(attach_url(0, url()), None, "a URL-only drag imports nothing");
+        assert_eq!(
+            attach_url(0, url()),
+            None,
+            "a URL-only drag imports nothing"
+        );
         assert_eq!(attach_url(1, None), None);
     }
 

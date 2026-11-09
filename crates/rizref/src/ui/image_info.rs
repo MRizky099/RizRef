@@ -169,10 +169,7 @@ impl ImageInfo {
         if let Some((frames, duration)) = self.animation {
             rows.push((
                 "Animation",
-                format!(
-                    "{frames} frames · {:.2} s per loop",
-                    duration.as_secs_f64()
-                ),
+                format!("{frames} frames · {:.2} s per loop", duration.as_secs_f64()),
             ));
         }
         rows.push((
@@ -226,10 +223,12 @@ impl ImageInfo {
     /// The label of a footer button for this image.
     pub fn button_label(&self, button: InfoButton) -> &'static str {
         match button {
-            InfoButton::Open => self.location_kind.map_or("Open location", |kind| match kind {
-                LocationKind::Local => "Open location",
-                LocationKind::Web => "Open URL",
-            }),
+            InfoButton::Open => self
+                .location_kind
+                .map_or("Open location", |kind| match kind {
+                    LocationKind::Local => "Open location",
+                    LocationKind::Web => "Open URL",
+                }),
             InfoButton::CopyLocation if self.location_is_url => "Copy URL",
             InfoButton::CopyLocation => "Copy path",
             InfoButton::CopyId => "Copy asset ID",
@@ -330,10 +329,7 @@ impl ImageInfoPanel {
             return InfoResult::Activate(self.focused());
         }
         let layout = Layout::new(viewport, &self.info);
-        if layout
-            .panel
-            .contains(position.x as f32, position.y as f32)
-        {
+        if layout.panel.contains(position.x as f32, position.y as f32) {
             InfoResult::None
         } else {
             InfoResult::Activate(InfoButton::Close)
@@ -414,12 +410,7 @@ impl ImageInfoPanel {
             if focused {
                 painter.fill_round_rect(*rect, 6.0, HOVER_BG);
             }
-            painter.stroke_round_rect(
-                *rect,
-                6.0,
-                1.0,
-                if focused { ACCENT } else { PANEL_BORDER },
-            );
+            painter.stroke_round_rect(*rect, 6.0, 1.0, if focused { ACCENT } else { PANEL_BORDER });
             painter.text_centered(
                 self.info.button_label(*button),
                 *rect,
@@ -604,7 +595,9 @@ fn display_name(location: &str, is_url: bool) -> Option<String> {
             .next()
             .unwrap_or(location)
             .trim_end_matches('/');
-        let (_, rest) = without_suffix.split_once("://").unwrap_or(("", without_suffix));
+        let (_, rest) = without_suffix
+            .split_once("://")
+            .unwrap_or(("", without_suffix));
         rest.split_once('/')
             .and_then(|(_, path)| path.rsplit('/').next())
             .or(Some(rest))
@@ -725,7 +718,11 @@ mod tests {
         );
         assert_eq!(
             info.buttons(),
-            [InfoButton::CopyLocation, InfoButton::CopyId, InfoButton::Close]
+            [
+                InfoButton::CopyLocation,
+                InfoButton::CopyId,
+                InfoButton::Close
+            ]
         );
     }
 
@@ -754,7 +751,10 @@ mod tests {
     fn animation_facts_appear_for_animated_assets() {
         let mut scene = Scene::new(SceneId::random());
         let frame = |ms| {
-            AnimationFrame::new(ImageBuffer::filled(4, 4, [0, 0, 0, 255]), Duration::from_millis(ms))
+            AnimationFrame::new(
+                ImageBuffer::filled(4, 4, [0, 0, 0, 255]),
+                Duration::from_millis(ms),
+            )
         };
         let animation = Animation::new(vec![frame(100), frame(150)]).expect("frames");
         let image = ImageBuffer::filled(4, 4, [0, 0, 0, 255]);
@@ -787,8 +787,14 @@ mod tests {
         assert_eq!(scale_text((150.0, 100.0), (100, 100)), "150% × 100%");
         assert_eq!(scale_text((1.0, 1.0), (0, 0)), "—");
 
-        assert_eq!(rotation_text(-90.0, (true, false)), "270° · mirrored horizontally");
-        assert_eq!(rotation_text(12.34, (true, true)), "12.3° · mirrored both ways");
+        assert_eq!(
+            rotation_text(-90.0, (true, false)),
+            "270° · mirrored horizontally"
+        );
+        assert_eq!(
+            rotation_text(12.34, (true, true)),
+            "12.3° · mirrored both ways"
+        );
 
         assert_eq!(origin_label(AssetOrigin::Generated), "Generated");
         for format in ImageFormat::ALL {
@@ -809,7 +815,10 @@ mod tests {
             Some("b.webp")
         );
         assert_eq!(display_name("https://e.com/a/", true).as_deref(), Some("a"));
-        assert_eq!(display_name("https://e.com", true).as_deref(), Some("e.com"));
+        assert_eq!(
+            display_name("https://e.com", true).as_deref(),
+            Some("e.com")
+        );
     }
 
     fn panel() -> ImageInfoPanel {
@@ -895,14 +904,18 @@ mod tests {
     fn painting_does_not_panic_at_any_size() {
         let panel = panel();
         let mut engine = crate::text::TextEngine::new();
-        for (width, height, scale) in [(1280u32, 800u32, 1.0f32), (420, 300, 1.0), (800, 600, 2.0)] {
+        for (width, height, scale) in [(1280u32, 800u32, 1.0f32), (420, 300, 1.0), (800, 600, 2.0)]
+        {
             let mut pixmap = Pixmap::new(
                 (width as f32 * scale) as u32,
                 (height as f32 * scale) as u32,
             )
             .expect("allocates");
             let mut painter = Painter::new(&mut pixmap, &mut engine, scale);
-            panel.paint(&mut painter, DVec2::new(f64::from(width), f64::from(height)));
+            panel.paint(
+                &mut painter,
+                DVec2::new(f64::from(width), f64::from(height)),
+            );
         }
     }
 }

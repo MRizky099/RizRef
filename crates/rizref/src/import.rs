@@ -113,6 +113,7 @@ impl ImportRequest {
     }
 
     /// A request for in-memory bytes.
+    #[cfg(test)]
     pub fn bytes(label: impl Into<String>, bytes: impl Into<Arc<[u8]>>, drop_world: Vec2) -> Self {
         Self::new(ImportSource::bytes(label, bytes), drop_world)
     }

@@ -145,8 +145,7 @@ pub fn plan(
                 Probe::Directory => LocationPlan::OpenParent(path),
                 Probe::Missing => match path.parent() {
                     Some(parent)
-                        if !parent.as_os_str().is_empty()
-                            && probe(parent) == Probe::Directory =>
+                        if !parent.as_os_str().is_empty() && probe(parent) == Probe::Directory =>
                     {
                         LocationPlan::OpenParent(parent.to_path_buf())
                     }

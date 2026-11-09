@@ -227,7 +227,8 @@ impl<'a> Painter<'a> {
         let x = rect.x + (rect.width - drawn_width) * 0.5;
         let y = rect.y + (rect.height - drawn_height) * 0.5;
         let device = fit * self.scale;
-        let transform = Transform::from_row(device, 0.0, 0.0, device, x * self.scale, y * self.scale);
+        let transform =
+            Transform::from_row(device, 0.0, 0.0, device, x * self.scale, y * self.scale);
         let paint = tiny_skia::PixmapPaint {
             quality: tiny_skia::FilterQuality::Bilinear,
             ..tiny_skia::PixmapPaint::default()
@@ -255,7 +256,9 @@ impl<'a> Painter<'a> {
 /// A premultiplied tiny-skia pixmap from straight-alpha RGBA pixels, for
 /// [`Painter::image`]. `None` for an empty image or mismatched data.
 pub fn pixmap_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<Pixmap> {
-    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
     if rgba.len() != expected {
         return None;
     }
