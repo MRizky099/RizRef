@@ -56,7 +56,7 @@ contract: [`format.md` → scene document](format.md) (`origin`, `source_path`,
 - Fixes found by hand testing: a left-button release always resolved to `EndPan` and
   never reached `Board::pointer_up`, so a clicked item stayed stuck to the cursor and
   could not be deselected (a phase 04 bug; the release now ends the pan and the board
-  gesture). Explorer `/select` with an 8.3 short path (`MRIZKY~1`) opened the folder
+  gesture). Explorer `/select` with an 8.3 short path (`USERNA~1`) opened the folder
   without selecting the file; paths are expanded with `GetLongPathNameW` first. The
   info dialog's keyboard hint overlapped the buttons in a small window; it now shortens.
   **Show grid** and **Scene border** were toggled in the menu but never reached the

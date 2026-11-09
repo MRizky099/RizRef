@@ -34,11 +34,11 @@ board thumbnails, atomic fresh saves, incremental appends, recovery and compacti
 `<span style>` colours and sizes, inline/display math typeset by RaTeX, a hover
 toolbar with a background colour popover and auto-contrast ink, a fixed wrap width
 with explicit "Reflow to box width", no note rotation, a title-bar ☰ menu, and the
-additive `.rizref` note fields) have landed. Phase 06b (image provenance: browser
-source-URL capture on paste and drag, Open file location / Open image URL for one
-selected image with strict http/https launching, and a read-only image info dialog)
-is delivered on its feature branch and awaits review; phase 07 (polish and ship) is
-next. The workspace builds, tests and lints clean.
+additive `.rizref` note fields) and phase 06b (image provenance: browser source-URL
+capture on paste and drag, Open file location / Open image URL for one selected image
+with strict http/https launching, and a read-only image info dialog) have landed, which
+completes phase 06. Phase 07 (polish and ship) is next. The workspace builds, tests and
+lints clean.
 
 ## Design principles
 

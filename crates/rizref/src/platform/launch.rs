@@ -71,7 +71,7 @@ pub fn open_folder(path: &Path) -> Result<(), LaunchError> {
     spawn_explorer(&argument)
 }
 
-/// Expands 8.3 short names (`MRIZKY~1`) to the long path.
+/// Expands 8.3 short names (`USERNA~1`) to the long path.
 ///
 /// Explorer opens the folder of a short `/select` path but does not select
 /// the file, and short names reach a board through command-line arguments.
