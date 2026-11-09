@@ -7,6 +7,7 @@ use glam::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::asset::{Asset, AssetId, AssetStore};
+use crate::geometry::Rect;
 use crate::group::{Group, GroupChild, GroupId, Groups};
 use crate::item::Item;
 
@@ -201,6 +202,21 @@ impl Scene {
     /// The items in z-order.
     pub fn items(&self) -> &[Item] {
         &self.items
+    }
+
+    /// The items whose world bounds intersect `visible`, in z-order.
+    ///
+    /// This is the render loop's visible set: only these items are instanced
+    /// and only their textures are kept warm, so the per-frame cost follows
+    /// what is on screen rather than how large the board is. `visible` is
+    /// usually [`crate::Camera::visible_world_rect`], which is already the
+    /// axis-aligned box around a rotated viewport, and an item's
+    /// [`Item::world_rect`] is the box around its rotated quad, so the test is
+    /// conservative: an item is never dropped while any part of it shows.
+    pub fn visible_items<'a>(&'a self, visible: &'a Rect) -> impl Iterator<Item = &'a Item> + 'a {
+        self.items
+            .iter()
+            .filter(move |item| item.world_rect().intersects(visible))
     }
 
     /// The items in z-order, for mutation.
@@ -435,6 +451,7 @@ impl Scene {
 mod tests {
     use super::{ItemId, Scene, SceneId};
     use crate::asset::{Asset, AssetId};
+    use crate::geometry::Rect;
     use crate::group::{GroupChild, GroupId};
     use crate::item::Item;
     use glam::Vec2;
@@ -454,6 +471,47 @@ mod tests {
             ImageBuffer::filled(2, 1, [1, 2, 3, 255]),
         );
         scene.insert_asset(asset).0
+    }
+
+    #[test]
+    fn only_items_that_touch_the_view_are_visible_and_order_is_kept() {
+        let mut scene = Scene::new(scene_id());
+        let below = scene.insert_note("below", Vec2::new(0.0, 0.0), Vec2::splat(100.0));
+        let far = scene.insert_note("far", Vec2::new(5_000.0, 0.0), Vec2::splat(100.0));
+        let edge = scene.insert_note("edge", Vec2::new(240.0, 0.0), Vec2::splat(100.0));
+        let view = Rect::from_min_max(Vec2::new(-200.0, -200.0), Vec2::new(200.0, 200.0));
+
+        let ids: Vec<ItemId> = scene.visible_items(&view).map(Item::id).collect();
+
+        assert_eq!(
+            ids,
+            vec![below, edge],
+            "the far note is culled, z-order kept"
+        );
+        assert!(!ids.contains(&far));
+    }
+
+    #[test]
+    fn a_rotated_item_is_kept_while_its_corner_shows() {
+        let mut scene = Scene::new(scene_id());
+        // A 400 x 20 bar centred at x = 300 reaches back to x = 100, inside a
+        // view that ends at x = 150; stood upright around its centre it spans
+        // only x = 290..310 and leaves the view entirely.
+        let id = scene.insert_note("bar", Vec2::new(300.0, 0.0), Vec2::new(400.0, 20.0));
+        let view = Rect::from_min_max(Vec2::new(-200.0, -200.0), Vec2::new(150.0, 200.0));
+        assert_eq!(
+            scene.visible_items(&view).count(),
+            1,
+            "the bar reaches into the view"
+        );
+
+        let item = scene.item_mut(id).expect("note");
+        item.set_transform(item.transform().with_rotation(std::f32::consts::FRAC_PI_2));
+        assert_eq!(
+            scene.visible_items(&view).count(),
+            0,
+            "upright, it is outside"
+        );
     }
 
     #[test]
