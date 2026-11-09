@@ -39,6 +39,7 @@ mod overlay;
 mod paths;
 mod placement;
 mod platform;
+mod provenance;
 mod recents;
 mod renderer;
 mod settings;
