@@ -1,0 +1,97 @@
+name: Release
+
+# Pushing a version tag (`v1.2.3`) builds, tests and packages RizRef, then
+# creates a DRAFT GitHub release with the artifacts and notes generated from
+# the conventional commits since the previous tag. Nothing is published until
+# a maintainer reviews the draft and presses "Publish release".
+#
+# Code signing is a hook: when the repository has the secrets
+# `RIZREF_SIGN_PFX_BASE64` (a base64-encoded .pfx) and `RIZREF_SIGN_PASSWORD`,
+# the binaries and the installer are signed; without them the job builds
+# unsigned artifacts and says so in the log. No certificate exists yet.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build a draft release for"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build, test, package
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      # `if:` cannot read secrets directly; this flag can.
+      HAS_CERT: ${{ secrets.RIZREF_SIGN_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Release notes walk the history back to the previous tag.
+          fetch-depth: 0
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches the workspace version
+        shell: bash
+        run: |
+          version=$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "::error::tag ${TAG} does not match the workspace version ${version}"
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Restore the signing certificate
+        if: ${{ env.HAS_CERT == 'true' }}
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.RIZREF_SIGN_PFX_BASE64 }}
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP 'rizref-sign.pfx'
+          [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:PFX_BASE64))
+          "RIZREF_SIGN_PFX=$path" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Package (portable zip + installer)
+        shell: pwsh
+        env:
+          RIZREF_SIGN_PASSWORD: ${{ secrets.RIZREF_SIGN_PASSWORD }}
+        # Inno Setup 6 is preinstalled on the windows-latest image.
+        run: ./packaging/package.ps1 -Sign
+
+      - name: Release notes
+        shell: bash
+        run: scripts/release-notes.sh "${TAG}" > dist/RELEASE_NOTES.md
+
+      - name: Create the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*-portable.zip dist/*-setup.exe)
+          if gh release view "${TAG}" > /dev/null 2>&1; then
+            gh release upload "${TAG}" "${files[@]}" --clobber
+          else
+            gh release create "${TAG}" "${files[@]}" --draft --title "RizRef ${TAG#v}" \
+              --notes-file dist/RELEASE_NOTES.md
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rizref-${{ env.TAG }}
+          path: |
+            dist/*-portable.zip
+            dist/*-setup.exe
+            dist/RELEASE_NOTES.md
