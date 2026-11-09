@@ -18,8 +18,13 @@ use crate::textures::{MAX_TEXTURE_SIDE, TextureCache};
 
 /// Backends this build tries, in preference order.
 ///
-/// Vulkan first because it is the thinnest path on Windows, DX12 second
-/// because it is the one guaranteed to be present on Windows 10 and later.
+/// On Windows DX12 is tried first (phase 07): presented through a
+/// DirectComposition visual it is the one backend whose window surface
+/// composites per-pixel alpha, which canvas-only transparency needs, and it
+/// starts as fast as Vulkan on the reference laptop (first GPU frame 1,051 vs
+/// 1,089 ms median). Vulkan follows: its Win32 surfaces offer opaque alpha
+/// only, so on Vulkan the transparency setting falls back to whole-window
+/// opacity. Elsewhere the order stays Vulkan first.
 ///
 /// GL is deliberately absent, by decision rather than omission: enabling
 /// `wgpu/gles` pulls `glutin_wgl_sys`, a `-sys` crate outside the accepted
@@ -31,8 +36,38 @@ pub fn preferred_backends() -> wgpu::Backends {
 }
 
 /// The backend order as a list, for the adapter walk.
+///
+/// `RIZREF_GPU_BACKEND=dx12` or `=vulkan` restricts the walk (and the wgpu
+/// instance) to one backend: the escape hatch for a machine whose Vulkan
+/// driver misbehaves, and the switch the phase-07 startup measurements use.
 fn backend_priority() -> Vec<wgpu::Backends> {
-    vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12]
+    backend_override(std::env::var("RIZREF_GPU_BACKEND").ok().as_deref())
+        .map_or_else(default_priority, |only| vec![only])
+}
+
+/// The adapter walk without an override.
+fn default_priority() -> Vec<wgpu::Backends> {
+    if cfg!(windows) {
+        vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN]
+    } else {
+        vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12]
+    }
+}
+
+/// Parses a `RIZREF_GPU_BACKEND` value; anything unknown keeps the default.
+fn backend_override(value: Option<&str>) -> Option<wgpu::Backends> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "dx12" | "d3d12" => Some(wgpu::Backends::DX12),
+        "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
+        _ => None,
+    }
+}
+
+/// The backends the instance is created with: the override's one, or both.
+fn instance_backends() -> wgpu::Backends {
+    backend_priority()
+        .into_iter()
+        .fold(wgpu::Backends::empty(), |all, one| all | one)
 }
 
 /// Renders a backend set as the arrow-joined names a bug report should quote.
@@ -82,6 +117,18 @@ fn clear_color(background: [u8; 4]) -> wgpu::Color {
     }
 }
 
+/// `colour` at `alpha` opacity, premultiplied as a premultiplied-alpha
+/// swapchain composites it.
+fn premultiplied(colour: wgpu::Color, alpha: f32) -> wgpu::Color {
+    let alpha = f64::from(alpha.clamp(0.0, 1.0)) * colour.a;
+    wgpu::Color {
+        r: colour.r * alpha,
+        g: colour.g * alpha,
+        b: colour.b * alpha,
+        a: alpha,
+    }
+}
+
 /// Why a frame did not make it to the screen.
 #[derive(Debug)]
 pub enum FrameError {
@@ -107,8 +154,16 @@ pub struct GpuSurface {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// Whether the surface composites per-pixel (premultiplied) alpha, so the
+    /// canvas background can be see-through on its own.
+    canvas_alpha: bool,
     canvas: Canvas,
     textures: TextureCache,
+    /// How long the last frame waited for a swapchain image. Under vsync this
+    /// is display pacing, not work, so the frame statistics subtract it.
+    last_acquire: std::time::Duration,
+    /// How long the last frame's `present` blocked.
+    last_present: std::time::Duration,
 }
 
 /// Everything one frame needs, gathered by the caller and consumed by
@@ -149,23 +204,43 @@ impl FrameParams<'_> {
     }
 }
 
-impl GpuSurface {
-    /// Creates the surface and picks the adapter/device for `window`.
+/// The swapchain format the background thread builds pipelines for. Both
+/// backends report it as the first (preferred) format on Windows; if a surface
+/// prefers another, `attach` rebuilds the pipelines on the spot.
+pub const PREDICTED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+
+/// Everything about the GPU that does not need the window: the instance, the
+/// chosen adapter, the device and queue, and the canvas pipelines.
+///
+/// This is the slow part of a launch — on a laptop whose only Vulkan/DX12
+/// adapter is a discrete GPU, the driver wakes the GPU while creating the
+/// instance and device, which costs most of a second (phase 07 measured
+/// ~800 ms) — so the application builds it on a background thread while the
+/// window opens and the first frames are presented by the CPU.
+pub struct GpuDevice {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    canvas: Canvas,
+}
+
+impl GpuDevice {
+    /// Creates the instance, picks the adapter and opens the device.
     ///
     /// The walk is explicit rather than `request_adapter`'s, because the plan
     /// fixes an order — Vulkan before DX12 — and a set-valued option cannot
     /// express order. Hardware adapters win over software ones inside a
     /// backend; every adapter found is logged at debug for bug reports.
-    pub fn new(window: Arc<Window>, size: (u32, u32)) -> Option<Self> {
+    pub fn create() -> Option<Self> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = preferred_backends();
+        descriptor.backends = instance_backends();
+        // A swapchain on a DirectComposition visual rather than on the HWND:
+        // the only DX12 presentation that composites per-pixel alpha (an HWND
+        // swapchain is opaque by DXGI's rules). It only affects DX12.
+        descriptor.backend_options.dx12.presentation_system =
+            wgpu::Dx12SwapchainKind::DxgiFromVisual;
         let instance = wgpu::Instance::new(descriptor);
-        // Holding the window in an `Arc` (which the caller does) lets the
-        // surface claim `'static` rather than borrowing the window.
-        let surface = instance
-            .create_surface(window)
-            .inspect_err(|e| tracing::error!(%e, "cannot create the window surface"))
-            .ok()?;
 
         let mut chosen: Option<wgpu::Adapter> = None;
         for backend in backend_priority() {
@@ -197,12 +272,49 @@ impl GpuSurface {
         }))
         .inspect_err(|e| tracing::error!(%e, "cannot acquire a GPU device"))
         .ok()?;
+        // Shader compilation and pipeline creation, off the UI thread too.
+        let canvas = Canvas::new(&device, PREDICTED_FORMAT);
+        Some(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            canvas,
+        })
+    }
+}
 
+impl GpuSurface {
+    /// Creates the window surface on an existing device and configures it.
+    pub fn attach(gpu: GpuDevice, window: Arc<Window>, size: (u32, u32)) -> Option<Self> {
+        let GpuDevice {
+            instance,
+            adapter,
+            device,
+            queue,
+            mut canvas,
+        } = gpu;
+        // Holding the window in an `Arc` (which the caller does) lets the
+        // surface claim `'static` rather than borrowing the window.
+        let surface = instance
+            .create_surface(window)
+            .inspect_err(|e| tracing::error!(%e, "cannot create the window surface"))
+            .ok()?;
+
+        let alpha_modes = surface.get_capabilities(&adapter).alpha_modes;
+        let canvas_alpha = alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied);
         let config = match surface.get_default_config(&adapter, size.0.max(1), size.1.max(1)) {
             Some(mut config) => {
                 // The colour picker reads one pixel back from the presented
                 // surface; that requires COPY_SRC on the swapchain texture.
                 config.usage |= wgpu::TextureUsages::COPY_SRC;
+                if canvas_alpha {
+                    config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+                }
+                // Vsync on every backend: the DX12 composition swapchain
+                // otherwise defaults to mailbox, rendering animations and the
+                // frame bench unthrottled.
+                config.present_mode = wgpu::PresentMode::AutoVsync;
                 config
             }
             None => {
@@ -214,12 +326,17 @@ impl GpuSurface {
         tracing::info!(
             format = ?config.format,
             present = ?config.present_mode,
+            alpha = ?config.alpha_mode,
+            canvas_transparency = if canvas_alpha { "per-pixel" } else { "whole-window fallback" },
             width = config.width,
             height = config.height,
             "surface configured"
         );
+        if config.format != PREDICTED_FORMAT {
+            tracing::info!(format = ?config.format, "rebuilding the pipelines for the surface format");
+            canvas = Canvas::new(&device, config.format);
+        }
 
-        let canvas = Canvas::new(&device, config.format);
         let max_side = device
             .limits()
             .max_texture_dimension_2d
@@ -236,9 +353,18 @@ impl GpuSurface {
             device,
             queue,
             config,
+            canvas_alpha,
             canvas,
             textures,
+            last_acquire: std::time::Duration::ZERO,
+            last_present: std::time::Duration::ZERO,
         })
+    }
+
+    /// Whether canvas-only transparency works on this surface; when it does
+    /// not, the application falls back to whole-window opacity.
+    pub fn supports_canvas_alpha(&self) -> bool {
+        self.canvas_alpha
     }
 
     /// Reconfigures the swapchain after a window resize or DPI change.
@@ -297,6 +423,13 @@ impl GpuSurface {
         self.textures.used_bytes()
     }
 
+    /// How long the last [`Self::render`] waited on the swapchain: acquiring
+    /// the image plus blocking in `present`. Under vsync this is display
+    /// pacing, not work, and the frame statistics subtract it.
+    pub fn last_swapchain_wait(&self) -> std::time::Duration {
+        self.last_acquire + self.last_present
+    }
+
     /// Renders one frame: acquire, draw the canvas, present.
     ///
     /// The frame span and the present span carry the timings the acceptance
@@ -310,7 +443,9 @@ impl GpuSurface {
     /// is the colour picker, reading exactly what the user sees.
     pub fn render(&mut self, frame: &FrameParams) -> Result<Option<[u8; 4]>, FrameError> {
         let _frame_span = tracing::debug_span!("frame").entered();
+        let acquire_start = std::time::Instant::now();
         let acquired = self.surface.get_current_texture();
+        self.last_acquire = acquire_start.elapsed();
         let frame_texture = match acquired {
             wgpu::CurrentSurfaceTexture::Success(texture) => texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
@@ -387,7 +522,14 @@ impl GpuSurface {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color(frame.background)),
+                        load: wgpu::LoadOp::Clear(premultiplied(
+                            clear_color(frame.background),
+                            if self.canvas_alpha {
+                                frame.flags.canvas_alpha
+                            } else {
+                                1.0
+                            },
+                        )),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -430,7 +572,11 @@ impl GpuSurface {
         {
             let _present_span = tracing::debug_span!("present").entered();
             self.queue.submit(Some(encoder.finish()));
+            // Under Fifo the driver may block here until the display is ready
+            // for the frame: pacing, not work, so it is reported separately.
+            let present_start = std::time::Instant::now();
             self.queue.present(frame_texture);
+            self.last_present = present_start.elapsed();
         }
 
         let Some(buffer) = readback else {
@@ -475,12 +621,45 @@ impl GpuSurface {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_color, describe_backends, preferred_backends};
+    use super::{
+        clear_color, default_priority, describe_backends, preferred_backends, premultiplied,
+    };
+
+    #[test]
+    fn windows_tries_dx12_first_for_per_pixel_alpha() {
+        let order = default_priority();
+        if cfg!(windows) {
+            assert_eq!(order, [wgpu::Backends::DX12, wgpu::Backends::VULKAN]);
+        } else {
+            assert_eq!(order[0], wgpu::Backends::VULKAN);
+        }
+    }
+
+    #[test]
+    fn a_translucent_canvas_clears_premultiplied() {
+        let c = premultiplied(clear_color([232, 226, 214, 255]), 0.5);
+        assert!((c.a - 0.5).abs() < 1.0e-9);
+        assert!((c.r - 0.806_952 * 0.5).abs() < 1.0e-5);
+        assert_eq!(
+            premultiplied(clear_color([10, 20, 30, 255]), 1.0),
+            clear_color([10, 20, 30, 255])
+        );
+    }
     use crate::app::CANVAS_BACKGROUND;
 
     #[test]
     fn this_build_prefers_vulkan_then_dx12() {
         assert_eq!(describe_backends(preferred_backends()), "vulkan -> dx12");
+        assert_eq!(
+            super::backend_override(Some("DX12")),
+            Some(wgpu::Backends::DX12)
+        );
+        assert_eq!(
+            super::backend_override(Some(" vulkan ")),
+            Some(wgpu::Backends::VULKAN)
+        );
+        assert_eq!(super::backend_override(Some("gl")), None);
+        assert_eq!(super::backend_override(None), None);
     }
 
     #[test]

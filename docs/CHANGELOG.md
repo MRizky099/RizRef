@@ -2,6 +2,262 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Phase 07 — Polish & ship (done)
+
+Branch `feat/phase-07-polish-and-ship`, closes issue #8. Version **1.0.0**, licensed
+MIT OR Apache-2.0. No format change ([`format.md`](format.md) revision 1.2 gains a
+documentation-only phase-07 row). Measurements: README → "Performance budgets"
+(reference laptop: i7-4720HQ, GTX 950M, Windows 10 22H2).
+
+Performance — every phase-00 budget measured by a committed harness, and met:
+
+- Cold start: the first frame waited for the GPU (1,059 ms median, ~800 ms of it the
+  NVIDIA driver creating the instance and device). `renderer::GpuDevice` (instance,
+  adapter, device, pipelines) is now built on a thread started after the first frame,
+  and until it arrives frames are the CPU-painted shell layer blitted with
+  `SetDIBitsToDevice` (`platform::gdi`). First frame **130 ms** median, 226 ms worst;
+  first GPU frame ~1.04 s. Starting the thread earlier was measured to stall window
+  creation by up to ~500 ms in one launch out of five.
+- `perf.rs`: a startup waterfall (logging, event loop, window, first frame, GPU, GPU
+  frame) logged per launch; `--exit-after-first-frame` prints it as JSON for
+  `scripts/bench-startup.ps1`. **F3** swaps the readout for a developer overlay (last
+  frame, p95, worst, drawn/total items, textures and MB, decode queue).
+  `--bench-frames=N <board>` drives a deterministic pan/zoom path and prints frame work
+  (swapchain acquire and present excluded) and total p50/p95/max plus the open-to-first-
+  GPU-frame time. The benches skip the single-instance handshake and the session marker.
+- `rizref-core`: `Scene::visible_items`; the render loop instances and keeps warm only
+  the visible set (5.8 µs per frame for 500 items). Frame work **0.59 ms** median,
+  0.96 ms p95 on a 100-item board, 1.04 ms p95 on a 500-item 1.6 GB board.
+- `rizref-format`: `load` hashed every original twice (chunk digest and content hash);
+  blobs now verify by content hash only (which fixes every payload byte), and blob
+  verification and preview decoding run on scoped threads. `benches/board_io.rs`
+  (100 items, 210 MB): load 606 → **300 ms**, incremental save **96 ms** (item moved)
+  and **121 ms** (2 MiB image added), summary 0.4 ms. A 327 MB 100-item board reaches
+  its first preview frame in **905 ms**. `examples/make_soak_board.rs` writes the large
+  real-JPEG boards.
+- Binary size: thin LTO at opt 3 was 18.37 MB, over budget. Fat LTO at `opt-level = "s"`
+  plus the static CRT: **14.28 MB** (14.58 MB with the artwork icons). `examples/decode_bench.rs` records the cost (12 MP
+  JPEG 139 → 154 ms, PNG 116 → 154 ms); `opt-level = "z"` (12.52 MB) was rejected for a
+  3.5× slower JPEG decode.
+- The release exe imported `VCRUNTIME140.dll` and six `api-ms-win-crt-*` forwarders,
+  absent on a clean Windows without the VC++ Redistributable. `.cargo/config.toml`
+  links the CRT statically; `scripts/check-imports.ps1` reads the PE import table (no
+  dumpbin) and fails on any C/C++ runtime. Release builds are GUI-subsystem (no console
+  flash) and reattach to the parent console for `--help`/`--version`/`inspect`.
+
+Explorer and shell integration:
+
+- `rizref-thumb` (new crate, cdylib): an in-process COM thumbnail provider
+  (`IInitializeWithStream` + `IThumbnailProvider`, class factory, `DllGetClassObject`/
+  `DllCanUnloadNow`) reading through an `IStream` adapter with `rizref-format`.
+  `BoardReader::thumbnail_image` decodes `THMB` or, without one, composites the
+  document and `PREV` chunks (`preview_composite`); notes keep their 06a background
+  colour either way. Never reads originals. Box-filtered, premultiplied BGRA DIB.
+- `rizref register [--machine]` / `unregister`: `.rizref` → `RizRef.Board`, icon,
+  "Open with RizRef", `Applications\rizref.exe`, and the thumbnail CLSID when
+  `rizref_thumb.dll` sits beside the exe; `HKCU` by default, `HKLM` for an elevated
+  installer; `SHChangeNotify(SHCNE_ASSOCCHANGED)`. The registry layout is a pure,
+  tested plan.
+- Jump list: opened and saved boards go to `SHAddToRecentDocs`, which feeds the taskbar
+  jump list's Recent category once the type is registered (Windows keeps the list,
+  pinning and removal; no `ICustomDestinationList` needed).
+- The exe embeds two icons and version info, through a `build.rs` that writes the
+  `.res` itself (`resources.rs`): no `rc.exe`, no C toolchain. `RT_GROUP_ICON` 1 is the
+  application icon and 2 the `.rizref` document icon, generated from the user's
+  artwork (`assets/app_icon.png`, `assets/app_document_icon.png`, committed) by
+  `examples/make_icon.rs`: trimmed, padded to a centred square (the page is never
+  stretched), Lanczos-3 in premultiplied colour, a light unsharp mask at 32 px and
+  under, and a simplified mark where the full art turns to noise — the magnifier
+  alone at 16–24 px, and the page with that magnifier large up to 32 px. Ten sizes,
+  16–256, stored as PNG. `--sheet <png>` writes a review contact sheet. The window
+  sets the app icon at runtime (title bar, Alt-Tab, running taskbar button), and
+  `DefaultIcon` names `rizref.exe,1`, the document icon.
+- `rizref register` / `unregister` were never reachable: `platform/registry.rs` was
+  written and documented but neither declared as a module nor dispatched, so the
+  subcommands fell through to opening a file named "register" (and its tests never
+  ran). Both are wired now and listed in `--help`. The registry plan keeps its own
+  copy of the thumbnail class id, so the exe does not link the DLL's COM exports; a
+  test checks the copy against `rizref_thumb`.
+- The thumbnail DLL shows the document artwork instead of failing or drawing a blank
+  page for a board with nothing to picture (an empty board saves a 1 x 1 thumbnail)
+  or one it cannot read. Board thumbnails get no corner badge: tried at 30% of the
+  long side, it covered a note on a wide board at 256 px and dominated at 96 px.
+  `examples/thumb_preview.rs` renders what Explorer would show.
+
+Reliability:
+
+- Crash minidumps: an unhandled-exception filter writes a dump through the OS's
+  `dbghelp` `MiniDumpWriteDump` to `%LOCALAPPDATA%\RizRef\crashes` (ten kept);
+  `--crash-test` proves it (exit `0xC0000005`, a 127 KB dump). No new crate — the plan
+  named `minidump-writer` behind a vectored handler; a vectored handler also sees
+  handled first-chance exceptions.
+- Autosave: every 20 changes or 60 s to a recovery copy
+  (`%LOCALAPPDATA%\RizRef\autosave\<scene>.rizref` + sidecar), never the user's file;
+  incremental appends after the first write. Deleted on save, discard and clean exit.
+  A session marker detects an unclean exit; the next launch offers the newest copy in
+  an in-app "Recover unsaved work" dialog (Restore, the default, loads it as an unsaved
+  document named after its board; "Discard the copy" deletes it) or, with nothing to
+  recover, reopens the last board. A test spawns a child that autosaves in a loop and
+  kills it six times mid-write: every copy left behind loads.
+- Fixes from the first manual test run: the recovery offer was a native modal box
+  opened before the window had presented — it stayed hidden and blocked the event
+  loop, so a relaunch after a crash looked dead (7.7); it is now the in-app dialog
+  above. The first GPU frame reused a UI layer the CPU frames had already consumed, so
+  the start view showed a bare canvas until the next input; attaching the GPU now
+  forces a repaint. Both checked on the release build by launching it (the offer,
+  Restore, the start view and a board opened from the command line draw unprompted).
+- Fixes from the second manual test run:
+  - File dialogs (Open images, Open board, Save board, Export PNG) are owned by the
+    main window: with always-on-top on they opened behind it, focused but unseen. The
+    fatal alert is `MB_TOPMOST`. (The unsaved-changes guard is in-app and was fine.)
+  - The revealed title bar was never drawn over a board: the GPU frame composited
+    the UI layer only for the start view, panels, toasts and window modes, so
+    hovering the top strip changed the bar's state invisibly. A revealed bar and a
+    note-toolbar tooltip now count, and a layer that becomes visible again is
+    uploaded even without a repaint.
+  - Scaling anchors the opposite corner or edge by default; `alt` scales about the
+    centre. Image corner drags keep the aspect ratio exactly (`shift` frees it);
+    notes resize freely (`shift` locks). This reverses the phase 04 default.
+  - The note hover toolbar and the ✗/✓ edit pill sit outside the card — above its
+    top corners, or below when there is no room above or the toolbar would cover
+    the rotate handle — so they never cover the note's text. A note larger than the
+    window gets them pinned to the window's top edge.
+  - The zoom floor is 0.5% (was 5%) for Fit and the wheel alike, so Fit frames any
+    board; the grid hides below 5%.
+  - Grid arrange packs row by row (selection order, rows as tall as their tallest
+    item, even gaps, near-square wrap) instead of uniform cells sized to the largest
+    item; still one undo step.
+  - Fourth run: an embedded TGA stayed on its 512 px preview after the board was
+    reopened. The full-resolution decode got the bytes alone and TGA has no
+    signature; it now gets the asset's recorded `format` (already in every asset
+    entry, so no format change), then the file extension, then a TGA header check.
+    Dropped virtual files (Outlook attachments) pass their name's extension too. A
+    test round-trips TGA, PPM, QOI and ICO through import, save, load and a
+    full-resolution decode.
+  - Recent-board cards draw the stored board thumbnail (the monogram is the
+    fallback, also for an empty board's 1 x 1 picture). `recents.json` stores the
+    preview as base64 instead of a JSON array of numbers, about a third of the
+    size; the array form is still read.
+  - Recent boards: the same board opened as `F:/a/b.rizref` and saved as
+    `F:\a\b.rizref` was two cards, and a relative command-line path was stored as
+    given. Paths are now made absolute against the working directory as they arrive
+    (command line, forwarded from a second instance, jump list) and normalised
+    (`\`, `.`/`..`, no `\\?\` prefix), and compared without regard to case.
+    Loading `recents.json` merges duplicates, keeping the most recent edit, and
+    drops a relative entry that does not resolve to a board.
+  - A failed import was logged twice, by the worker and by the application; the
+    worker's line is debug now. A failed full-resolution decode is a warning.
+  - Sixth run: the two note budgets phase 06a deferred are met.
+    - Rendering: the text, decorations and equations of a markdown note are painted
+      once into a cached layer (keyed by source hash, wrap width, density and
+      palette; 64 MiB) and blitted onto a fresh card; the card is drawn analytically
+      (tiny-skia's anti-aliased path fill and stroke took 33 ms of a 626 x 2048
+      card) and the straight-alpha conversion is table-driven (17 ms before).
+    - Off the UI thread: every note render except the live editor's runs on a note
+      worker with its own font system; requests coalesce per note, a panic is
+      contained, and the note shows its last texture or a card-only placeholder
+      (0.11 ms) meanwhile. Notes more than half a viewport away are not rendered.
+    - Budget: full-resolution note textures stay within 64 MiB; off-screen notes,
+      least recently seen first, drop to a 256 px copy kept from their last render
+      and come back sharp, without a blank frame, when they return.
+    - Measured with `note_budgets` (release, reference laptop), before (`32892e0`)
+      and after: warm re-render of a 4,000-character note 61.1 ms to **7.1 ms**
+      (budget 8 ms); a resize that keeps the wrap width 11.7 ms (it re-used
+      the layout before but repainted everything); 20 equations cold 35.7 ms to
+      14.3 ms and cached 26.3 ms to 4.0 ms; cold layout ~100 ms, unchanged but
+      on the worker. A board of four 3.8k-character notes with 20 equations each
+      reaches its first interactive frame in 252 to 340 ms instead of 557 to 764
+      ms (`--bench-frames`, three runs each); steady pan/zoom frame work is
+      unchanged (p95 0.7 ms).
+  - Menu items publish their shortcut as AccessKit `keyboard_shortcut`, from the
+    live table, so a rebinding shows up. UIA `AcceleratorKey` still reads empty:
+    no `accesskit_windows` release (0.32.1 here, 0.35.2 newest) maps any node
+    property to it, so the shortcut also stays in the description, which Narrator
+    reads as the full description. Tests: Save gives `Ctrl+S`, and a rebound Undo
+    gives the new chord.
+  - Installer: the folder page always shows, also on upgrades (pre-filled with the
+    previous folder). The default follows the install mode (`{autopf}`: still
+    `%LOCALAPPDATA%\Programs\RizRef` per user, Program Files for all users). Setup
+    checks the chosen folder before copying: a folder a per-user install cannot
+    write to (Program Files without elevation) gets a message pointing at the
+    all-users mode, and a network folder asks first because Explorer will not load
+    the thumbnail DLL from it. `register` / `unregister` (with `--machine` for all
+    users) run from the chosen folder; uninstall removes it. Silent installs take
+    `/DIR="..."` and `/ALLUSERS` or `/CURRENTUSER`. Not compiled here (no Inno Setup
+    on this machine).
+  - Title-bar buttons show a tooltip after 500 ms on the button, worded for the
+    state and with the live shortcut: "Main menu", "Pin on top (Ctrl+Shift+T)" /
+    "Unpin", "Minimize", "Maximize" / "Restore", "Close (Ctrl+Q)". It reuses the
+    note-toolbar tooltip (clamped inside the window); moving between buttons
+    restarts the delay, and the note hover never overwrites it.
+  - View → **Scene boundary** (Ctrl+B, checkable, persisted as `scene_border`) next
+    to Checkerboard and HUD readout; it was only in View → Grid as "Scene border".
+    Named the same in the F1 overlay and settings, and exposed in the UIA tree like
+    every menu item. On screen only: exports and thumbnails are composited by
+    `rizref-format`, which never draws it.
+  - Transparency is the canvas background only: the steps (100/80/60/40/20 %) and
+    Ctrl+Shift+O now fade the fill, checkerboard, grid and boundary, while images,
+    notes, selection chrome, the HUD, toasts and the title bar stay opaque, and the
+    transparent canvas still takes clicks (it is not a layered window). How: the
+    window is created transparent (DWM alpha composition), DX12 is tried before
+    Vulkan on Windows and presents through a DirectComposition visual with a
+    premultiplied-alpha swapchain, the clear and the background pass write the
+    canvas alpha (the background pass keeps the clear's alpha), and the later passes
+    already blend "over". Checked live on the reference laptop: DX12 composites per
+    pixel; Vulkan's Win32 surface offers opaque alpha only, so with
+    `RIZREF_GPU_BACKEND=vulkan` the setting falls back to whole-window opacity, with
+    a toast saying so. DX12 startup matches Vulkan (first frame 167 ms, GPU frame
+    ~1.1 s); presentation is pinned to vsync on both. Ghost mode is no longer in the
+    Transparency submenu; it keeps its own Canvas entry, Ctrl+Shift+G and its
+    whole-window 15 % (it is for tracing over another application, where the images
+    must fade too). The setting is stored as `canvas_opacity_percent`; an older
+    `opacity_percent` is read into it, the same value now meaning the canvas.
+  - Transparency gains a 0 % step (100/80/60/40/20/0 %, also on Ctrl+Shift+O and in
+    settings; `canvas_opacity_percent` accepts 0): the canvas background vanishes,
+    everything on it stays opaque. Checked live on DX12/DirectComposition: alpha-0
+    canvas still takes the mouse — a click on empty canvas deselects and a marquee
+    started there selects — because the window is not layered, so Windows hit-tests
+    its whole client area; no minimum alpha is needed. The whole-window fallback
+    (Vulkan) never goes below 20 %, the lowest step that leaves RizRef visible and
+    clickable, and its toast says so.
+  - The colour picker: no path was found by which it drops the next key or the
+    dirty mark (it changes neither selection nor history, and the dirty mark comes
+    from the board's effects); not reproduced, left unchanged.
+- Fix: the panic hook exited the process for every panic, so the `catch_unwind` guards
+  around decoders and math never ran — one hostile image closed RizRef.
+  `contain::contain` marks the boundary and the hook now lets it handle the panic.
+- Files: a read-only target is refused before anything is written
+  (`FormatError::Denied`), the final rename retries six times over ~1.2 s while another
+  program briefly holds the board, and a refused save offers Save As.
+- **Help → Open logs folder**; `-v`/`--verbose` and daily rotation already existed.
+
+Packaging and docs:
+
+- `packaging/package.ps1`: release build, import checks, optional signing (only when
+  `RIZREF_SIGN_PFX` is set), portable zip `RizRef-<v>-x64-portable.zip` (exe, DLL,
+  README.txt, licences), and the installer when Inno Setup is present.
+  `packaging/rizref.iss`: per-user install, runs `rizref register`/`unregister`.
+- `.github/workflows/release.yml`: on a `v*` tag matching the workspace version, test,
+  package, sign if the secrets exist, and create a **draft** release with notes from
+  conventional commits (`scripts/release-notes.sh`). It never publishes.
+- `docs/demo.rizref` (`examples/make_demo_board.rs`): four images drawn in code (CC0)
+  and three markdown notes. README: status, layout, measured budgets, install and
+  integration, releasing, licence. `LICENSE-MIT`, `LICENSE-APACHE`.
+- Tests: 712 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
+  clean; no new dependency crate and no new `-sys` crate (audit: `windows-sys`,
+  `renderdoc-sys`).
+- Not verified here, by design or by environment: `register`/`unregister` and Explorer
+  thumbnails on Win10 and Win11 (they change the user's file associations — part of
+  the manual test plan; the registry plan, the COM factory and the DLL's rendering are
+  unit-tested); the installer (no Inno Setup on this machine; the script is untested);
+  a clean Win10 22H2 VM run (substituted by the import-table check); the release
+  workflow (runs on the first tag).
+- Deferred: code signing (no certificate; the hook is in place); README screenshots
+  (best captured during the manual test run); undo history across a crash (the format
+  stores no history, so recovery restores the board, not its undo tail); a CPU canvas
+  for images when no GPU exists at all (the CPU frames draw the shell only); the stretch
+  items (headless CLI scripting, link-vs-embed UI, slideshow/drawings/comments).
+
 ## Phase 06b — Image provenance (done)
 
 Merged 2026-11-09 in PR #22 (branch `feat/phase-06b-image-provenance`, merge commit

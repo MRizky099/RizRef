@@ -121,6 +121,25 @@ pub fn open_url(url: &str) -> Result<(), LaunchError> {
     }
 }
 
+/// Adds `path` to the shell's recent documents.
+///
+/// That one call feeds the taskbar jump list's *Recent* category (once
+/// `.rizref` is registered to RizRef — `rizref register`), Explorer's Recent
+/// folder and the Start menu: the jump list the plan asks for, with Windows
+/// keeping the list, its pinning and its "remove from this list" behaviour.
+/// A custom `ICustomDestinationList` would only duplicate that.
+// SAFETY: `SHAddToRecentDocs(SHARD_PATHW, …)` reads one NUL-terminated wide
+// string that outlives the call.
+#[allow(unsafe_code)]
+pub fn add_to_recent_documents(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::{SHARD_PATHW, SHAddToRecentDocs};
+    // One spelling per board, or the jump list shows it twice.
+    let path = crate::paths::normalize(path);
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe { SHAddToRecentDocs(SHARD_PATHW.0 as u32, Some(wide.as_ptr().cast())) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::{folder_argument, select_argument};

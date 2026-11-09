@@ -17,7 +17,8 @@ struct Globals {
     // x: grid visible, y: scene border visible, z: checkerboard, w: grayscale
     flags: vec4f,
     hud_size: vec2f,      // HUD texture size in device px
-    _pad: vec2f,
+    canvas_alpha: f32,    // canvas background opacity (fill, checkerboard, grid)
+    _pad: f32,
 }
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -141,8 +142,10 @@ fn fs_background(in: BgOut) -> @location(0) vec4f {
         color = blend_over(vec4f(vec3f(1.0, 1.0, 1.0), band * dash * 0.45), color);
     }
 
-    // Premultiplied out; the pipeline blends with One / OneMinusSrcAlpha.
-    return vec4f(color.rgb * color.a, color.a);
+    // Premultiplied out, scaled by the canvas opacity; the pipeline blends
+    // colour with One / OneMinusSrcAlpha and keeps the clear's alpha, which
+    // is already the canvas opacity.
+    return vec4f(color.rgb * color.a * g.canvas_alpha, color.a);
 }
 
 // ---------------------------------------------------------------------------

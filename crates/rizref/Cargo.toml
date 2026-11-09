@@ -4,6 +4,7 @@ description = "The RizRef application: window, renderer, input and Windows platf
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true
@@ -41,3 +42,8 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 windows.workspace = true
 windows-core.workspace = true
+
+[dev-dependencies]
+# The thumbnail DLL's crate, for one test: the registry plan repeats its class
+# id (the exe must not link the DLL's COM exports) and checks it still agrees.
+rizref-thumb = { path = "../rizref-thumb" }

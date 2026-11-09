@@ -10,7 +10,6 @@
 //! asset's identity (BLAKE3), its provenance, and later the BLOB a `.rizref`
 //! file stores, so re-encoding them anywhere on this path would be a bug.
 
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -38,6 +37,10 @@ pub struct ImportSource {
     /// The web address the image came from, when a browser drag or paste
     /// exposed one. Carried through untouched; validated when recorded.
     pub source_url: Option<String>,
+    /// The format already known for these bytes — an embedded asset's
+    /// recorded format. TGA has no signature, so without it a reopened
+    /// board's TGA could not be decoded at full resolution.
+    pub format_hint: Option<ImageFormat>,
 }
 
 impl ImportSource {
@@ -54,6 +57,7 @@ impl ImportSource {
             path: Some(path),
             bytes: None,
             source_url: None,
+            format_hint: None,
         }
     }
 
@@ -64,7 +68,14 @@ impl ImportSource {
             path: None,
             bytes: Some(bytes.into()),
             source_url: None,
+            format_hint: None,
         }
+    }
+
+    /// Names the format the bytes are known to be in.
+    pub fn with_format_hint(mut self, format: ImageFormat) -> Self {
+        self.format_hint = Some(format);
+        self
     }
 
     /// Attaches the source URL a browser exposed for this image.
@@ -118,10 +129,11 @@ impl ImportRequest {
         Self::new(ImportSource::bytes(label, bytes), drop_world)
     }
 
-    /// A request to decode `asset` again for its full-resolution texture.
-    pub fn texture(asset: AssetId, bytes: impl Into<Arc<[u8]>>) -> Self {
+    /// A request to decode `asset` again for its full-resolution texture,
+    /// in the format recorded for it.
+    pub fn texture(asset: AssetId, bytes: impl Into<Arc<[u8]>>, format: ImageFormat) -> Self {
         Self {
-            source: ImportSource::bytes(format!("asset {asset}"), bytes),
+            source: ImportSource::bytes(format!("asset {asset}"), bytes).with_format_hint(format),
             drop_world: Vec2::ZERO,
             queued_at: Instant::now(),
             purpose: ImportPurpose::RefreshTexture(asset),
@@ -262,13 +274,12 @@ fn process(request: ImportRequest) -> ImportOutcome {
     } = request;
     let label = source.label.clone();
 
-    let result =
-        std::panic::catch_unwind(AssertUnwindSafe(|| import(&source))).unwrap_or_else(|payload| {
-            Err(ImportError {
-                label: label.clone(),
-                reason: format!("decoder panicked: {}", panic_message(payload.as_ref())),
-            })
-        });
+    let result = crate::contain::contain(|| import(&source)).unwrap_or_else(|message| {
+        Err(ImportError {
+            label: label.clone(),
+            reason: format!("decoder panicked: {message}"),
+        })
+    });
 
     let latency = queued_at.elapsed();
     match &result {
@@ -280,11 +291,13 @@ fn process(request: ImportRequest) -> ImportOutcome {
             latency_ms = latency.as_secs_f64() * 1000.0,
             "import finished"
         ),
-        Err(error) => tracing::warn!(
+        // Debug only: the application reports the failure once, with what
+        // it means for the user (a skipped file, or a kept preview).
+        Err(error) => tracing::debug!(
             label = %label,
             reason = %error.reason,
             latency_ms = latency.as_secs_f64() * 1000.0,
-            "import failed"
+            "decode failed on the worker"
         ),
     }
 
@@ -314,10 +327,13 @@ fn import(source: &ImportSource) -> Result<ImportedImage, ImportError> {
         }
     };
 
-    let format = format_for(&bytes, source.path.as_deref()).ok_or_else(|| ImportError {
-        label: source.label.clone(),
-        reason: CodecError::Unrecognized.to_string(),
-    })?;
+    let format =
+        format_for(&bytes, source.format_hint, source.path.as_deref()).ok_or_else(|| {
+            ImportError {
+                label: source.label.clone(),
+                reason: CodecError::Unrecognized.to_string(),
+            }
+        })?;
 
     let _decode_span = tracing::info_span!(
         "import.decode",
@@ -427,31 +443,131 @@ fn animation_of(bytes: &[u8], limits: DecodeLimits, label: &str) -> Option<Anima
 }
 
 /// Sniffs the format, falling back to the extension for TGA (no signature).
-fn format_for(bytes: &[u8], path: Option<&Path>) -> Option<ImageFormat> {
-    rizref_codecs::sniff(bytes).or_else(|| {
-        path.and_then(Path::extension)
-            .and_then(|extension| extension.to_str())
-            .and_then(ImageFormat::from_extension)
-    })
+/// The format to decode `bytes` as: the signature when there is one (it
+/// cannot be wrong), else the recorded format, else the file extension, else
+/// — for bytes with neither, such as a TGA pasted without a name — a TGA
+/// header check.
+fn format_for(bytes: &[u8], hint: Option<ImageFormat>, path: Option<&Path>) -> Option<ImageFormat> {
+    rizref_codecs::sniff(bytes)
+        .or(hint)
+        .or_else(|| {
+            path.and_then(Path::extension)
+                .and_then(|extension| extension.to_str())
+                .and_then(ImageFormat::from_extension)
+        })
+        .or_else(|| looks_like_tga(bytes).then_some(ImageFormat::Tga))
 }
 
-fn panic_message(payload: &dyn std::any::Any) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_owned()
-    }
+/// Whether `bytes` open with a plausible TGA header. TGA has no magic
+/// number, so this checks what a real header constrains: no or a 256-entry
+/// colour map, an image type the format defines, a sane pixel depth, and a
+/// non-zero size whose pixels the data could hold.
+fn looks_like_tga(bytes: &[u8]) -> bool {
+    let Some(header) = bytes.get(..18) else {
+        return false;
+    };
+    let colour_map = header[1];
+    let image_type = header[2];
+    let width = u16::from_le_bytes([header[12], header[13]]);
+    let height = u16::from_le_bytes([header[14], header[15]]);
+    let depth = header[16];
+    let descriptor = header[17];
+    colour_map <= 1
+        && matches!(image_type, 1 | 2 | 3 | 9 | 10 | 11)
+        && (colour_map == 1) == matches!(image_type, 1 | 9)
+        && matches!(depth, 8 | 15 | 16 | 24 | 32)
+        && width > 0
+        && height > 0
+        // Bits 6-7 of the descriptor are interleaving, unused since 1989.
+        && descriptor & 0xC0 == 0
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ImportRequest, ImportSource, Importer};
+    use super::{ImportRequest, ImportSource, Importer, format_for, import, looks_like_tga};
     use glam::Vec2;
     use rizref_codecs::{ImageBuffer, ImageFormat};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rizref-codecs/tests/data")
+            .join(name)
+    }
+
+    /// Phase 07 manual test: a TGA embedded in a board stayed on its 512 px
+    /// preview after the board was reopened — the full-resolution decode had
+    /// only the bytes, and TGA has no signature. Every signature-less or
+    /// weak-signature format must survive import → save → load → decode.
+    #[test]
+    fn signatureless_formats_decode_at_full_resolution_after_a_reload() {
+        use rizref_core::{Asset, Camera, Scene, SceneId};
+
+        for (name, format) in [
+            ("plain.tga", ImageFormat::Tga),
+            ("plain.ppm", ImageFormat::Pnm),
+            ("plain.qoi", ImageFormat::Qoi),
+            ("multi.ico", ImageFormat::Ico),
+        ] {
+            let imported = import(&ImportSource::path(fixture(name))).expect(name);
+            assert_eq!(imported.format, format, "{name} on import");
+            let (width, height) = (imported.image.width(), imported.image.height());
+
+            let mut scene = Scene::new(SceneId::random());
+            let asset = Asset::from_parts(
+                imported.encoded,
+                imported.format,
+                imported.checksum,
+                &imported.image,
+                imported.preview,
+            );
+            let (id, _) = scene.insert_asset(asset);
+            scene.insert_image(id, Vec2::ZERO, Vec2::new(width as f32, height as f32));
+            let dir = std::env::temp_dir().join(format!(
+                "rizref-import-{}-{}",
+                name.replace('.', "-"),
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let path = dir.join("b.rizref");
+            rizref_format::save(
+                &path,
+                &rizref_format::SaveRequest::new(&scene, Camera::default(), "b"),
+            )
+            .expect("save");
+
+            let loaded = rizref_format::load(&path).expect("load");
+            let asset = loaded.scene.asset(id).expect("the asset survives");
+            assert_eq!(asset.format(), format, "{name}: the recorded format");
+            // The texture refresh path: bytes only, plus the recorded format.
+            let request =
+                ImportRequest::texture(id, std::sync::Arc::clone(asset.encoded()), asset.format());
+            let full = import(&request.source).expect(name);
+            assert_eq!(
+                (full.image.width(), full.image.height()),
+                (width, height),
+                "{name}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_nameless_tga_is_recognised_by_its_header() {
+        let bytes = std::fs::read(fixture("plain.tga")).expect("fixture");
+        assert!(looks_like_tga(&bytes));
+        assert_eq!(format_for(&bytes, None, None), Some(ImageFormat::Tga));
+        // Text and truncated input are not TGA.
+        assert!(!looks_like_tga(b"just some text, long enough for a header"));
+        assert!(!looks_like_tga(&bytes[..10]));
+        // A signature wins over a wrong hint.
+        let png = png();
+        assert_eq!(
+            format_for(&png, Some(ImageFormat::Tga), None),
+            Some(ImageFormat::Png)
+        );
+    }
 
     fn png() -> Vec<u8> {
         let image = ImageBuffer::filled(8, 4, [20, 40, 60, 255]);

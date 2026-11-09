@@ -1,4 +1,13 @@
-//! Window modes: always-on-top, layered opacity, click-through and ghost mode.
+//! Window modes: always-on-top, transparency, click-through and ghost mode.
+//!
+//! Transparency (phase 07) is the canvas background only: images, notes,
+//! selection chrome, the HUD and the title bar stay opaque. It needs a GPU
+//! surface that composites per-pixel alpha (DX12 through DirectComposition on
+//! Windows); the renderer reports whether it got one, and where it did not
+//! (Vulkan's Win32 surfaces are opaque) the setting falls back to the
+//! whole-window opacity of earlier builds, through `WS_EX_LAYERED`. Ghost mode
+//! keeps its whole-window 15 %: it is for tracing over another application,
+//! where the images themselves must fade too.
 //!
 //! These are one module because the Win32 extended styles interact: layered is
 //! required by click-through, click-through is required by ghost mode, and
@@ -20,19 +29,28 @@ use winit::window::{Fullscreen, Window};
 /// recognisable at a glance.
 pub const GHOST_OPACITY_PERCENT: u8 = 15;
 
-/// The smallest ordinary transparency the menu offers.
-pub const MIN_OPACITY_PERCENT: u8 = 20;
+/// The smallest transparency setting: a fully invisible canvas background.
+pub const MIN_OPACITY_PERCENT: u8 = 0;
+
+/// The lowest opacity ever applied to the whole window (the fallback where
+/// per-pixel alpha is unavailable): 0 % there would hide RizRef entirely,
+/// with nothing left to click to bring it back.
+pub const MIN_WINDOW_OPACITY_PERCENT: u8 = 20;
 
 /// The order the transparency menu cycles through.
-pub const OPACITY_STEPS: [u8; 5] = [100, 80, 60, 40, 20];
+pub const OPACITY_STEPS: [u8; 6] = [100, 80, 60, 40, 20, 0];
 
 /// The mode state, independent of any window handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowModes {
     /// Whether the window floats above other applications.
     pub always_on_top: bool,
-    /// Ordinary opacity, 20–100 %.
+    /// Transparency setting, 20–100 %: the canvas background's opacity, or
+    /// the whole window's where per-pixel alpha is unavailable.
     pub opacity_percent: u8,
+    /// Whether the GPU surface composites per-pixel alpha, so transparency
+    /// can be the canvas alone. Set once the GPU is attached.
+    pub canvas_alpha_supported: bool,
     /// Whether ordinary click-through is armed.
     pub click_through: bool,
     /// Whether ghost mode is active, with the state to restore when it ends.
@@ -55,6 +73,7 @@ impl Default for WindowModes {
         Self {
             always_on_top: false,
             opacity_percent: 100,
+            canvas_alpha_supported: false,
             click_through: false,
             ghost: None,
             ghost_opacity_percent: GHOST_OPACITY_PERCENT,
@@ -82,11 +101,24 @@ impl WindowModes {
         self.ghost.is_some()
     }
 
-    /// The alpha that should be applied to the window, in percent.
+    /// The alpha applied to the whole window, in percent: ghost mode's, or —
+    /// only without per-pixel alpha — the transparency setting.
     pub fn effective_opacity_percent(self) -> u8 {
         match self.ghost {
             Some(_) => self.ghost_opacity_percent,
-            None => self.opacity_percent,
+            None if self.canvas_alpha_supported => 100,
+            None => self.opacity_percent.max(MIN_WINDOW_OPACITY_PERCENT),
+        }
+    }
+
+    /// The canvas background's opacity, 0–1: the transparency setting when
+    /// the surface composites per-pixel alpha, otherwise opaque (the window
+    /// carries the transparency instead).
+    pub fn canvas_alpha(self) -> f32 {
+        if self.canvas_alpha_supported {
+            f32::from(self.opacity_percent) / 100.0
+        } else {
+            1.0
         }
     }
 
@@ -178,7 +210,7 @@ pub fn styled_ex_style(current: u32, modes: WindowModes) -> u32 {
 }
 
 /// The window's `HWND`, or `None` on a non-Windows backend.
-fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+pub(crate) fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
     let handle = window.window_handle().ok()?;
     match handle.as_raw() {
         RawWindowHandle::Win32(win32) => Some(windows::Win32::Foundation::HWND(
@@ -286,7 +318,8 @@ pub fn click_through_chord_down() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GHOST_OPACITY_PERCENT, MIN_OPACITY_PERCENT, OPACITY_STEPS, WindowModes, styled_ex_style,
+        GHOST_OPACITY_PERCENT, MIN_WINDOW_OPACITY_PERCENT, OPACITY_STEPS, WindowModes,
+        styled_ex_style,
     };
     use windows::Win32::UI::WindowsAndMessaging::{WS_EX_LAYERED, WS_EX_TRANSPARENT};
 
@@ -317,6 +350,42 @@ mod tests {
         let style = styled_ex_style(0, modes);
         assert_ne!(style & WS_EX_LAYERED.0, 0);
         assert_eq!(style & WS_EX_TRANSPARENT.0, 0);
+    }
+
+    #[test]
+    fn with_per_pixel_alpha_transparency_is_the_canvas_alone() {
+        let mut modes = WindowModes {
+            canvas_alpha_supported: true,
+            ..WindowModes::default()
+        };
+        modes.set_opacity(40);
+
+        assert!((modes.canvas_alpha() - 0.4).abs() < 1.0e-6);
+        assert_eq!(
+            modes.effective_opacity_percent(),
+            100,
+            "the window stays opaque"
+        );
+        assert!(
+            !modes.needs_layered(),
+            "and is not layered: it takes clicks"
+        );
+        assert_eq!(styled_ex_style(0, modes), 0);
+
+        // Ghost mode still fades the whole window, canvas transparency kept.
+        modes.toggle_ghost();
+        assert_eq!(modes.effective_opacity_percent(), GHOST_OPACITY_PERCENT);
+        assert!((modes.canvas_alpha() - 0.4).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn without_per_pixel_alpha_transparency_falls_back_to_the_window() {
+        let mut modes = WindowModes::default();
+        modes.set_opacity(60);
+
+        assert_eq!(modes.canvas_alpha(), 1.0);
+        assert_eq!(modes.effective_opacity_percent(), 60);
+        assert!(modes.needs_layered());
     }
 
     #[test]
@@ -365,16 +434,42 @@ mod tests {
             modes.cycle_opacity();
             seen.push(modes.opacity_percent);
         }
-        assert_eq!(seen, vec![80, 60, 40, 20, 100]);
+        assert_eq!(seen, vec![80, 60, 40, 20, 0, 100]);
     }
 
     #[test]
     fn opacity_is_clamped_to_the_supported_band() {
         let mut modes = WindowModes::default();
-        modes.set_opacity(1);
-        assert_eq!(modes.opacity_percent, MIN_OPACITY_PERCENT);
+        modes.set_opacity(0);
+        assert_eq!(
+            modes.opacity_percent, 0,
+            "a fully invisible canvas is allowed"
+        );
         modes.set_opacity(200);
         assert_eq!(modes.opacity_percent, 100);
+    }
+
+    #[test]
+    fn zero_percent_hides_the_canvas_but_never_the_window() {
+        let mut modes = WindowModes {
+            canvas_alpha_supported: true,
+            ..WindowModes::default()
+        };
+        modes.set_opacity(0);
+        assert_eq!(modes.canvas_alpha(), 0.0);
+        assert_eq!(modes.effective_opacity_percent(), 100);
+        assert!(
+            !modes.needs_layered(),
+            "an opaque, unlayered window takes clicks"
+        );
+
+        // The whole-window fallback stops at the lowest safe step.
+        modes.canvas_alpha_supported = false;
+        assert_eq!(modes.canvas_alpha(), 1.0);
+        assert_eq!(
+            modes.effective_opacity_percent(),
+            MIN_WINDOW_OPACITY_PERCENT
+        );
     }
 
     #[test]

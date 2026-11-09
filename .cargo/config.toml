@@ -1,0 +1,14 @@
+# Link the C runtime statically on Windows/MSVC.
+#
+# By default a Rust MSVC binary imports `vcruntime140.dll` and the UCRT
+# forwarders, which a clean Windows install without the Visual C++
+# Redistributable does not have. The phase-07 acceptance check is "the
+# portable exe runs on a clean Win10 22H2 VM (no VC runtime installed)", so
+# the runtime is linked into the exe instead: one file, zero DLLs beyond the
+# operating system's own. `scripts/check-imports.ps1` verifies the import
+# table of a release build.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

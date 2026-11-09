@@ -46,7 +46,7 @@ pub enum SettingId {
     Snap,
     /// HUD readout.
     Hud,
-    /// Scene border.
+    /// Scene boundary.
     Border,
     /// Checkerboard.
     Checkerboard,
@@ -83,11 +83,11 @@ impl SettingId {
             Self::Grid => "Canvas grid",
             Self::Snap => "Snap to items",
             Self::Hud => "HUD readout",
-            Self::Border => "Scene border",
+            Self::Border => "Scene boundary",
             Self::Checkerboard => "Checkerboard",
             Self::Grayscale => "Grayscale items",
             Self::AlwaysOnTop => "Always on top",
-            Self::Opacity => "Window opacity",
+            Self::Opacity => "Canvas opacity",
             Self::GhostOpacity => "Ghost opacity",
             Self::DecodeCap => "Decode cache limit",
         }
@@ -532,15 +532,26 @@ pub enum CloseChoice {
     Discard,
 }
 
-/// The modal "unsaved changes" dialog shown before a destructive step.
+/// The modal two-button dialog: the "unsaved changes" guard shown before a
+/// destructive step, and the launch-time crash-recovery offer.
+///
+/// It is painted into the UI layer like every other panel, so it never blocks
+/// the event loop (a native modal box opened before the first frame was never
+/// shown at all — phase 07 manual test 7.7).
 #[derive(Debug, Clone)]
 pub struct ConfirmClose {
-    /// Document title including the unsaved marker.
-    pub title: String,
+    /// The dialog's heading.
+    pub heading: String,
+    /// The first body line.
+    pub message: String,
+    /// Label of the safe (default) button.
+    pub cancel_label: String,
     /// Label of the destructive button.
     pub discard_label: String,
     /// One line explaining what continuing will do.
     pub note: String,
+    /// The keyboard hint above the buttons.
+    pub hint: String,
     /// 0 = Cancel, 1 = the destructive choice.
     selected: usize,
 }
@@ -563,9 +574,26 @@ impl ConfirmClose {
         note: impl Into<String>,
     ) -> Self {
         Self {
-            title,
+            heading: "Unsaved changes".to_owned(),
+            message: format!("{title} has unsaved changes."),
+            cancel_label: "Cancel".to_owned(),
             discard_label: discard_label.into(),
             note: note.into(),
+            hint: "Esc cancels · ← → switch · Enter confirms".to_owned(),
+            selected: 0,
+        }
+    }
+
+    /// The crash-recovery offer. The safe button restores the copy (it is
+    /// selected, and Esc picks it too: nothing is lost); the other deletes it.
+    pub fn recovery(message: String, note: String) -> Self {
+        Self {
+            heading: "Recover unsaved work".to_owned(),
+            message,
+            cancel_label: "Restore".to_owned(),
+            discard_label: "Discard the copy".to_owned(),
+            note,
+            hint: "Enter or Esc restores · ← → switch".to_owned(),
             selected: 0,
         }
     }
@@ -628,20 +656,8 @@ impl ConfirmClose {
         dim_backdrop(painter, viewport);
         let panel = confirm_rect(viewport);
         painter.panel(panel, 10.0);
-        painter.text(
-            "Unsaved changes",
-            panel.x + PADDING,
-            panel.y + 16.0,
-            18.0,
-            TEXT,
-        );
-        painter.text(
-            &format!("{} has unsaved changes.", self.title),
-            panel.x + PADDING,
-            panel.y + 48.0,
-            13.0,
-            TEXT,
-        );
+        painter.text(&self.heading, panel.x + PADDING, panel.y + 16.0, 18.0, TEXT);
+        painter.text(&self.message, panel.x + PADDING, panel.y + 48.0, 13.0, TEXT);
         painter.text(
             &self.note,
             panel.x + PADDING,
@@ -650,7 +666,7 @@ impl ConfirmClose {
             DIM_TEXT,
         );
         painter.text(
-            "Esc cancels · ← → switch · Enter confirms",
+            &self.hint,
             panel.x + PADDING,
             panel.bottom() - 68.0,
             10.5,
@@ -686,7 +702,7 @@ impl ConfirmClose {
                     1.0,
                     if selected { ACCENT } else { PANEL_BORDER },
                 );
-                painter.text_centered("Cancel", *rect, rect.y + 8.0, 12.0, TEXT);
+                painter.text_centered(&self.cancel_label, *rect, rect.y + 8.0, 12.0, TEXT);
             }
         }
     }
@@ -969,5 +985,37 @@ mod tests {
             ),
             CloseChoice::None
         );
+    }
+
+    #[test]
+    fn the_recovery_offer_defaults_to_restoring() {
+        let mut dialog = ConfirmClose::recovery("m".to_owned(), "n".to_owned());
+
+        // Enter on the default button and Esc both pick the safe choice,
+        // which for this dialog restores the copy; only the second button
+        // deletes it.
+        assert_eq!(dialog.key(KeyChord::plain(Key::Enter)), CloseChoice::Cancel);
+        assert_eq!(
+            dialog.key(KeyChord::plain(Key::Escape)),
+            CloseChoice::Cancel
+        );
+        assert_eq!(
+            dialog.key(KeyChord::plain(Key::Right)),
+            CloseChoice::Changed
+        );
+        assert_eq!(
+            dialog.key(KeyChord::plain(Key::Enter)),
+            CloseChoice::Discard
+        );
+        assert_eq!(dialog.discard_label, "Discard the copy");
+    }
+
+    #[test]
+    fn the_close_guard_keeps_its_wording() {
+        let dialog = ConfirmClose::new("Board*.rizref".to_owned());
+
+        assert_eq!(dialog.heading, "Unsaved changes");
+        assert_eq!(dialog.message, "Board*.rizref has unsaved changes.");
+        assert_eq!(dialog.cancel_label, "Cancel");
     }
 }

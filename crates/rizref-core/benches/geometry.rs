@@ -13,7 +13,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use glam::{DVec2, Vec2};
-use rizref_core::{Camera, Rect};
+use rizref_core::{Camera, Rect, Scene, SceneId};
 
 /// Iterations per measurement.
 const ITERATIONS: u32 = 200_000;
@@ -72,6 +72,26 @@ fn main() {
     time("Rect::intersects (culling)", ITERATIONS, || {
         let visible = camera.visible_world_rect(viewport);
         f64::from(u8::from(visible.intersects(&item_rect)))
+    });
+
+    // The phase-07 soak shape: 500 items on a 25 x 20 grid of 640 x 480 cells,
+    // with the camera looking at a corner. The visible set is what the render
+    // loop instances each frame, so this line is the per-frame culling cost.
+    let mut scene = Scene::new(SceneId::from_bytes([7; SceneId::BYTE_LEN]));
+    for index in 0..500_u16 {
+        let center = Vec2::new(f32::from(index % 25) * 700.0, f32::from(index / 25) * 540.0);
+        scene.insert_note("", center, Vec2::new(640.0, 480.0));
+    }
+    let soak_camera = Camera::new(DVec2::new(1_000.0, 800.0), 0.5, 0.0);
+    let soak_visible = soak_camera.visible_world_rect(viewport);
+    println!(
+        "soak board: {} items, {} visible",
+        scene.items().len(),
+        scene.visible_items(&soak_visible).count()
+    );
+    time("Scene::visible_items (500)", ITERATIONS / 100, || {
+        let visible = soak_camera.visible_world_rect(viewport);
+        scene.visible_items(&visible).count() as f64
     });
 
     time("Rect::union (board bounds)", ITERATIONS, || {

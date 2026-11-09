@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glam::{DVec2, Vec2};
+use rizref_codecs::ImageBuffer;
 use rizref_core::{
     Asset, AssetId, Camera, Item, ItemBody, ItemId, Rect, Scene, SceneId, Selection,
 };
@@ -35,9 +36,11 @@ use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 use crate::accessibility::Accessibility;
+use crate::autosave::{self, AutosavePolicy, AutosaveTracker, PreviousSession, Recovery};
 use crate::board::{Board, CursorHint, Modifiers, ViewInfo};
 use crate::canvas::{FrameFlags, HudUpload, ItemQuad, QuadInstance, UiUpload};
 use crate::clipboard::{self, ClipboardContent};
@@ -52,7 +55,9 @@ use crate::note::{self, NoteRenderer, NoteSession};
 use crate::note_chrome::{
     NoteChrome, PillButton, PillLayout, ScreenRect, ToolbarButton, ToolbarLayout,
 };
+use crate::note_worker::{NOTE_TEXTURE_BUDGET, NoteJob, NoteRendered, NoteWorker, Resident};
 use crate::overlay::{self, OverlayState, OverlayVertex};
+use crate::perf::{self, FrameBench, FrameStats, Milestone, StartupClock};
 use crate::placement;
 use crate::platform::launch;
 use crate::platform::window_modes::WindowModes;
@@ -62,7 +67,7 @@ use crate::platform::{
 };
 use crate::provenance;
 use crate::recents::{Recents, now_unix};
-use crate::renderer::{FrameError, FrameParams, GpuSurface};
+use crate::renderer::{FrameError, FrameParams, GpuDevice, GpuSurface};
 use crate::settings::Settings;
 use crate::shortcuts::{Key as ShortcutKey, KeyChord, ShortcutId, Shortcuts};
 use crate::text::TextEngine;
@@ -141,6 +146,15 @@ struct ParsedArgs {
     check_dialogs: bool,
     /// Print the build summary instead of opening the window.
     build_info: bool,
+    /// Raise an access violation after the crash handler is installed (the
+    /// minidump check).
+    crash_test: bool,
+    /// Print the startup waterfall as JSON once the first frame is presented,
+    /// then exit (the cold-start bench, `scripts/bench-startup.ps1`).
+    exit_after_first_frame: bool,
+    /// Drive the scripted pan/zoom soak for this many frames once the board is
+    /// on screen, print the frame-time report as JSON, then exit.
+    bench_frames: Option<u32>,
     /// Positional paths — boards to open (consumed by later phases).
     paths: Vec<String>,
 }
@@ -153,6 +167,15 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
             "--verbose" | "-v" => parsed.verbose = true,
             "--check-dialogs" => parsed.check_dialogs = true,
             "--build-info" => parsed.build_info = true,
+            "--crash-test" => parsed.crash_test = true,
+            "--exit-after-first-frame" => parsed.exit_after_first_frame = true,
+            flag if flag.starts_with("--bench-frames=") => {
+                let count = &flag["--bench-frames=".len()..];
+                match count.parse::<u32>() {
+                    Ok(frames) if frames > 0 => parsed.bench_frames = Some(frames),
+                    _ => return Err(flag.to_owned()),
+                }
+            }
             flag if flag.starts_with('-') && flag != "-" => return Err(flag.to_owned()),
             path => parsed.paths.push(path.to_owned()),
         }
@@ -165,8 +188,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 /// Exit codes: `0` after a normal run, `2` for an argument this build does not
 /// understand, `1` when the application could not start at all.
 pub fn run(args: Vec<String>) -> ExitCode {
-    if args.first().map(String::as_str) == Some("inspect") {
-        return crate::inspect::run(&args[1..]);
+    match args.first().map(String::as_str) {
+        Some("inspect") => return crate::inspect::run(&args[1..]),
+        Some("register") => return platform::registry::run(true, &args[1..]),
+        Some("unregister") => return platform::registry::run(false, &args[1..]),
+        _ => {}
     }
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => {
@@ -180,7 +206,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
         _ => {}
     }
 
-    let parsed = match parse_args(&args) {
+    let mut parsed = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(flag) => {
             eprintln!("rizref: unrecognised argument {flag:?}");
@@ -189,8 +215,23 @@ pub fn run(args: Vec<String>) -> ExitCode {
         }
     };
 
+    // Absolute now, against this process's working directory: a second
+    // instance forwards its paths to the first, which runs elsewhere.
+    for path in &mut parsed.paths {
+        if path != "-" {
+            *path = crate::paths::normalize_str(path);
+        }
+    }
+
     let log_dir = init_logging(parsed.verbose);
+    let mut startup = StartupClock::new(perf::process_start());
+    startup.mark(Milestone::Logging);
     install_panic_hook(log_dir);
+    let dump = platform::crash::install(&platform::crash::crashes_dir());
+    if parsed.crash_test {
+        tracing::warn!(dump = %dump.display(), "--crash-test: raising an access violation");
+        platform::crash::raise_access_violation();
+    }
     tracing::info!(version = env!("CARGO_PKG_VERSION"), ?parsed, "starting");
 
     if parsed.check_dialogs {
@@ -202,8 +243,14 @@ pub fn run(args: Vec<String>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // The benches measure a launch of their own: they neither hand their
+    // arguments to a running RizRef nor touch its session marker.
+    if parsed.exit_after_first_frame || parsed.bench_frames.is_some() {
+        return run_window(None, parsed, startup);
+    }
+
     match SingleInstance::acquire() {
-        Ok(guard) => run_window(Some(guard), parsed),
+        Ok(guard) => run_window(Some(guard), parsed, startup),
         Err(()) => {
             // Either another instance owns the mutex, or the mutex could not
             // be created. Handing the arguments over is correct in both
@@ -213,7 +260,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
                 ExitCode::SUCCESS
             } else {
                 tracing::warn!("no running instance answered; continuing as the instance");
-                run_window(None, parsed)
+                run_window(None, parsed, startup)
             }
         }
     }
@@ -227,6 +274,7 @@ fn print_help() {
     println!("USAGE:");
     println!("    rizref [OPTION]... [FILE]...");
     println!("    rizref inspect <FILE> [--verify]");
+    println!("    rizref register|unregister [--machine]");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help            print this help and exit");
@@ -234,10 +282,23 @@ fn print_help() {
     println!("    -v, --verbose         log at debug level");
     println!("    --build-info          print what this build contains and exit");
     println!("    --check-dialogs       open the native file dialog and print the chosen paths");
+    println!("    --exit-after-first-frame");
+    println!(
+        "                          print the startup timings as JSON after the first frame and exit"
+    );
+    println!(
+        "    --bench-frames=N      pan/zoom the opened board for N frames, print frame times, exit"
+    );
     println!();
     println!("SUBCOMMANDS:");
     println!("    inspect <FILE>        print a board's header, chunks and document summary");
     println!("                          (--verify recomputes every digest)");
+    println!(
+        "    register [--machine]  associate .rizref with this exe: file icon, open verb and,"
+    );
+    println!("                          when rizref_thumb.dll is beside it, Explorer thumbnails");
+    println!("    unregister [--machine]");
+    println!("                          remove exactly what register wrote");
     println!();
     println!("A second launch hands its FILE arguments to the running instance and exits.");
     println!();
@@ -346,6 +407,13 @@ fn init_logging(verbose: bool) -> PathBuf {
 /// hook, which is why no test in this crate can pop a message box.
 fn install_panic_hook(log_dir: PathBuf) {
     std::panic::set_hook(Box::new(move |info| {
+        // A panic inside a containment boundary (a decoder, the math
+        // backend) is reported by the boundary as an ordinary error; exiting
+        // here would defeat it, which is what happened before phase 07.
+        if crate::contain::is_contained() {
+            tracing::warn!(%info, "contained panic");
+            return;
+        }
         let backtrace = std::backtrace::Backtrace::force_capture();
         let body = format!(
             "rizref {}\npanicked:\n{info}\n\n{backtrace}\n",
@@ -387,6 +455,10 @@ pub(crate) enum AppEvent {
     Dropped(Box<DropEvent>),
     /// An accessibility adapter event (tree request, action, deactivation).
     Accessibility(accesskit_winit::Event),
+    /// The background GPU initialisation finished (successfully or not).
+    GpuReady,
+    /// The note worker finished one render.
+    NoteRendered(Box<NoteRendered>),
 }
 
 impl From<accesskit_winit::Event> for AppEvent {
@@ -396,12 +468,21 @@ impl From<accesskit_winit::Event> for AppEvent {
 }
 
 /// One note's resident texture.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct NoteTexture {
-    /// Content-addressed texture id.
+    /// The texture drawn now: the full render, its low-resolution copy, or
+    /// the card-only placeholder.
     id: AssetId,
     /// World size the texture was rendered for.
     world_size: Vec2,
+    /// Bytes of the full-resolution texture, counted against
+    /// [`NOTE_TEXTURE_BUDGET`]; 0 for a placeholder or low-resolution copy.
+    bytes: usize,
+    /// The render at most 256 px, shown after eviction until the full
+    /// texture is back.
+    low: Option<Arc<ImageBuffer>>,
+    /// The note-frame counter when the note was last near the viewport.
+    last_seen: u64,
 }
 
 /// Everything the event loop owns: the window, its surface, the board state
@@ -448,6 +529,14 @@ struct App {
     pick_for_note: Option<ItemId>,
     /// Resident note textures.
     note_textures: HashMap<ItemId, NoteTexture>,
+    /// The title-bar button whose tooltip is showing.
+    title_hint: Option<titlebar::TitleBarButton>,
+    /// Renders every note except the one being edited, off the UI thread.
+    note_worker: Option<NoteWorker>,
+    /// The texture each note's in-flight worker render will produce.
+    pending_notes: HashMap<ItemId, AssetId>,
+    /// Counts `ensure_note_textures` passes, for least-recently-seen eviction.
+    note_frame: u64,
     /// Notes whose texture must be re-rendered on the next frame.
     dirty_notes: BTreeSet<ItemId>,
     /// The last click, for double-click detection.
@@ -464,6 +553,10 @@ struct App {
     next_document: u32,
     /// The cached, dirty-tracked screen-space shell layer.
     ui_layer: UiLayer,
+    /// Whether the last GPU frame composited the UI layer. The renderer drops
+    /// its UI texture while the layer is hidden, so a layer that becomes
+    /// visible again is uploaded even when it was not repainted.
+    ui_was_visible: bool,
     /// Persisted settings.
     settings: Settings,
     /// The rebindable keyboard table built from the settings.
@@ -488,6 +581,38 @@ struct App {
     ghost_hotkey_was_down: bool,
     /// Latch for the polled click-through hotkey.
     click_through_hotkey_was_down: bool,
+    /// Launch milestones, reported once the first frame is presented.
+    startup: StartupClock,
+    /// Rolling frame times for the `F3` developer overlay.
+    frame_stats: FrameStats,
+    /// Whether the `F3` developer overlay replaces the readout.
+    dev_overlay: bool,
+    /// Items instanced by the last frame, for the developer overlay.
+    last_drawn: usize,
+    /// Exit after the first presented frame, printing the startup JSON.
+    exit_after_first_frame: bool,
+    /// Frames the scripted soak should run once a board is on screen.
+    bench_frames: Option<u32>,
+    /// The running scripted soak.
+    bench: Option<FrameBench>,
+    /// When the last board open started, until its first frame is presented.
+    board_open_started: Option<Instant>,
+    /// Open-to-first-frame time of the last opened board.
+    last_board_load: Option<Duration>,
+    /// The device being created on a background thread, until it arrives.
+    gpu_init: Option<std::sync::mpsc::Receiver<Option<GpuDevice>>>,
+    /// Whether the device thread was started (after the first CPU frame).
+    gpu_started: bool,
+    /// Changes since the last autosave.
+    autosave: AutosaveTracker,
+    /// When autosaves are due.
+    autosave_policy: AutosavePolicy,
+    /// Where recovery copies live.
+    autosave_dir: PathBuf,
+    /// Recovery copies found at launch, offered once the window is up.
+    pending_recoveries: Vec<Recovery>,
+    /// Whether the previous session ended without a clean exit.
+    previous_session: PreviousSession,
 }
 
 /// One asset's place in its animation.
@@ -508,6 +633,9 @@ enum PendingAction {
     NewBoard,
     /// Replace the board with the file at this path.
     OpenBoard(PathBuf),
+    /// The launch-time crash-recovery offer: its safe button restores this
+    /// copy, its destructive one deletes it.
+    Recover(Recovery),
 }
 
 impl App {
@@ -525,6 +653,15 @@ impl App {
             }
         });
         tracing::info!(workers = importer.worker_count(), "import pool started");
+        let note_proxy = proxy.clone();
+        let note_worker = NoteWorker::spawn(move |done| {
+            if note_proxy
+                .send_event(AppEvent::NoteRendered(Box::new(done)))
+                .is_err()
+            {
+                tracing::debug!("the event loop is gone; dropping a note render");
+            }
+        });
 
         // The camera belongs to the board document; a session with no board
         // starts at the default view.
@@ -565,6 +702,10 @@ impl App {
             note_hover: None,
             pick_for_note: None,
             note_textures: HashMap::new(),
+            title_hint: None,
+            note_worker: Some(note_worker),
+            pending_notes: HashMap::new(),
+            note_frame: 0,
             dirty_notes: BTreeSet::new(),
             last_click: None,
             last_title_click: None,
@@ -575,6 +716,7 @@ impl App {
                 Mode::Canvas
             }),
             ui_layer: UiLayer::new(),
+            ui_was_visible: false,
             document: None,
             next_document: 1,
             settings,
@@ -589,6 +731,22 @@ impl App {
             pending_pick: None,
             ghost_hotkey_was_down: false,
             click_through_hotkey_was_down: false,
+            startup: StartupClock::new(perf::process_start()),
+            frame_stats: FrameStats::default(),
+            dev_overlay: false,
+            last_drawn: 0,
+            exit_after_first_frame: false,
+            bench_frames: None,
+            bench: None,
+            board_open_started: None,
+            last_board_load: None,
+            gpu_init: None,
+            gpu_started: false,
+            autosave: AutosaveTracker::default(),
+            autosave_policy: AutosavePolicy::default(),
+            autosave_dir: autosave::autosave_dir(),
+            pending_recoveries: Vec::new(),
+            previous_session: PreviousSession::Clean,
         }
     }
 
@@ -621,7 +779,177 @@ impl App {
     /// guard or confirmed that there is nothing to lose.
     fn exit(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("closing the window");
+        // Exit is reached only after a save or an explicit discard, so the
+        // recovery copy has nothing left to protect.
+        self.discard_autosave();
         event_loop.exit();
+    }
+
+    /// Deletes the current board's recovery copy and forgets pending changes.
+    fn discard_autosave(&mut self) {
+        autosave::discard(&self.autosave_dir, self.board.scene().id);
+        self.autosave.reset();
+    }
+
+    /// Writes the recovery copy now, if the document has unsaved changes.
+    ///
+    /// The copy is an ordinary board in the autosave folder: the first write
+    /// is a fresh save, every later one an incremental append, so a periodic
+    /// autosave costs the changed chunks plus a new index. The user's own
+    /// file is never touched.
+    fn autosave_now(&mut self) {
+        self.autosave.reset();
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        if !document.is_dirty() {
+            return;
+        }
+        let started = Instant::now();
+        let scene_id = self.board.scene().id;
+        let path = autosave::board_path(&self.autosave_dir, scene_id);
+        if let Err(error) = std::fs::create_dir_all(&self.autosave_dir) {
+            tracing::warn!(%error, "cannot create the autosave folder");
+            return;
+        }
+        let name = document.stem().to_owned();
+        let info = autosave::RecoveryInfo {
+            name: document.name().to_owned(),
+            original: document.path().map(Path::to_path_buf),
+            saved_unix: now_unix(),
+            items: self.board.scene().items().len(),
+        };
+        let result = {
+            let mut request = SaveRequest::new(self.board.scene(), self.view.camera, &name);
+            request.provenance = &self.provenance;
+            request.background = self.settings.canvas_theme.rgba();
+            request.old_document = self.loaded_document.as_ref();
+            rizref_format::save(&path, &request)
+        };
+        match result {
+            Ok(report) => {
+                if let Err(error) = autosave::write_sidecar(&self.autosave_dir, scene_id, &info) {
+                    tracing::warn!(%error, "cannot write the autosave sidecar");
+                }
+                tracing::info!(
+                    path = %path.display(),
+                    mode = ?report.mode,
+                    bytes = report.bytes_written,
+                    ms = perf::ms(started.elapsed()),
+                    "autosaved"
+                );
+            }
+            Err(error) => tracing::warn!(path = %path.display(), %error, "autosave failed"),
+        }
+    }
+
+    /// Offers the newest recovery copy found at launch, then reports an
+    /// unclean previous exit that left nothing to recover.
+    fn offer_recovery(&mut self) {
+        let recoveries = std::mem::take(&mut self.pending_recoveries);
+        if let Some(recovery) = recoveries.into_iter().next() {
+            // An in-app dialog, painted with the first frames: a native modal
+            // box opened here, before the window had ever presented, was
+            // never shown and blocked the event loop (manual test 7.7).
+            let (message, note) = autosave::prompt_text(&recovery, now_unix());
+            let dialog = panels::ConfirmClose::recovery(message, note);
+            tracing::info!(board = %recovery.board.display(), "offering recovery");
+            self.pending_action = Some(PendingAction::Recover(recovery));
+            self.shell.title_bar.hide();
+            self.shell.open_recovery(dialog);
+            self.redraw();
+            return;
+        }
+        if self.previous_session == PreviousSession::Crashed {
+            // Nothing unsaved survived (the board was clean or never edited),
+            // so put the user back where they were: the last board, if any.
+            let last = self
+                .recents
+                .entries
+                .first()
+                .map(|entry| PathBuf::from(&entry.path));
+            let message = match last {
+                Some(path) if self.pending_paths.is_empty() => {
+                    self.open_board_now(&path);
+                    "RizRef recovered from an unexpected exit; your last board was reopened"
+                }
+                _ => "RizRef recovered from an unexpected exit",
+            };
+            self.shell.toast(message, Instant::now());
+            self.redraw();
+        }
+    }
+
+    /// Loads a recovery copy as the open document: named after the board it
+    /// belongs to, marked unsaved, and still autosaving to the same copy.
+    fn restore_recovery(&mut self, recovery: &Recovery) {
+        match rizref_format::load(&recovery.board) {
+            Ok(loaded) => {
+                let item_count = loaded.scene.items().len();
+                let provenance: BTreeMap<AssetId, AssetProvenance> = loaded
+                    .document
+                    .assets
+                    .iter()
+                    .filter_map(|entry| {
+                        AssetId::from_hex(&entry.hash).map(|id| {
+                            (
+                                id,
+                                AssetProvenance {
+                                    origin: entry.origin,
+                                    source_path: entry.source_path.clone(),
+                                    source_url: entry.source_url.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                self.reset_board(loaded.scene);
+                self.provenance = provenance;
+                // Unknown-field preservation follows the user's own file when
+                // it still exists; the copy's document is the fallback.
+                self.loaded_document = recovery
+                    .info
+                    .original
+                    .as_ref()
+                    .and_then(|path| rizref_format::BoardReader::open_path(path).ok())
+                    .and_then(|mut reader| reader.document().ok())
+                    .or(Some(loaded.document));
+                self.view.camera = loaded.camera;
+                let mut document = match &recovery.info.original {
+                    Some(path) => Document::from_path(path),
+                    None => self.new_document(),
+                };
+                document.mark_dirty();
+                self.document = Some(document);
+                self.shell.set_mode(Mode::Canvas);
+                self.refresh_window_title();
+                self.upload_asset_previews();
+                self.shell.toast(
+                    format!("Restored unsaved work ({item_count} items) — save to keep it"),
+                    Instant::now(),
+                );
+                tracing::info!(board = %recovery.board.display(), items = item_count, "recovery restored");
+                self.redraw();
+            }
+            Err(error) => {
+                tracing::warn!(board = %recovery.board.display(), %error, "cannot restore the recovery copy");
+                self.shell.toast(
+                    format!("Could not restore unsaved work: {error}"),
+                    Instant::now(),
+                );
+                self.redraw();
+            }
+        }
+    }
+
+    /// The dialog's safe button (or Esc): keeps the document open — or, for
+    /// the recovery offer, restores the copy.
+    fn cancel_confirm(&mut self) {
+        self.shell.close_confirm_close();
+        if let Some(PendingAction::Recover(recovery)) = self.pending_action.take() {
+            self.restore_recovery(&recovery);
+        }
+        self.redraw();
     }
 
     /// Confirms the unsaved-changes guard and runs the pending action.
@@ -629,6 +957,12 @@ impl App {
         self.shell.confirm_close = None;
         self.shell.touch();
         match self.pending_action.take() {
+            Some(PendingAction::Recover(recovery)) => {
+                tracing::info!(board = %recovery.board.display(), "recovery declined");
+                let _ = std::fs::remove_file(&recovery.board);
+                let _ = std::fs::remove_file(&recovery.sidecar);
+                self.redraw();
+            }
             Some(PendingAction::NewBoard) => self.new_board_now(),
             Some(PendingAction::OpenBoard(path)) => {
                 self.open_board_now(&path);
@@ -646,7 +980,7 @@ impl App {
                 PendingAction::OpenBoard(path) => {
                     self.open_board_now(&path);
                 }
-                PendingAction::Quit => {}
+                PendingAction::Quit | PendingAction::Recover(_) => {}
             }
             return;
         }
@@ -667,6 +1001,9 @@ impl App {
 
     /// Drops the old board's GPU textures and resets per-board caches.
     fn reset_board(&mut self, scene: Scene) {
+        // Replacing the board happens only after a save or an explicit
+        // discard (the close guard), so its recovery copy goes with it.
+        self.discard_autosave();
         let old_assets: Vec<AssetId> = self
             .board
             .scene()
@@ -684,7 +1021,17 @@ impl App {
         self.decode_cache = DecodeCache::new(self.settings.max_decode_bytes);
         self.playbacks.clear();
         self.pending_textures.clear();
-        self.note_textures.clear();
+        let note_textures: Vec<AssetId> = self
+            .note_textures
+            .drain()
+            .map(|(_, entry)| entry.id)
+            .collect();
+        if let Some(renderer) = self.renderer.as_mut() {
+            for id in note_textures {
+                renderer.remove_texture(id);
+            }
+        }
+        self.pending_notes.clear();
         self.dirty_notes.clear();
         self.provenance.clear();
         self.loaded_document = None;
@@ -705,6 +1052,7 @@ impl App {
 
     /// Opens `path`, replacing the board. Errors become a toast, never a panic.
     fn open_board_now(&mut self, path: &Path) {
+        let open_started = Instant::now();
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -763,9 +1111,11 @@ impl App {
                     format!("{message} · {} linked image(s) missing", missing.len())
                 };
                 self.shell.toast(message, Instant::now());
+                self.board_open_started = Some(open_started);
                 tracing::info!(
                     path = %path.display(),
                     items = item_count,
+                    read_ms = perf::ms(open_started.elapsed()),
                     missing = missing.len(),
                     recovered,
                     "board opened"
@@ -813,6 +1163,7 @@ impl App {
         if let Err(error) = self.recents.save() {
             tracing::warn!(%error, "cannot save the recent-board list");
         }
+        launch::add_to_recent_documents(path);
     }
 
     /// Saves the board to its file, or asks for one first.
@@ -835,7 +1186,7 @@ impl App {
                 .map(Document::name)
                 .unwrap_or("Board.rizref")
                 .to_owned();
-            let Some(path) = dialogs::save_board(&default) else {
+            let Some(path) = dialogs::save_board(self.window.as_deref(), &default) else {
                 return;
             };
             path
@@ -862,6 +1213,7 @@ impl App {
                     document.set_path(&path);
                     document.mark_saved();
                 }
+                self.discard_autosave();
                 self.refresh_window_title();
                 let thumbnail = rizref_format::read_summary(&path)
                     .ok()
@@ -891,6 +1243,20 @@ impl App {
                     "board saved"
                 );
             }
+            Err(error) if error.is_denied() && existing => {
+                // Read-only file, read-only share, or a lock another program
+                // holds: retrying cannot help, saving elsewhere can.
+                tracing::warn!(path = %path.display(), %error, "save refused; offering Save As");
+                self.shell.toast(
+                    format!(
+                        "{} is read-only or in use — choose where to save a copy",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    now,
+                );
+                self.save_document(true);
+                return;
+            }
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "cannot save board");
                 self.shell.toast(format!("Could not save: {error}"), now);
@@ -909,7 +1275,7 @@ impl App {
                 .map(Document::stem)
                 .unwrap_or("Board")
         );
-        let Some(path) = dialogs::export_png(&default) else {
+        let Some(path) = dialogs::export_png(self.window.as_deref(), &default) else {
             return;
         };
         match rizref_format::thumbnail::export_png(
@@ -947,6 +1313,9 @@ impl App {
 
     /// Marks the open document dirty. Returns whether the asterisk changed.
     fn mark_document_dirty(&mut self) -> bool {
+        if self.document.is_some() {
+            self.autosave.note_change(Instant::now());
+        }
         self.document.as_mut().is_some_and(Document::mark_dirty)
     }
 
@@ -978,6 +1347,24 @@ impl App {
         }
     }
 
+    /// The toast after a transparency change: the canvas, or — on a GPU
+    /// surface without per-pixel alpha — the whole window.
+    fn opacity_toast(&self) -> String {
+        let percent = self.window_modes.opacity_percent;
+        let window = self.window_modes.effective_opacity_percent();
+        if self.window_modes.canvas_alpha_supported || self.renderer.is_none() {
+            format!("Canvas opacity {percent}%")
+        } else if window > percent {
+            // A fully faded window could never be clicked again.
+            format!(
+                "Window opacity {window}% (the lowest on this GPU, which has no per-pixel alpha)"
+            )
+        } else {
+            // Vulkan's Win32 surfaces have no per-pixel alpha.
+            format!("Window opacity {percent}% (no per-pixel alpha on this GPU)")
+        }
+    }
+
     /// Whether the title bar may appear in the current window mode.
     fn title_bar_allowed(&self) -> bool {
         !self.window_modes.effective_click_through()
@@ -1001,14 +1388,50 @@ impl App {
     fn update_title_bar_pointer(&mut self, cursor: Option<DVec2>) {
         let allowed = self.title_bar_allowed();
         let viewport = self.viewport();
-        if self
+        let moved = self
             .shell
             .title_bar
-            .pointer_moved(cursor, viewport, allowed)
-        {
+            .pointer_moved(cursor, viewport, allowed);
+        let hinted = self.refresh_title_hint(Instant::now());
+        if moved || hinted {
             self.shell.touch();
             self.redraw();
         }
+    }
+
+    /// Shows, rewords or hides the title-bar button tooltip: after
+    /// [`titlebar::TOOLTIP_DELAY`] on a button, with the live shortcut. The
+    /// bar cannot auto-hide under it — it only hides when the pointer leaves
+    /// the bar, which also leaves the button. Returns whether it changed.
+    fn refresh_title_hint(&mut self, now: Instant) -> bool {
+        let button = self.shell.title_bar.hint(now);
+        let wanted = button.map(|button| {
+            let shortcut = button
+                .shortcut()
+                .and_then(|id| self.shortcuts.chord_for(id))
+                .map(|chord| chord.to_string());
+            let text = button.tooltip(
+                self.shell.title_bar.pinned(),
+                self.shell.title_bar.maximized(),
+                shortcut.as_deref(),
+            );
+            let rect = titlebar::TitleBarLayout::new(self.viewport()).rect(button);
+            (
+                text,
+                DVec2::new(f64::from(rect.x), f64::from(rect.y + rect.height)),
+            )
+        });
+        let changed = match (&wanted, self.title_hint) {
+            (Some(_), _) => self.shell.tooltip != wanted,
+            (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        if changed {
+            self.shell.tooltip = wanted;
+            self.title_hint = button;
+            self.shell.touch();
+        }
+        changed
     }
 
     /// Handles a left press on the title bar.
@@ -1416,10 +1839,7 @@ impl App {
     fn execute(&mut self, action: Action, event_loop: &ActiveEventLoop) {
         if self.shell.confirm_close.is_some() {
             match action {
-                Action::ConfirmCloseCancel => {
-                    self.shell.close_confirm_close();
-                    self.redraw();
-                }
+                Action::ConfirmCloseCancel => self.cancel_confirm(),
                 Action::ConfirmCloseDiscard => self.confirm_discard(event_loop),
                 // The close guard is modal: nothing behind it runs.
                 _ => {}
@@ -1462,7 +1882,7 @@ impl App {
                 self.redraw();
             }
             Action::OpenBoard => {
-                if let Some(path) = dialogs::pick_board() {
+                if let Some(path) = dialogs::pick_board(self.window.as_deref()) {
                     self.request_destructive(
                         PendingAction::OpenBoard(path),
                         "Discard changes",
@@ -1520,6 +1940,15 @@ impl App {
                 self.shell.toggle_settings();
                 self.redraw();
             }
+            Action::OpenLogsFolder => {
+                let dir = logs_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                if let Err(error) = launch::open_folder(&dir) {
+                    tracing::warn!(dir = %dir.display(), ?error, "cannot open the logs folder");
+                    self.shell
+                        .toast(format!("Could not open {}", dir.display()), now);
+                }
+            }
             Action::About => {
                 self.shell.toast(
                     format!(
@@ -1565,10 +1994,7 @@ impl App {
                 self.settings.opacity_percent = self.window_modes.opacity_percent;
                 self.apply_window_modes();
                 self.save_settings();
-                self.shell.toast(
-                    format!("Window opacity {}%", self.window_modes.opacity_percent),
-                    now,
-                );
+                self.shell.toast(self.opacity_toast(), now);
                 self.redraw();
             }
             Action::CycleOpacity => {
@@ -1576,10 +2002,7 @@ impl App {
                 self.settings.opacity_percent = self.window_modes.opacity_percent;
                 self.apply_window_modes();
                 self.save_settings();
-                self.shell.toast(
-                    format!("Window opacity {}%", self.window_modes.opacity_percent),
-                    now,
-                );
+                self.shell.toast(self.opacity_toast(), now);
                 self.redraw();
             }
             Action::ToggleClickThrough => {
@@ -1971,6 +2394,20 @@ impl App {
 
     /// The HUD readout line: zoom, rotation, cursor, selection size.
     fn readout_text(&self) -> String {
+        if self.dev_overlay {
+            let (textures, texture_bytes) = self
+                .renderer
+                .as_ref()
+                .map_or((0, 0), |r| (r.texture_count(), r.texture_bytes()));
+            return perf::dev_overlay_line(
+                &self.frame_stats,
+                self.last_drawn,
+                self.board.scene().items().len(),
+                textures,
+                texture_bytes,
+                self.pending_textures.len(),
+            );
+        }
         let zoom = self.view.camera.zoom * 100.0;
         let zoom = if (zoom - zoom.round()).abs() < 0.05 {
             format!("{}", zoom.round() as i64)
@@ -2118,7 +2555,7 @@ impl App {
 
     /// Ctrl+O: the native multi-select image dialog.
     fn open_images(&mut self) {
-        if let Some(paths) = crate::dialogs::pick_images() {
+        if let Some(paths) = crate::dialogs::pick_images(self.window.as_deref()) {
             let drop_world = self.drop_world();
             // `import_paths` switches to the canvas only for actual images, so
             // cancelling or picking a non-image never strands the start view.
@@ -2179,8 +2616,17 @@ impl App {
                 "virtual file dropped"
             );
             self.shell.set_mode(Mode::Canvas);
-            let source =
+            // A virtual file has a name but no path: its extension is the
+            // only way to recognise a signature-less format such as TGA.
+            let hint = Path::new(&file.name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(rizref_codecs::ImageFormat::from_extension);
+            let mut source =
                 ImportSource::bytes(file.name, file.bytes).with_source_url(source_url.clone());
+            if let Some(format) = hint {
+                source = source.with_format_hint(format);
+            }
             self.submit_import(ImportRequest::new(source, drop_world));
         }
         self.redraw();
@@ -2209,7 +2655,7 @@ impl App {
                 }
                 // Keep the request recorded: a corrupt original would
                 // otherwise be decoded again on every visible frame.
-                Err(error) => tracing::debug!(
+                Err(error) => tracing::warn!(
                     asset = %asset_id,
                     reason = %error.reason,
                     "full-resolution decode failed; keeping the preview"
@@ -2383,13 +2829,33 @@ impl App {
         self.redraw();
     }
 
-    /// Renders any note whose content or size changed, and uploads it.
+    /// Keeps every note near the view textured.
+    ///
+    /// Phase 07: only the note being edited renders here; every other render
+    /// goes to the note worker, and the note shows its last texture (or a
+    /// card-only placeholder) until the result arrives — no frame waits on a
+    /// layout or an equation. Off-screen notes are not rendered until they
+    /// come within half a viewport, and full textures stay within the 64 MiB
+    /// budget by dropping the least recently seen off-screen notes to their
+    /// low-resolution copies.
     fn ensure_note_textures(&mut self) {
         if self.renderer.is_none() {
             return;
         }
+        self.note_frame += 1;
+        let frame = self.note_frame;
         let active = self.note_session.as_ref().map(NoteSession::item);
         let gesture = self.board.is_gesture_active();
+        // Notes within half a viewport of the screen count as seen: they are
+        // rendered just before they scroll in, and kept resident.
+        let visible = self.view.camera.visible_world_rect(self.view.viewport());
+        let near = Rect::from_min_size(visible.min - visible.size * 0.5, visible.size * 2.0);
+        let near_ids: BTreeSet<ItemId> = self
+            .board
+            .scene()
+            .visible_items(&near)
+            .map(Item::id)
+            .collect();
         let notes: Vec<(ItemId, rizref_core::NoteContent, Vec2)> = self
             .board
             .scene()
@@ -2402,63 +2868,255 @@ impl App {
             .collect();
 
         for (id, content, size) in notes {
-            let density = match self.note_session.as_ref().filter(|s| s.item() == id) {
-                Some(session) => session.pixels_per_world(),
-                None => note::pixels_per_world(size),
-            };
-            let wanted = note::texture_id(&content, size, density);
-            let current = self.note_textures.get(&id).copied();
-            let resident = self
-                .renderer
-                .as_ref()
-                .is_some_and(|renderer| renderer.has_texture(wanted));
-            let stale = current.is_none_or(|entry| entry.id != wanted || entry.world_size != size)
-                || self.dirty_notes.contains(&id)
-                || !resident;
+            let on_screen = near_ids.contains(&id) || active == Some(id);
+            if on_screen && let Some(entry) = self.note_textures.get_mut(&id) {
+                entry.last_seen = frame;
+            }
+            if active == Some(id) {
+                self.render_note_now(id, &content, size);
+                continue;
+            }
+            let wanted = note::texture_id(&content, size, note::pixels_per_world(size));
+            let current = self.note_textures.get(&id).map(|entry| entry.id);
+            let resident = current.is_some_and(|current| {
+                self.renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.has_texture(current))
+            });
+            let stale = current != Some(wanted) || self.dirty_notes.contains(&id) || !resident;
             if !stale {
                 continue;
             }
             // During a drag a note keeps its existing texture stretched; it is
             // re-rendered once at the final size instead of every mouse move.
-            if gesture && active != Some(id) && current.is_some() {
+            if gesture && resident {
                 continue;
             }
-
-            let session = self
-                .note_session
-                .as_mut()
-                .filter(|session| session.item() == id);
-            let session = match session {
-                Some(session) => {
-                    // A resize changes the visible area, never the wrap width.
-                    session.resize(size);
-                    Some(session)
-                }
-                None => None,
-            };
-            let Some(image) = self
-                .note_renderer
-                .render(&mut self.text, &content, size, session)
-            else {
+            // Off-screen notes are rendered when they come near the view.
+            if !on_screen || self.pending_notes.get(&id) == Some(&wanted) {
                 continue;
+            }
+            let job = NoteJob {
+                note: id,
+                texture: wanted,
+                content: content.clone(),
+                size,
             };
+            let submitted = self
+                .note_worker
+                .as_ref()
+                .is_some_and(|worker| worker.submit(job));
+            if !submitted {
+                // No worker thread (it could not start): render here.
+                self.render_note_now(id, &content, size);
+                continue;
+            }
+            self.pending_notes.insert(id, wanted);
             self.dirty_notes.remove(&id);
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.upload_texture(wanted, &image, false);
+            if !resident {
+                self.show_note_placeholder(id, &content, size, wanted);
             }
-            let previous = self.note_textures.insert(
-                id,
-                NoteTexture {
-                    id: wanted,
-                    world_size: size,
-                },
-            );
-            // One resident texture per note: the superseded one is freed as
-            // soon as no other note shares it, so typing or resizing never
-            // accumulates GPU memory.
-            if let Some(previous) = previous {
-                self.release_note_texture(previous.id);
+        }
+        self.enforce_note_budget();
+    }
+
+    /// Renders one note on the UI thread: the note being edited (its caret
+    /// and selection change every keystroke, and the editor lives here), or
+    /// any note when the worker could not start.
+    fn render_note_now(&mut self, id: ItemId, content: &rizref_core::NoteContent, size: Vec2) {
+        let density = match self.note_session.as_ref().filter(|s| s.item() == id) {
+            Some(session) => session.pixels_per_world(),
+            None => note::pixels_per_world(size),
+        };
+        let wanted = note::texture_id(content, size, density);
+        let current = self.note_textures.get(&id);
+        let resident = current.is_some_and(|entry| {
+            self.renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.has_texture(entry.id))
+        });
+        let fresh = current.is_some_and(|entry| entry.id == wanted && entry.world_size == size);
+        if fresh && resident && !self.dirty_notes.contains(&id) {
+            return;
+        }
+        let session = self
+            .note_session
+            .as_mut()
+            .filter(|session| session.item() == id);
+        let session = match session {
+            Some(session) => {
+                // A resize changes the visible area, never the wrap width.
+                session.resize(size);
+                Some(session)
             }
+            None => None,
+        };
+        let Some(image) = self
+            .note_renderer
+            .render(&mut self.text, content, size, session)
+        else {
+            return;
+        };
+        self.dirty_notes.remove(&id);
+        self.pending_notes.remove(&id);
+        let low = Arc::new(note::low_resolution(&image));
+        self.install_note_texture(id, wanted, size, &image, Some(low));
+    }
+
+    /// Uploads a full note render and makes it the note's texture.
+    fn install_note_texture(
+        &mut self,
+        id: ItemId,
+        texture: AssetId,
+        size: Vec2,
+        image: &ImageBuffer,
+        low: Option<Arc<ImageBuffer>>,
+    ) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.upload_texture(texture, image, false);
+        }
+        let previous = self.note_textures.insert(
+            id,
+            NoteTexture {
+                id: texture,
+                world_size: size,
+                bytes: image.width() as usize * image.height() as usize * 4,
+                low,
+                last_seen: self.note_frame,
+            },
+        );
+        // One resident texture per note: the superseded one is freed as soon
+        // as no other note shares it, so typing or resizing never
+        // accumulates GPU memory.
+        if let Some(previous) = previous
+            && previous.id != texture
+        {
+            self.release_note_texture(previous.id);
+        }
+    }
+
+    /// Gives a note with nothing to show its card-only placeholder until the
+    /// worker's render arrives.
+    fn show_note_placeholder(
+        &mut self,
+        id: ItemId,
+        content: &rizref_core::NoteContent,
+        size: Vec2,
+        wanted: AssetId,
+    ) {
+        let Some(image) = note::render_placeholder(content, size) else {
+            return;
+        };
+        let texture = note::derived_texture_id(wanted, b"placeholder");
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.upload_texture(texture, &image, false);
+        }
+        let previous = self.note_textures.insert(
+            id,
+            NoteTexture {
+                id: texture,
+                world_size: size,
+                bytes: 0,
+                low: None,
+                last_seen: self.note_frame,
+            },
+        );
+        if let Some(previous) = previous
+            && previous.id != texture
+        {
+            self.release_note_texture(previous.id);
+        }
+    }
+
+    /// Takes a finished worker render: uploaded if it is still what the note
+    /// wants, dropped if the note changed (a newer render is on its way).
+    fn apply_note_render(&mut self, done: NoteRendered) {
+        if done.image.is_none() {
+            // A failed render keeps its pending mark, so the same content is
+            // not retried every frame; an edit or resize asks again.
+            tracing::warn!(note = ?done.note, "note render failed; keeping the placeholder");
+            return;
+        }
+        if self.pending_notes.get(&done.note) == Some(&done.texture) {
+            self.pending_notes.remove(&done.note);
+        }
+        let Some(item) = self.board.scene().item(done.note) else {
+            return;
+        };
+        let Some(content) = item.note_content() else {
+            return;
+        };
+        let size = item.size();
+        let editing = self
+            .note_session
+            .as_ref()
+            .is_some_and(|session| session.item() == done.note);
+        let wanted = note::texture_id(&content, size, note::pixels_per_world(size));
+        if editing || wanted != done.texture {
+            return;
+        }
+        let Some(image) = done.image else {
+            return;
+        };
+        tracing::debug!(
+            note = ?done.note,
+            ms = perf::ms(done.elapsed),
+            width = image.width(),
+            height = image.height(),
+            "note rendered on the worker"
+        );
+        self.install_note_texture(
+            done.note,
+            done.texture,
+            size,
+            &image,
+            done.low.map(Arc::new),
+        );
+        self.enforce_note_budget();
+        self.redraw();
+    }
+
+    /// Keeps full-resolution note textures within [`NOTE_TEXTURE_BUDGET`]:
+    /// off-screen notes, least recently seen first, drop to their
+    /// low-resolution copies (a note without one drops its texture).
+    fn enforce_note_budget(&mut self) {
+        let frame = self.note_frame;
+        let active = self.note_session.as_ref().map(NoteSession::item);
+        let residents: Vec<Resident> = self
+            .note_textures
+            .iter()
+            .map(|(id, entry)| Resident {
+                note: *id,
+                bytes: entry.bytes,
+                last_seen: entry.last_seen,
+                pinned: entry.last_seen == frame || active == Some(*id),
+            })
+            .collect();
+        for id in crate::note_worker::plan_evictions(&residents, NOTE_TEXTURE_BUDGET) {
+            let Some(entry) = self.note_textures.get(&id).cloned() else {
+                continue;
+            };
+            match &entry.low {
+                Some(low) => {
+                    let texture = note::derived_texture_id(entry.id, b"low");
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.upload_texture(texture, low, false);
+                    }
+                    self.note_textures.insert(
+                        id,
+                        NoteTexture {
+                            id: texture,
+                            bytes: 0,
+                            ..entry.clone()
+                        },
+                    );
+                }
+                None => {
+                    self.note_textures.remove(&id);
+                }
+            }
+            self.release_note_texture(entry.id);
+            tracing::debug!(note = ?id, bytes = entry.bytes, "note texture evicted");
         }
     }
 
@@ -2471,11 +3129,15 @@ impl App {
     }
 
     /// Builds this frame's drawable items in scene z-order.
+    ///
+    /// Only the visible set is instanced (phase 07): items whose world bounds
+    /// miss the viewport are culled here, so neither their quads nor their
+    /// textures cost anything while they are off screen.
     fn build_items(&self) -> Vec<ItemQuad> {
+        let visible = self.view.camera.visible_world_rect(self.view.viewport());
         self.board
             .scene()
-            .items()
-            .iter()
+            .visible_items(&visible)
             .filter_map(|item| {
                 let asset = match item.body() {
                     ItemBody::Image { asset } => *asset,
@@ -2525,7 +3187,8 @@ impl App {
             let Some(asset) = self.board.scene().asset(asset_id) else {
                 continue;
             };
-            let request = ImportRequest::texture(asset_id, Arc::clone(asset.encoded()));
+            let request =
+                ImportRequest::texture(asset_id, Arc::clone(asset.encoded()), asset.format());
             if self
                 .importer
                 .as_ref()
@@ -2846,6 +3509,12 @@ impl App {
     // Note chrome: hover toolbar, edit pill, background popover
     // -----------------------------------------------------------------------
 
+    /// The lowest visible logical y: note chrome flips below a note only
+    /// while it stays on screen.
+    fn chrome_bottom(&self) -> f32 {
+        self.view.viewport().y as f32
+    }
+
     /// The note's on-screen bounding box, in logical pixels.
     fn note_screen_rect(&self, id: ItemId) -> Option<ScreenRect> {
         let item = self.board.scene().item(id)?;
@@ -2887,12 +3556,16 @@ impl App {
             if self.shell.mode() != Mode::Canvas {
                 return None;
             }
-            let layout = PillLayout::new(self.note_screen_rect(session.item())?);
+            let layout = PillLayout::new(
+                self.note_screen_rect(session.item())?,
+                0.0,
+                self.chrome_bottom(),
+            );
             let hovered = cursor.and_then(|c| layout.hit(c));
             return Some(NoteChrome::Pill { layout, hovered });
         }
         let id = self.toolbar_note()?;
-        let layout = ToolbarLayout::new(self.note_screen_rect(id)?);
+        let layout = ToolbarLayout::new(self.note_screen_rect(id)?, 0.0, self.chrome_bottom());
         let background = self
             .board
             .scene()
@@ -2958,8 +3631,9 @@ impl App {
             .filter(|id| self.board.scene().item(*id).is_some_and(Item::is_note));
         // Moving from the note onto its toolbar keeps the toolbar.
         let on_toolbar = self.note_hover.filter(|id| {
-            self.note_screen_rect(*id)
-                .is_some_and(|rect| ToolbarLayout::new(rect).contains(point))
+            self.note_screen_rect(*id).is_some_and(|rect| {
+                ToolbarLayout::new(rect, 0.0, self.chrome_bottom()).contains(point)
+            })
         });
         let hover = on_toolbar.or(under);
         let mut changed = hover != self.note_hover;
@@ -2987,7 +3661,9 @@ impl App {
             }),
             _ => None,
         };
-        if tooltip != self.shell.tooltip {
+        // The title bar's own tooltip wins while a bar button is hovered.
+        let title_bar_hovered = self.shell.title_bar.hovered().is_some();
+        if !title_bar_hovered && self.title_hint.is_none() && tooltip != self.shell.tooltip {
             self.shell.tooltip = tooltip;
             self.shell.touch();
             changed = true;
@@ -3063,7 +3739,8 @@ impl App {
     fn note_color_anchor(&self, id: ItemId) -> DVec2 {
         self.note_screen_rect(id)
             .map_or(self.viewport() * 0.5, |rect| {
-                let swatch = ToolbarLayout::new(rect).button(ToolbarButton::Background);
+                let swatch = ToolbarLayout::new(rect, 0.0, self.chrome_bottom())
+                    .button(ToolbarButton::Background);
                 DVec2::new(f64::from(swatch.min.x), f64::from(swatch.max.y))
             })
     }
@@ -3274,6 +3951,193 @@ impl App {
         self.update_cursor_icon(window, screen);
         self.redraw();
     }
+    /// Takes the device from the background thread and attaches it to the
+    /// window. `wait` blocks for it (the thread has announced it is done);
+    /// otherwise a device that is not ready yet is left for `GpuReady`.
+    fn attach_gpu(&mut self, wait: bool, event_loop: &ActiveEventLoop) {
+        if self.renderer.is_some() {
+            return;
+        }
+        let (Some(receiver), Some(window)) = (self.gpu_init.as_ref(), self.window.clone()) else {
+            return;
+        };
+        let device = if wait {
+            receiver.recv().ok().flatten()
+        } else {
+            match receiver.try_recv() {
+                Ok(device) => device,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        self.gpu_init = None;
+        let size = window.inner_size();
+        match device.and_then(|device| {
+            GpuSurface::attach(device, window.clone(), (size.width, size.height))
+        }) {
+            Some(renderer) => {
+                self.startup.mark(Milestone::Gpu);
+                let canvas_alpha = renderer.supports_canvas_alpha();
+                self.renderer = Some(renderer);
+                self.window_modes.canvas_alpha_supported = canvas_alpha;
+                if canvas_alpha {
+                    // The composition visual draws over the window surface,
+                    // which still holds the last (opaque) CPU frame: clear
+                    // it, or it would show through a see-through canvas.
+                    let size = window.inner_size();
+                    platform::gdi::clear(&window, size.width, size.height);
+                }
+                // Transparency moves from the window to the canvas.
+                self.window_modes.apply(&window);
+                // The CPU frames consumed the UI layer; the GPU's first frame
+                // must upload it, not `Keep` a texture it never had.
+                self.ui_layer.invalidate();
+                // Anything opened during the CPU frames gets its previews now.
+                self.upload_asset_previews();
+                if self.bench_frames.is_some() {
+                    self.open_pending_paths();
+                }
+                window.request_redraw();
+            }
+            None => {
+                // No GPU device or surface at all. There is no CPU canvas for
+                // images yet; be loud and honest rather than a grey box.
+                platform::alert(
+                    "RizRef",
+                    "RizRef could not initialise a GPU surface (Vulkan or DirectX 12)\nand must close.",
+                );
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// A frame presented without the GPU: the background and the CPU-painted
+    /// shell layer (start view, title bar, menus, toasts) copied to the window
+    /// with GDI. Items appear once the device is attached, a moment later.
+    fn cpu_frame(&mut self, window: &Window, started: Instant, event_loop: &ActiveEventLoop) {
+        self.sync_title_bar_state();
+        let viewport = self.viewport();
+        let scale = window.scale_factor();
+        if self
+            .ui_layer
+            .needs_paint(viewport, scale, self.shell.revision())
+        {
+            let cursor = self.view.cursor_position();
+            self.ui_layer.paint(
+                &self.shell,
+                &self.settings,
+                &self.shortcuts,
+                &self.recents,
+                self.window_modes,
+                viewport,
+                scale,
+                cursor,
+                &mut self.text,
+            );
+        }
+        let painted = started.elapsed();
+        let size = window.inner_size();
+        let layer = self.ui_layer.upload();
+        let bgra = platform::gdi::compose_bgra(
+            size.width.max(1),
+            size.height.max(1),
+            self.settings.canvas_theme.rgba(),
+            layer
+                .as_ref()
+                .map(|(bytes, w, h)| (bytes.as_slice(), *w, *h)),
+        );
+        let composed = started.elapsed();
+        let shown = platform::gdi::present(window, &bgra, size.width.max(1), size.height.max(1));
+        tracing::debug!(
+            paint_ms = perf::ms(painted),
+            compose_ms = perf::ms(composed),
+            present_ms = perf::ms(started.elapsed()),
+            since_start_ms = perf::ms(perf::process_start().elapsed()),
+            "cpu frame"
+        );
+        // The GPU device is the slow part of a launch (the driver may have to
+        // wake a discrete GPU): it is built on its own thread, started only
+        // once the first CPU frame is on screen. Started earlier — before or
+        // right after window creation — the driver's start-up was measured to
+        // stall showing the window by up to ~500 ms in one launch out of five,
+        // and starting it after the window is shown gained nothing.
+        if !self.gpu_started {
+            self.gpu_started = true;
+            self.gpu_init = Some(spawn_gpu_init(self.proxy.clone()));
+        }
+        if shown {
+            self.last_drawn = 0;
+            let canvas_mode = self.shell.mode() == Mode::Canvas;
+            self.after_present(started, Duration::ZERO, canvas_mode, event_loop);
+        }
+        if self.published_accessibility != self.shell.revision() {
+            self.refresh_accessibility();
+        }
+    }
+
+    /// Opens or imports the paths held since launch.
+    fn open_pending_paths(&mut self) {
+        let pending = std::mem::take(&mut self.pending_paths);
+        if !pending.is_empty() {
+            let drop_world = self.drop_world();
+            let paths = pending.into_iter().map(PathBuf::from).collect();
+            self.import_paths(paths, drop_world);
+        }
+    }
+
+    /// Book-keeping after a presented frame: frame statistics, the startup
+    /// and board-load milestones, and the scripted soak.
+    fn after_present(
+        &mut self,
+        frame_started: Instant,
+        acquire_wait: Duration,
+        canvas_mode: bool,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let now = Instant::now();
+        let total = now.saturating_duration_since(frame_started);
+        self.frame_stats.record(total.saturating_sub(acquire_wait));
+
+        self.startup.mark_at(Milestone::FirstFrame, now);
+        if self.renderer.is_some() && self.startup.mark_at(Milestone::GpuFrame, now) {
+            tracing::info!("{}", self.startup.summary());
+            if self.exit_after_first_frame {
+                // Both milestones are in: the first (CPU) frame and the
+                // first GPU frame, which also means the device thread is done.
+                println!("{}", self.startup.to_json());
+                event_loop.exit();
+                return;
+            }
+        }
+        // A board is interactive at its first GPU frame: that is when its
+        // previews draw.
+        if self.renderer.is_some()
+            && let Some(started) = self.board_open_started.take()
+        {
+            let load = now.saturating_duration_since(started);
+            self.last_board_load = Some(load);
+            tracing::info!(ms = perf::ms(load), "board interactive");
+        }
+
+        if let Some(bench) = self.bench.as_mut() {
+            if bench.record(total, acquire_wait, self.last_drawn) {
+                let report = bench.to_json(self.board.scene().items().len(), self.last_board_load);
+                tracing::info!(%report, "frame bench finished");
+                println!("{report}");
+                self.bench = None;
+                event_loop.exit();
+            }
+        } else if let Some(frames) = self.bench_frames
+            && canvas_mode
+            && self.renderer.is_some()
+            && self.pending_paths.is_empty()
+            && !self.board.scene().items().is_empty()
+        {
+            self.bench_frames = None;
+            tracing::info!(frames, "frame bench starting");
+            self.bench = Some(FrameBench::new(frames, self.view.camera));
+        }
+    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -3284,17 +4148,27 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
 
+        let (small_icon, big_icon) = platform::icon::app_icons();
         let attributes = Window::default_attributes()
             .with_title(self.plan.title)
+            .with_window_icon(small_icon)
+            .with_taskbar_icon(big_icon)
             .with_inner_size(self.plan.size)
             // The window draws its own auto-hiding title bar; a native frame
             // would sit above the board permanently.
             .with_decorations(false)
             .with_resizable(true)
+            // Per-pixel alpha for canvas-only transparency: winit enables
+            // DWM's alpha composition of the window surface; the renderer
+            // decides whether its swapchain can use it.
+            .with_transparent(true)
             // AccessKit must attach before the window is first shown.
             .with_visible(false);
         let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
+            Ok(window) => {
+                self.startup.mark(Milestone::Window);
+                Arc::new(window)
+            }
             Err(error) => {
                 tracing::error!(%error, "cannot create the window");
                 platform::alert("RizRef", "RizRef could not open its window and must close.");
@@ -3314,33 +4188,23 @@ impl ApplicationHandler<AppEvent> for App {
             size.height as f64 / scale,
         ));
         self.rebuild_hud(scale);
-        match GpuSurface::new(window.clone(), (size.width, size.height)) {
-            Some(renderer) => {
-                tracing::info!(?size, scale, "window ready");
-                self.renderer = Some(renderer);
-                self.window = Some(window);
-                self.refresh_window_title();
-                self.install_drop_target();
-                self.window.as_ref().expect("just set").request_redraw();
+        tracing::info!(?size, scale, "window ready");
+        self.window = Some(window);
+        self.refresh_window_title();
+        self.install_drop_target();
+        // The GPU may already be ready (a fast driver); otherwise the first
+        // frames are CPU frames and `AppEvent::GpuReady` attaches it later.
+        self.attach_gpu(false, event_loop);
+        self.window.as_ref().expect("just set").request_redraw();
 
-                // Command-line and forwarded paths were held until the window
-                // (and therefore the camera and viewport) existed.
-                let pending = std::mem::take(&mut self.pending_paths);
-                if !pending.is_empty() {
-                    let drop_world = self.drop_world();
-                    let paths = pending.into_iter().map(PathBuf::from).collect();
-                    self.import_paths(paths, drop_world);
-                }
-            }
-            None => {
-                // No GPU surface at all. The CPU raster fallback is a later
-                // phase; for now be loud and honest rather than a grey box.
-                platform::alert(
-                    "RizRef",
-                    "RizRef could not initialise a GPU surface (Vulkan or DirectX 12)\nand must close.",
-                );
-                event_loop.exit();
-            }
+        self.offer_recovery();
+
+        // Command-line and forwarded paths were held until the window
+        // (and therefore the camera and viewport) existed. The frame bench
+        // holds them until the GPU is attached, so its board-load time is an
+        // open on a running GPU, as a user's open is.
+        if self.bench_frames.is_none() {
+            self.open_pending_paths();
         }
     }
 
@@ -3361,10 +4225,11 @@ impl ApplicationHandler<AppEvent> for App {
         }
         match event {
             WindowEvent::Resized(size) => {
-                self.renderer
-                    .as_mut()
-                    .expect("a resized window has a renderer")
-                    .resize(size.width, size.height);
+                // Before the GPU is ready the CPU frame follows the window size
+                // by itself; the swapchain is created at the current size.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(size.width, size.height);
+                }
                 let scale = window.scale_factor();
                 self.view.set_viewport(DVec2::new(
                     size.width as f64 / scale,
@@ -3502,10 +4367,7 @@ impl ApplicationHandler<AppEvent> for App {
                             .as_mut()
                             .map(|dialog| dialog.pointer_click(position, viewport));
                         match choice {
-                            Some(CloseChoice::Cancel) => {
-                                self.shell.close_confirm_close();
-                                self.redraw();
-                            }
+                            Some(CloseChoice::Cancel) => self.cancel_confirm(),
                             Some(CloseChoice::Discard) => self.confirm_discard(event_loop),
                             _ => {}
                         }
@@ -3717,6 +4579,14 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
+                // F3 is the developer overlay: outside the rebindable table on
+                // purpose, so it works in every mode and can never be lost.
+                if pressed && !event.repeat && event.logical_key == Key::Named(NamedKey::F3) {
+                    self.dev_overlay = !self.dev_overlay;
+                    tracing::info!(on = self.dev_overlay, "developer overlay");
+                    self.redraw();
+                    return;
+                }
                 let chord = shortcut_key(&event.logical_key).map(|key| KeyChord {
                     key,
                     ctrl: self.modifiers.control_key(),
@@ -3747,10 +4617,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 .map(|dialog| dialog.key(chord))
                         });
                         match choice {
-                            Some(CloseChoice::Cancel) => {
-                                self.shell.close_confirm_close();
-                                self.redraw();
-                            }
+                            Some(CloseChoice::Cancel) => self.cancel_confirm(),
                             Some(CloseChoice::Discard) => self.confirm_discard(event_loop),
                             Some(CloseChoice::Changed) => {
                                 self.shell.touch();
@@ -3879,6 +4746,15 @@ impl ApplicationHandler<AppEvent> for App {
                 self.import_paths(vec![path], drop_world);
             }
             WindowEvent::RedrawRequested => {
+                let frame_started = Instant::now();
+                if self.renderer.is_none() {
+                    self.cpu_frame(&window, frame_started, event_loop);
+                    return;
+                }
+                if let Some(bench) = &self.bench {
+                    let index = bench.work.len() as u32;
+                    self.view.camera = bench.camera(index, self.view.viewport());
+                }
                 self.sync_title_bar_state();
                 // Advance the zoom animation first: this frame shows the new
                 // state, and if it is still running the next frame is queued.
@@ -3933,13 +4809,12 @@ impl ApplicationHandler<AppEvent> for App {
                     );
                 }
                 let ui_visible = !picking
-                    && (self.shell.mode() == Mode::Start
-                        || self.shell.has_overlay()
-                        || self.shell.toast.is_some()
-                        || self.shell.picker
+                    && (self.shell.draws_over_board()
                         || self.window_modes.effective_click_through()
                         || self.window_modes.effective_opacity_percent() < 100);
-                let ui_bytes = if ui_visible && repaint_ui {
+                let upload_ui = repaint_ui || !self.ui_was_visible;
+                self.ui_was_visible = ui_visible;
+                let ui_bytes = if ui_visible && upload_ui {
                     self.ui_layer.upload()
                 } else {
                     None
@@ -3951,7 +4826,7 @@ impl ApplicationHandler<AppEvent> for App {
                             width: *width,
                             height: *height,
                         },
-                        None if repaint_ui => UiUpload::None,
+                        None if upload_ui => UiUpload::None,
                         None => UiUpload::Keep,
                     }
                 } else {
@@ -3964,6 +4839,9 @@ impl ApplicationHandler<AppEvent> for App {
                         (position.y * scale).round().max(0.0) as u32,
                     )
                 });
+                self.last_drawn = items.len();
+                let acquire_wait;
+                let mut presented = false;
                 let picked = {
                     let Some(renderer) = self.renderer.as_mut() else {
                         return;
@@ -3990,12 +4868,18 @@ impl ApplicationHandler<AppEvent> for App {
                             scene_border: self.settings.scene_border,
                             checkerboard: self.settings.checkerboard,
                             grayscale: self.settings.grayscale,
+                            canvas_alpha: self.window_modes.canvas_alpha(),
                         },
                         background: self.settings.canvas_theme.rgba(),
                         pick: physical_pick,
                     };
-                    match renderer.render(&params) {
-                        Ok(pixel) => pixel,
+                    let result = renderer.render(&params);
+                    acquire_wait = renderer.last_swapchain_wait();
+                    match result {
+                        Ok(pixel) => {
+                            presented = true;
+                            pixel
+                        }
                         Err(FrameError::NeedsReconfigure) => None,
                         Err(FrameError::Fatal(why)) => {
                             // Log and stop: retrying into a lost surface would
@@ -4009,7 +4893,10 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(pixel) = picked {
                     self.finish_pick(pixel);
                 }
-                if animating {
+                if presented {
+                    self.after_present(frame_started, acquire_wait, canvas_mode, event_loop);
+                }
+                if animating || self.bench.is_some() || self.dev_overlay {
                     window.request_redraw();
                 }
                 if self.published_accessibility != self.shell.revision() {
@@ -4033,12 +4920,25 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             AppEvent::ForwardedArgs(args) => {
                 tracing::info!(count = args.len(), "accepted forwarded args");
-                self.pending_paths = args;
+                // The sender made them absolute; folding the spelling again
+                // also covers an older RizRef on the other end of the pipe.
+                self.pending_paths = args
+                    .into_iter()
+                    .map(|path| {
+                        if path == "-" {
+                            path
+                        } else {
+                            crate::paths::normalize_str(&path)
+                        }
+                    })
+                    .collect();
                 let pending = std::mem::take(&mut self.pending_paths);
                 let drop_world = self.drop_world();
                 let paths = pending.into_iter().map(PathBuf::from).collect();
                 self.import_paths(paths, drop_world);
             }
+            AppEvent::GpuReady => self.attach_gpu(true, event_loop),
+            AppEvent::NoteRendered(done) => self.apply_note_render(*done),
             AppEvent::Import(outcome) => self.apply_import(*outcome),
             AppEvent::Dropped(event) => self.apply_drop(*event),
             AppEvent::Accessibility(event) => match event.window_event {
@@ -4071,6 +4971,14 @@ impl ApplicationHandler<AppEvent> for App {
         if self.shell.expire_toast(now) {
             self.redraw();
         }
+        if self.refresh_title_hint(now) {
+            self.redraw();
+        }
+        let hint_deadline = self
+            .shell
+            .title_bar
+            .hint_due()
+            .filter(|_| self.title_hint.is_none());
 
         let mut poll_deadline = None;
         if self.window_modes.ghost() {
@@ -4093,10 +5001,21 @@ impl ApplicationHandler<AppEvent> for App {
             poll_deadline = Some(now + Duration::from_millis(50));
         }
 
-        let deadline = [self.next_frame_at, self.shell.next_wake(), poll_deadline]
-            .into_iter()
-            .flatten()
-            .min();
+        if self.autosave.is_due(self.autosave_policy, now) {
+            self.autosave_now();
+        }
+        let autosave_deadline = self.autosave.deadline(self.autosave_policy);
+
+        let deadline = [
+            self.next_frame_at,
+            self.shell.next_wake(),
+            poll_deadline,
+            autosave_deadline,
+            hint_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         match deadline {
             Some(deadline) if deadline <= now => {
                 self.redraw();
@@ -4272,7 +5191,30 @@ fn tick_animations(
 /// `guard` is `Some` when the single-instance mutex is held; it lives in the
 /// frame of this function, so the mutex is released exactly when the loop
 /// ends — before `run` returns and the process exits.
-fn run_window(guard: Option<SingleInstance>, parsed: ParsedArgs) -> ExitCode {
+/// Starts building the GPU device on its own thread; the result arrives on
+/// the returned channel, announced by `AppEvent::GpuReady`.
+fn spawn_gpu_init(proxy: EventLoopProxy<AppEvent>) -> std::sync::mpsc::Receiver<Option<GpuDevice>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("rizref-gpu-init".to_owned())
+        .spawn(move || {
+            let device = GpuDevice::create();
+            let _ = sender.send(device);
+            let _ = proxy.send_event(AppEvent::GpuReady);
+        });
+    if let Err(error) = spawned {
+        // The receiver reports a disconnect, which `attach_gpu` treats as
+        // "no GPU": the same honest failure as a device that cannot open.
+        tracing::error!(%error, "cannot start the GPU thread");
+    }
+    receiver
+}
+
+fn run_window(
+    guard: Option<SingleInstance>,
+    parsed: ParsedArgs,
+    mut startup: StartupClock,
+) -> ExitCode {
     let event_loop = match EventLoop::<AppEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(error) => {
@@ -4287,17 +5229,44 @@ fn run_window(guard: Option<SingleInstance>, parsed: ParsedArgs) -> ExitCode {
 
     // The pipe server must exist before the window: a secondary that arrives
     // during startup finds it waiting instead of racing it.
+    let benchmark = parsed.exit_after_first_frame || parsed.bench_frames.is_some();
     let proxy = event_loop.create_proxy();
     let app_proxy = proxy.clone();
-    serve_forwarded_args(move |args| {
-        let _ = proxy.send_event(AppEvent::ForwardedArgs(args));
-    });
+    if !benchmark {
+        serve_forwarded_args(move |args| {
+            let _ = proxy.send_event(AppEvent::ForwardedArgs(args));
+        });
+    }
 
+    startup.mark(Milestone::EventLoop);
+    let marker = autosave::session_marker();
+    let previous_session = if benchmark {
+        PreviousSession::Clean
+    } else {
+        autosave::claim_session(&marker)
+    };
     let mut app = App::new(WindowPlan::default(), app_proxy, parsed.paths.is_empty());
+    app.previous_session = previous_session;
+    // The benches measure a launch, not a recovery prompt.
+    if !benchmark {
+        app.pending_recoveries = autosave::pending_recoveries(&app.autosave_dir);
+    }
+    if previous_session == PreviousSession::Crashed {
+        tracing::warn!(
+            recoveries = app.pending_recoveries.len(),
+            "the previous session did not exit cleanly"
+        );
+    }
+    app.startup = startup;
+    app.exit_after_first_frame = parsed.exit_after_first_frame;
+    app.bench_frames = parsed.bench_frames;
     app.pending_paths = parsed.paths;
     match event_loop.run_app(&mut app) {
         Ok(()) => {
             tracing::info!("exited cleanly");
+            if !benchmark {
+                autosave::release_session(&marker);
+            }
             drop(guard);
             ExitCode::SUCCESS
         }
@@ -4365,7 +5334,7 @@ fn print_startup_summary() {
 /// phase-05 blocker best discovered on a real desktop now, which is the whole
 /// purpose of this flag.
 fn check_dialogs() {
-    match crate::dialogs::pick_images() {
+    match crate::dialogs::pick_images(None) {
         Some(paths) if !paths.is_empty() => {
             println!("chose {} file(s):", paths.len());
             for path in paths {

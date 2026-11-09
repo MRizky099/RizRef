@@ -105,6 +105,16 @@ pub enum FormatError {
         /// The operating-system message.
         reason: String,
     },
+    /// The target is read-only, or another process holds it locked: a save
+    /// elsewhere (Save As) is the way forward, not a retry.
+    Denied {
+        /// What was being attempted, for example `replace`.
+        operation: &'static str,
+        /// Path involved.
+        path: String,
+        /// Why, in words.
+        reason: String,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -152,6 +162,11 @@ impl fmt::Display for FormatError {
                 operation,
                 path,
                 reason,
+            }
+            | Self::Denied {
+                operation,
+                path,
+                reason,
             } => {
                 if path.is_empty() {
                     write!(formatter, "cannot {operation}: {reason}")
@@ -166,12 +181,28 @@ impl fmt::Display for FormatError {
 impl Error for FormatError {}
 
 impl FormatError {
-    /// Wraps an I/O error with the operation and path it belongs to.
+    /// Whether the failure was a refused write — read-only file or folder, or
+    /// a lock held by another program — which Save As can route around.
+    pub fn is_denied(&self) -> bool {
+        matches!(self, Self::Denied { .. })
+    }
+}
+
+impl FormatError {
+    /// Wraps an I/O error with the operation and path it belongs to. A
+    /// permission error becomes [`FormatError::Denied`].
     pub(crate) fn io(
         operation: &'static str,
         path: impl Into<String>,
         error: std::io::Error,
     ) -> Self {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return Self::Denied {
+                operation,
+                path: path.into(),
+                reason: format!("{error} (read-only, or open in another program)"),
+            };
+        }
         Self::Io {
             operation,
             path: path.into(),

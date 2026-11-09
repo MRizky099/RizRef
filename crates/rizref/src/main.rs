@@ -19,12 +19,19 @@
 //! directly.
 
 #![deny(unsafe_code)]
+// Release builds are GUI-subsystem binaries: launching from Explorer or a jump
+// list never flashes a console. `platform::console::attach_parent` restores
+// terminal output for `--help`, `--version` and `inspect`. Debug builds (and
+// so `cargo test`) keep the console subsystem.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod accessibility;
 mod app;
+mod autosave;
 mod board;
 mod canvas;
 mod clipboard;
+mod contain;
 mod dialogs;
 mod document;
 mod hud;
@@ -36,13 +43,21 @@ mod markdown;
 mod memory;
 mod note;
 mod note_chrome;
+mod note_worker;
 mod overlay;
 mod paths;
+mod perf;
 mod placement;
 mod platform;
 mod provenance;
 mod recents;
 mod renderer;
+#[cfg(test)]
+mod resource_tests;
+// The `.res` writer `build.rs` uses, compiled here for the tests only.
+#[cfg(test)]
+#[path = "../resources.rs"]
+mod resources;
 mod settings;
 mod shortcuts;
 mod text;
@@ -53,5 +68,7 @@ mod view;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    perf::mark_process_start();
+    platform::console::attach_parent();
     app::run(std::env::args().skip(1).collect())
 }

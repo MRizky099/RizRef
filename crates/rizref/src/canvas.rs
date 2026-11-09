@@ -62,11 +62,18 @@ pub struct Globals {
     pub grayscale: f32,
     /// HUD texture size in device pixels.
     pub hud_size: [f32; 2],
+    /// Canvas background opacity (the WGSL `canvas_alpha`, in what was
+    /// padding).
+    pub canvas_alpha: f32,
 }
 
 impl Globals {
     /// Zoom above which the grid hides (400%).
     const GRID_MAX_ZOOM: f64 = 4.0;
+
+    /// Zoom below which the grid hides (5%): further out its lines would be
+    /// closer than a pixel and shimmer.
+    const GRID_MIN_ZOOM: f64 = 0.05;
 
     /// Applies the user's view settings. Grid (with its origin axis) and
     /// border can only be switched off here: the zoom range and an empty
@@ -79,6 +86,7 @@ impl Globals {
             self.border_visible = 0.0;
         }
         self.checkerboard = if flags.checkerboard { 1.0 } else { 0.0 };
+        self.canvas_alpha = flags.canvas_alpha.clamp(0.0, 1.0);
         self.grayscale = if flags.grayscale { 1.0 } else { 0.0 };
     }
 
@@ -100,7 +108,9 @@ impl Globals {
             physical_scale: physical_scale as f32,
             scene_min,
             scene_max,
-            grid_visible: if camera.zoom >= Camera::MIN_ZOOM && camera.zoom <= Self::GRID_MAX_ZOOM {
+            grid_visible: if camera.zoom >= Self::GRID_MIN_ZOOM
+                && camera.zoom <= Self::GRID_MAX_ZOOM
+            {
                 1.0
             } else {
                 0.0
@@ -109,6 +119,7 @@ impl Globals {
             checkerboard: 0.0,
             grayscale: 0.0,
             hud_size: [0.0, 0.0],
+            canvas_alpha: 1.0,
         }
     }
 
@@ -133,7 +144,7 @@ impl Globals {
             self.grayscale,
             self.hud_size[0],
             self.hud_size[1],
-            0.0,
+            self.canvas_alpha,
             0.0,
         ];
         pack_floats(&floats)
@@ -423,7 +434,21 @@ impl Canvas {
             "fs_background",
             None,
             &[],
-            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            // Premultiplied colour over the clear, but the clear's alpha —
+            // the canvas opacity — is kept: the grid and checkerboard are
+            // part of the canvas, not drawn over it.
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
             wgpu::PrimitiveTopology::TriangleList,
         );
         let item_pipeline = make_pipeline(
@@ -834,7 +859,7 @@ impl Canvas {
 }
 
 /// Per-frame display-effect flags.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameFlags {
     /// Draw the grid and its origin axis (still hidden outside the zoom
     /// range the grid is legible in).
@@ -845,6 +870,23 @@ pub struct FrameFlags {
     pub checkerboard: bool,
     /// Draw items in grayscale.
     pub grayscale: bool,
+    /// Opacity of the canvas background — fill, checkerboard, grid and
+    /// boundary — on a surface that composites per-pixel alpha (phase 07:
+    /// transparency is the canvas only; items, chrome and the UI stay
+    /// opaque). 1.0 is opaque.
+    pub canvas_alpha: f32,
+}
+
+impl Default for FrameFlags {
+    fn default() -> Self {
+        Self {
+            grid: false,
+            scene_border: false,
+            checkerboard: false,
+            grayscale: false,
+            canvas_alpha: 1.0,
+        }
+    }
 }
 
 /// One frame's HUD layer, or its absence.
@@ -917,6 +959,7 @@ mod tests {
             scene_border: true,
             checkerboard: true,
             grayscale: true,
+            ..super::FrameFlags::default()
         });
         assert_eq!(on.grid_visible, 1.0);
         assert_eq!(on.border_visible, 1.0);
@@ -965,13 +1008,21 @@ mod tests {
 
     #[test]
     fn the_grid_hides_outside_the_planned_zoom_band() {
-        let zoomed_out = Globals::new(
+        let floor = Globals::new(
+            &Camera::new(DVec2::ZERO, Globals::GRID_MIN_ZOOM, 0.0),
+            DVec2::ONE,
+            1.0,
+            None,
+        );
+        assert_eq!(floor.grid_visible, 1.0, "5% is the visible floor");
+
+        let fitted = Globals::new(
             &Camera::new(DVec2::ZERO, Camera::MIN_ZOOM, 0.0),
             DVec2::ONE,
             1.0,
             None,
         );
-        assert_eq!(zoomed_out.grid_visible, 1.0, "5% is the visible floor");
+        assert_eq!(fitted.grid_visible, 0.0, "below 5% the grid hides");
 
         let zoomed_in = Globals::new(&Camera::new(DVec2::ZERO, 5.0, 0.0), DVec2::ONE, 1.0, None);
         assert_eq!(zoomed_in.grid_visible, 0.0, "above 400% the grid hides");
@@ -1062,6 +1113,7 @@ mod tests {
                 scene_border: true,
                 checkerboard: true,
                 grayscale: true,
+                ..super::FrameFlags::default()
             },
         );
 

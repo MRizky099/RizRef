@@ -278,6 +278,53 @@ impl<S: Read + Seek> BoardReader<S> {
         Ok(Some(Preview::new(width, height, bytes[8..].to_vec())))
     }
 
+    /// The board's picture, decoded: the embedded thumbnail when there is one,
+    /// otherwise [`Self::preview_composite`].
+    ///
+    /// This is the whole job of the Explorer thumbnail provider
+    /// (`rizref-thumb`), which links this crate so the shell and the
+    /// application can never disagree about the format. It never reads an
+    /// original image: a 2 GB board costs its index, its thumbnail chunk and,
+    /// at worst, its document and the small per-asset previews.
+    pub fn thumbnail_image(&mut self, background: [u8; 4]) -> Result<ImageBuffer, FormatError> {
+        if let Some(thumbnail) = self.thumbnail()? {
+            return decode_preview(&thumbnail.bytes);
+        }
+        self.preview_composite(background)
+    }
+
+    /// Composites a thumbnail from the document and the stored previews, the
+    /// fallback for a board without a `THMB` chunk. Notes are painted as cards
+    /// in their stored background colours, exactly as a saved thumbnail is.
+    pub fn preview_composite(&mut self, background: [u8; 4]) -> Result<ImageBuffer, FormatError> {
+        let document = self.document()?;
+        let mut blobs: BTreeMap<AssetId, Arc<[u8]>> = BTreeMap::new();
+        let mut previews: BTreeMap<AssetId, ImageBuffer> = BTreeMap::new();
+        let empty: Arc<[u8]> = Arc::from(Vec::<u8>::new());
+        for entry in &document.assets {
+            let Some(id) = AssetId::from_hex(&entry.hash) else {
+                continue;
+            };
+            // Originals are never read: an empty stand-in satisfies the
+            // scene builder, and only the previews are drawn.
+            if entry.embedded {
+                blobs.insert(id, Arc::clone(&empty));
+            }
+            if let Ok(Some(bytes)) = self.asset_preview(id)
+                && let Ok(image) = decode_preview(&bytes)
+            {
+                previews.insert(id, image);
+            }
+        }
+        let loaded = document.build_scene(&blobs, &previews)?;
+        crate::thumbnail::composite(
+            &loaded.scene,
+            background,
+            crate::thumbnail::MAX_THUMBNAIL_SIDE,
+            None,
+        )
+    }
+
     /// The original bytes of asset `id`, checked against its content hash.
     pub fn blob(&mut self, id: AssetId) -> Result<Vec<u8>, FormatError> {
         let hash = id.to_hex();
@@ -288,14 +335,28 @@ impl<S: Read + Seek> BoardReader<S> {
             .ok_or_else(|| FormatError::Document {
                 reason: format!("the board index has no blob for asset {hash}"),
             })?;
-        let payload = self.read_chunk(&chunk, ChunkKind::Blob)?;
-        let original = strip_hash_prefix(&payload, &hash)?;
-        if !checksum::verify(original, id.as_bytes()) {
-            return Err(FormatError::IntegrityMismatch {
-                subject: "image blob",
+        let payload = self.read_blob_payload(&chunk)?;
+        verify_blob(&payload, id).map(<[u8]>::to_vec)
+    }
+
+    /// Reads a blob chunk's payload without its chunk digest.
+    ///
+    /// A blob payload is the asset's 32-byte BLAKE3 id followed by the
+    /// original bytes, and [`verify_blob`] checks both against the id: that
+    /// fixes every byte of the payload, so the chunk digest (a second BLAKE3
+    /// pass over the same bytes) adds nothing. Skipping it halves the hashing
+    /// an open does — the largest single cost of loading a board.
+    fn read_blob_payload(&mut self, reference: &ChunkRef) -> Result<Vec<u8>, FormatError> {
+        let mut unchecked = reference.clone();
+        unchecked.digest = String::new();
+        let payload = self.read_chunk_relaxed(&unchecked)?;
+        let header = chunk_header(&mut self.source, reference.offset)?;
+        if header.kind != ChunkKind::Blob {
+            return Err(FormatError::BadChunk {
+                reason: format!("expected a BLOB at {}", reference.offset),
             });
         }
-        Ok(original.to_vec())
+        Ok(payload)
     }
 
     /// The encoded preview of asset `id`.
@@ -313,23 +374,43 @@ impl<S: Read + Seek> BoardReader<S> {
     }
 
     /// Loads the document, every embedded blob, every preview and the scene.
+    ///
+    /// Reading is sequential (one file handle); verifying the blobs and
+    /// decoding the previews — the CPU-bound part — runs on every core
+    /// (`std::thread::scope`, no runtime), which is what keeps a 300 MB board's
+    /// open inside the phase-07 budget.
     pub fn load(&mut self) -> Result<LoadedBoard, FormatError> {
         let document = self.document()?;
-        let mut blobs: BTreeMap<AssetId, Arc<[u8]>> = BTreeMap::new();
+        let mut payloads: Vec<(AssetId, Vec<u8>)> = Vec::new();
+        let mut seen = BTreeSet::new();
         for entry in &document.assets {
             let Some(id) = AssetId::from_hex(&entry.hash) else {
                 return Err(FormatError::Document {
                     reason: format!("asset hash {:?} is not 64 hex digits", entry.hash),
                 });
             };
-            if !entry.embedded || blobs.contains_key(&id) {
+            if !entry.embedded || !seen.insert(id) {
                 continue;
             }
-            let bytes = self.blob(id)?;
-            blobs.insert(id, Arc::from(bytes));
+            let chunk = self
+                .index
+                .asset(&entry.hash)
+                .and_then(|asset| asset.blob.clone())
+                .ok_or_else(|| FormatError::Document {
+                    reason: format!("the board index has no blob for asset {}", entry.hash),
+                })?;
+            payloads.push((id, self.read_blob_payload(&chunk)?));
+        }
+        let verified = parallel_map(payloads, |(id, payload)| {
+            verify_blob(&payload, id).map(|original| (id, Arc::<[u8]>::from(original)))
+        });
+        let mut blobs: BTreeMap<AssetId, Arc<[u8]>> = BTreeMap::new();
+        for result in verified {
+            let (id, bytes) = result?;
+            blobs.insert(id, bytes);
         }
 
-        let mut previews: BTreeMap<AssetId, ImageBuffer> = BTreeMap::new();
+        let mut encoded_previews: Vec<(AssetId, Vec<u8>)> = Vec::new();
         for entry in &document.assets {
             if entry.preview.is_none() {
                 continue;
@@ -337,12 +418,17 @@ impl<S: Read + Seek> BoardReader<S> {
             let Some(id) = AssetId::from_hex(&entry.hash) else {
                 continue;
             };
-            if let Ok(Some(bytes)) = self.asset_preview(id)
-                && let Ok(image) = decode_preview(&bytes)
-            {
-                previews.insert(id, image);
+            if let Ok(Some(bytes)) = self.asset_preview(id) {
+                encoded_previews.push((id, bytes));
             }
         }
+        let previews: BTreeMap<AssetId, ImageBuffer> =
+            parallel_map(encoded_previews, |(id, bytes)| {
+                decode_preview(&bytes).ok().map(|image| (id, image))
+            })
+            .into_iter()
+            .flatten()
+            .collect();
 
         let LoadedScene {
             scene,
@@ -1025,6 +1111,58 @@ fn read_at<S: Read + Seek>(
     Ok(buffer)
 }
 
+/// Checks a blob payload against its asset id — the 32-byte prefix and the
+/// BLAKE3 of the original — and returns the original bytes.
+fn verify_blob(payload: &[u8], id: AssetId) -> Result<&[u8], FormatError> {
+    let original = strip_hash_prefix(payload, &id.to_hex())?;
+    if !checksum::verify(original, id.as_bytes()) {
+        return Err(FormatError::IntegrityMismatch {
+            subject: "image blob",
+        });
+    }
+    Ok(original)
+}
+
+/// Maps `items` through `work` on up to one scoped thread per core, keeping
+/// the order. Small inputs stay on the calling thread.
+fn parallel_map<T, R>(items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+{
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(items.len());
+    if threads <= 1 {
+        return items.into_iter().map(work).collect();
+    }
+    // Deal the items round-robin so large and small ones spread evenly, then
+    // put the results back in their original order.
+    let mut lanes: Vec<Vec<(usize, T)>> = (0..threads).map(|_| Vec::new()).collect();
+    for (index, item) in items.into_iter().enumerate() {
+        lanes[index % threads].push((index, item));
+    }
+    let work = &work;
+    let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = lanes
+            .into_iter()
+            .map(|lane| {
+                scope.spawn(move || {
+                    lane.into_iter()
+                        .map(|(index, item)| (index, work(item)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("a load worker panicked"))
+            .collect()
+    });
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
 fn strip_hash_prefix<'a>(payload: &'a [u8], hash: &str) -> Result<&'a [u8], FormatError> {
     if payload.len() < 32 {
         return Err(FormatError::BadChunk {
@@ -1057,6 +1195,14 @@ fn with_label(error: FormatError, label: &str) -> FormatError {
 mod tests {
     use super::{BoardReader, VerifyReport, read_summary};
     use crate::error::FormatError;
+
+    #[test]
+    fn the_parallel_map_keeps_order_and_handles_small_inputs() {
+        let doubled = super::parallel_map((0..1000).collect(), |n: u32| n * 2);
+        assert_eq!(doubled, (0..1000).map(|n| n * 2).collect::<Vec<_>>());
+        assert_eq!(super::parallel_map(vec![7_u8], |n| n + 1), vec![8]);
+        assert!(super::parallel_map(Vec::<u8>::new(), |n| n).is_empty());
+    }
 
     #[test]
     fn a_short_file_is_refused() {

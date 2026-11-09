@@ -16,8 +16,8 @@
 //! inside `catch_unwind`, so a backend panic on hostile input degrades to the
 //! same error state instead of taking the application down.
 
+use crate::contain::contain;
 use std::collections::HashMap;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use ratex_layout::{LayoutOptions, layout, to_display_list, validate_layout};
@@ -135,7 +135,7 @@ fn display_list(tex: &str, display: bool) -> Result<DisplayList, String> {
         return Err(format!("{command} is not supported in notes"));
     }
     let tex = tex.to_owned();
-    catch_unwind(AssertUnwindSafe(move || {
+    contain(move || {
         let ast = ratex_parser::parser::parse(&tex).map_err(|error| error.to_string())?;
         let style = if display {
             MathStyle::Display
@@ -153,7 +153,7 @@ fn display_list(tex: &str, display: bool) -> Result<DisplayList, String> {
             return Err("equation has no finite size".to_owned());
         }
         Ok(list)
-    }))
+    })
     .unwrap_or_else(|_| Err("the math backend panicked".to_owned()))
 }
 
@@ -171,9 +171,7 @@ fn rasterise(list: &DisplayList, font_px: f32) -> Option<MathMask> {
         font_dir: String::new(),
         device_pixel_ratio: 1.0,
     };
-    let png = catch_unwind(AssertUnwindSafe(|| render_to_png(list, &options)))
-        .ok()?
-        .ok()?;
+    let png = contain(|| render_to_png(list, &options)).ok()?.ok()?;
     let image = rizref_codecs::decode(&png).ok()?;
     let alpha = image
         .pixels()

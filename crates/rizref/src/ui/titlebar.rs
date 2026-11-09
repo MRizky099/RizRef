@@ -6,7 +6,11 @@
 //! actual window operations (`drag_window`, `set_minimized`, …), which keeps the
 //! layout and visibility rules testable without a desktop.
 
+use std::time::{Duration, Instant};
+
 use glam::DVec2;
+
+use crate::shortcuts::ShortcutId;
 
 use super::paint::{ACCENT, ACCENT_SOFT, Painter, TEXT, UiRect};
 
@@ -18,6 +22,9 @@ pub const BUTTON_WIDTH: f32 = 44.0;
 
 /// Width of the close button.
 pub const CLOSE_WIDTH: f32 = 46.0;
+
+/// How long the pointer rests on a button before its tooltip appears.
+pub const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 
 /// Bar fill.
 const BAR_BG: [u8; 4] = [23, 24, 29, 255];
@@ -46,6 +53,36 @@ pub enum TitleBarButton {
     Maximize,
     /// Close the window.
     Close,
+}
+
+impl TitleBarButton {
+    /// The command a button shares with the keyboard, for its tooltip.
+    pub const fn shortcut(self) -> Option<ShortcutId> {
+        match self {
+            Self::Pin => Some(ShortcutId::ToggleAlwaysOnTop),
+            Self::Close => Some(ShortcutId::Quit),
+            Self::Menu | Self::Minimize | Self::Maximize => None,
+        }
+    }
+
+    /// The tooltip: what a click does now (the pin and maximize buttons
+    /// toggle, so their wording follows the state), with the live shortcut
+    /// when the command has one.
+    pub fn tooltip(self, pinned: bool, maximized: bool, shortcut: Option<&str>) -> String {
+        let action = match self {
+            Self::Menu => "Main menu",
+            Self::Pin if pinned => "Unpin",
+            Self::Pin => "Pin on top",
+            Self::Minimize => "Minimize",
+            Self::Maximize if maximized => "Restore",
+            Self::Maximize => "Maximize",
+            Self::Close => "Close",
+        };
+        match shortcut {
+            Some(chord) => format!("{action} ({chord})"),
+            None => action.to_owned(),
+        }
+    }
 }
 
 /// The title-bar geometry for one viewport.
@@ -133,6 +170,8 @@ pub struct TitleBar {
     pinned: bool,
     maximized: bool,
     title: Option<String>,
+    /// When the pointer arrived on the hovered button.
+    hovered_since: Option<Instant>,
 }
 
 impl Default for TitleBar {
@@ -150,7 +189,25 @@ impl TitleBar {
             pinned: false,
             maximized: false,
             title: None,
+            hovered_since: None,
         }
+    }
+
+    /// The button under the pointer, if any.
+    pub const fn hovered(&self) -> Option<TitleBarButton> {
+        self.hovered
+    }
+
+    /// When the hovered button's tooltip is due.
+    pub fn hint_due(&self) -> Option<Instant> {
+        self.hovered_since.map(|since| since + TOOLTIP_DELAY)
+    }
+
+    /// The button whose tooltip should show at `now`: the pointer has
+    /// rested on it for [`TOOLTIP_DELAY`] and the bar is visible.
+    pub fn hint(&self, now: Instant) -> Option<TitleBarButton> {
+        let due = self.hint_due()?;
+        (self.visible && now >= due).then_some(self.hovered?)
     }
 
     /// Sets the document title shown at the left, or `None` for a blank left
@@ -196,6 +253,7 @@ impl TitleBar {
         let changed = self.visible || self.hovered.is_some();
         self.visible = false;
         self.hovered = None;
+        self.hovered_since = None;
         changed
     }
 
@@ -205,7 +263,35 @@ impl TitleBar {
     /// click-through, borderless fullscreen, colour picker). Returns whether
     /// the painted state changed.
     pub fn pointer_moved(&mut self, cursor: Option<DVec2>, viewport: DVec2, allowed: bool) -> bool {
+        self.pointer_moved_at(cursor, viewport, allowed, Instant::now())
+    }
+
+    /// [`pointer_moved`](Self::pointer_moved) at an explicit time, so the
+    /// tooltip delay is testable.
+    pub fn pointer_moved_at(
+        &mut self,
+        cursor: Option<DVec2>,
+        viewport: DVec2,
+        allowed: bool,
+        now: Instant,
+    ) -> bool {
         let before = (self.visible, self.hovered);
+        let changed = self.track_pointer(cursor, viewport, allowed, before);
+        if self.hovered != before.1 {
+            // A new button (or none): the delay starts again, so moving
+            // along the bar never flashes one tooltip after another.
+            self.hovered_since = self.hovered.map(|_| now);
+        }
+        changed
+    }
+
+    fn track_pointer(
+        &mut self,
+        cursor: Option<DVec2>,
+        viewport: DVec2,
+        allowed: bool,
+        before: (bool, Option<TitleBarButton>),
+    ) -> bool {
         if !allowed {
             self.visible = false;
             self.hovered = None;
@@ -474,5 +560,54 @@ mod tests {
         bar.pointer_moved(Some(DVec2::new(300.0, 2.0)), viewport(), true);
         assert!(bar.hide());
         assert!(!bar.hide());
+    }
+
+    #[test]
+    fn a_button_tooltip_waits_for_the_delay_and_follows_the_state() {
+        use super::{TOOLTIP_DELAY, TitleBar, TitleBarButton, TitleBarLayout};
+        use std::time::Instant;
+        let viewport = DVec2::new(600.0, 400.0);
+        let layout = TitleBarLayout::new(viewport);
+        let pin = layout.pin;
+        let on_pin = DVec2::new(f64::from(pin.x + 5.0), 10.0);
+        let mut bar = TitleBar::new();
+        let start = Instant::now();
+
+        bar.pointer_moved_at(Some(on_pin), viewport, true, start);
+        assert_eq!(bar.hovered(), Some(TitleBarButton::Pin));
+        assert_eq!(bar.hint(start), None, "not before the delay");
+        assert_eq!(bar.hint(start + TOOLTIP_DELAY), Some(TitleBarButton::Pin));
+
+        // Moving within the same button keeps the timer.
+        let still_on_pin = DVec2::new(f64::from(pin.x + 9.0), 12.0);
+        bar.pointer_moved_at(Some(still_on_pin), viewport, true, start + TOOLTIP_DELAY);
+        assert_eq!(bar.hint(start + TOOLTIP_DELAY), Some(TitleBarButton::Pin));
+
+        // Another button restarts it; leaving the bar clears it.
+        let on_close = DVec2::new(f64::from(layout.close.x + 5.0), 10.0);
+        let later = start + TOOLTIP_DELAY * 2;
+        bar.pointer_moved_at(Some(on_close), viewport, true, later);
+        assert_eq!(bar.hint(later), None);
+        bar.pointer_moved_at(Some(DVec2::new(300.0, 300.0)), viewport, true, later);
+        assert_eq!(bar.hint(later + TOOLTIP_DELAY), None);
+        assert_eq!(bar.hint_due(), None);
+
+        assert_eq!(
+            TitleBarButton::Pin.tooltip(false, false, Some("Ctrl+Shift+T")),
+            "Pin on top (Ctrl+Shift+T)"
+        );
+        assert_eq!(TitleBarButton::Pin.tooltip(true, false, None), "Unpin");
+        assert_eq!(
+            TitleBarButton::Maximize.tooltip(false, true, None),
+            "Restore"
+        );
+        assert_eq!(
+            TitleBarButton::Maximize.tooltip(false, false, None),
+            "Maximize"
+        );
+        assert_eq!(
+            TitleBarButton::Menu.tooltip(false, false, None),
+            "Main menu"
+        );
     }
 }

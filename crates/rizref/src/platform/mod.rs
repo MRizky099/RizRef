@@ -26,10 +26,15 @@
 //! this module is the point: the rest of the application stays safe Rust.
 
 pub mod clipboard_html;
+pub mod console;
+pub mod crash;
 pub mod drop_target;
+pub mod gdi;
+pub mod icon;
 pub mod imaging;
 pub mod launch;
 pub mod message_box;
+pub mod registry;
 pub mod single_instance;
 pub mod window_modes;
 

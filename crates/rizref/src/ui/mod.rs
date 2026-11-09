@@ -139,6 +139,21 @@ impl Shell {
             || self.image_info.is_some()
     }
 
+    /// Whether the shell draws anything over the board this frame, so the GPU
+    /// frame must composite the UI layer.
+    ///
+    /// The revealed title bar and tooltips count: leaving them out (phase 05
+    /// to 07) meant hovering the top strip of a board updated the bar's state
+    /// but never drew it — it showed only on the start view or over a panel.
+    pub fn draws_over_board(&self) -> bool {
+        self.mode() == Mode::Start
+            || self.has_overlay()
+            || self.toast.is_some()
+            || self.picker
+            || self.title_bar.visible()
+            || self.tooltip.is_some()
+    }
+
     /// Opens the image information dialog, closing the other overlays.
     pub fn open_image_info(&mut self, panel: image_info::ImageInfoPanel) {
         self.menu = None;
@@ -171,6 +186,16 @@ impl Shell {
             "Close without saving",
             "Closing now will discard them.",
         );
+    }
+
+    /// Opens the crash-recovery offer over whatever is showing.
+    pub fn open_recovery(&mut self, dialog: panels::ConfirmClose) {
+        self.menu = None;
+        self.shortcuts = None;
+        self.settings = None;
+        self.image_info = None;
+        self.confirm_close = Some(dialog);
+        self.touch();
     }
 
     /// Opens the unsaved-changes guard for a non-close destructive step.
@@ -313,6 +338,16 @@ impl UiLayer {
         }
     }
 
+    /// Forces the next [`needs_paint`](Self::needs_paint) to say yes.
+    ///
+    /// The GPU attaches after the CPU frames have already painted (and
+    /// consumed) the layer; without this, its first frame would `Keep` a UI
+    /// texture that was never uploaded and show a bare canvas until the next
+    /// shell change (phase 07 manual test: a blank start view until a click).
+    pub fn invalidate(&mut self) {
+        self.pixmap = None;
+    }
+
     /// Whether the layer must be repainted for this size/scale/revision.
     pub fn needs_paint(&self, viewport: DVec2, scale: f64, revision: u64) -> bool {
         let width = (viewport.x * scale).round().max(1.0) as u32;
@@ -410,7 +445,7 @@ fn paint_mode_indicator(painter: &mut Painter, viewport: DVec2, modes: WindowMod
             "CLICK-THROUGH · Ctrl+Shift+X to restore",
             paint::GHOST_ACCENT,
         )
-    } else if modes.opacity_percent < 100 {
+    } else if modes.effective_opacity_percent() < 100 {
         (
             "TRANSPARENT WINDOW",
             [
@@ -508,7 +543,7 @@ fn paint_picker_hint(painter: &mut Painter, viewport: DVec2, cursor: DVec2) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, Shell, TOAST_LIFETIME, UiLayer};
+    use super::{Mode, Shell, TOAST_LIFETIME, UiLayer, panels};
     use glam::DVec2;
     use std::time::{Duration, Instant};
 
@@ -616,5 +651,54 @@ mod tests {
         layer.scale = 1.0;
         // A pixmap is still required; the dummy values model a built layer.
         assert!(layer.needs_paint(viewport, 1.0, 1), "no pixmap yet");
+    }
+
+    #[test]
+    fn a_revealed_title_bar_is_drawn_over_the_board() {
+        let mut shell = Shell::new(Mode::Canvas);
+        let viewport = DVec2::new(600.0, 400.0);
+        assert!(!shell.draws_over_board(), "a bare board draws no UI");
+
+        // The pointer 1 px inside the top edge reveals the bar ...
+        assert!(
+            shell
+                .title_bar
+                .pointer_moved(Some(DVec2::new(78.0, 1.0)), viewport, true)
+        );
+
+        // ... and the frame must then composite the UI layer.
+        assert!(shell.draws_over_board());
+    }
+
+    #[test]
+    fn invalidating_a_built_layer_forces_a_repaint() {
+        // The GPU attaches after the CPU frames painted the layer: its first
+        // frame must repaint and upload it, or the start view is blank.
+        let mut layer = UiLayer::new();
+        let viewport = DVec2::new(800.0, 600.0);
+        layer.pixmap = tiny_skia::Pixmap::new(800, 600);
+        layer.built_revision = 1;
+        layer.width = 800;
+        layer.height = 600;
+        layer.scale = 1.0;
+        assert!(!layer.needs_paint(viewport, 1.0, 1), "built and current");
+
+        layer.invalidate();
+
+        assert!(layer.needs_paint(viewport, 1.0, 1));
+    }
+
+    #[test]
+    fn the_recovery_offer_is_modal_and_replaces_other_overlays() {
+        let mut shell = Shell::new(Mode::Start);
+        shell.open_recovery(panels::ConfirmClose::recovery(
+            "\"Board\" (3 items) was not saved.".to_owned(),
+            "It belongs to x.rizref.".to_owned(),
+        ));
+
+        assert!(shell.has_overlay());
+        let dialog = shell.confirm_close.as_ref().expect("open");
+        assert_eq!(dialog.heading, "Recover unsaved work");
+        assert_eq!(dialog.cancel_label, "Restore");
     }
 }

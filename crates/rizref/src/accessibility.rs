@@ -4,8 +4,17 @@
 //! reader to discover — the exact failure noted in the PureRef study, where
 //! Inspect.exe sees an empty window. This module publishes a virtual tree
 //! instead: a window root, a command menu bar, every menu item with its label,
-//! accelerator (as the description) and disabled/checked state, plus the live
-//! HUD readout as a status label.
+//! accelerator and disabled/checked state, plus the live HUD readout as a
+//! status label.
+//!
+//! A menu item's accelerator is published twice, from the live (rebindable)
+//! shortcut table: as AccessKit's `keyboard_shortcut`, the property meant for
+//! it, and as the description. The description is not redundant on Windows:
+//! `accesskit_windows` (0.32 here, and still 0.35.2, the newest release) maps
+//! no node property to UIA `AcceleratorKey`, so the description — exposed as
+//! UIA `FullDescription`/`HelpText` — is what Narrator reads today. When the
+//! adapter gains the mapping, `keyboard_shortcut` fills `AcceleratorKey` with
+//! no change here.
 //!
 //! The AccessKit winit adapter owns the platform bridge. Activating a menu item
 //! arrives as an [`accesskit_winit::Event::ActionRequested`]; the application
@@ -278,20 +287,20 @@ fn build_update(
 
     if let Some(dialog) = confirm_close {
         let mut node = Node::new(Role::Dialog);
-        node.set_label("Unsaved changes");
-        node.set_description(dialog.title.as_str());
+        node.set_label(dialog.heading.as_str());
+        node.set_description(dialog.message.as_str());
         node.push_child(NodeId(CONFIRM_CANCEL_ID));
         node.push_child(NodeId(CONFIRM_DISCARD_ID));
         nodes.push((NodeId(CONFIRM_ID), node));
 
         let mut cancel = Node::new(Role::Button);
-        cancel.set_label("Cancel");
+        cancel.set_label(dialog.cancel_label.as_str());
         cancel.add_action(A11yAction::Click);
         actions.insert(CONFIRM_CANCEL_ID, Action::ConfirmCloseCancel);
         nodes.push((NodeId(CONFIRM_CANCEL_ID), cancel));
 
         let mut discard = Node::new(Role::Button);
-        discard.set_label("Close without saving");
+        discard.set_label(dialog.discard_label.as_str());
         discard.add_action(A11yAction::Click);
         actions.insert(CONFIRM_DISCARD_ID, Action::ConfirmCloseDiscard);
         nodes.push((NodeId(CONFIRM_DISCARD_ID), discard));
@@ -402,6 +411,7 @@ fn build_children(
         let mut node = Node::new(role);
         node.set_label(entry.label.as_str());
         if let Some(accel) = &entry.accel {
+            node.set_keyboard_shortcut(accel.as_str());
             node.set_description(accel.as_str());
         }
         if entry.toggles {
@@ -504,6 +514,64 @@ mod tests {
     use crate::ui::menu::Action;
     use crate::ui::menu::MenuEntry;
     use std::collections::HashMap;
+
+    /// The published node for the menu entry labelled `label`.
+    fn menu_node(shortcuts: &crate::shortcuts::Shortcuts, label: &str) -> accesskit::Node {
+        use crate::recents::Recents;
+        use crate::settings::Settings;
+        use crate::ui::menu::{MenuContext, build};
+
+        let settings = Settings::default();
+        let recents = Recents::default();
+        let menu = build(&MenuContext {
+            settings: &settings,
+            shortcuts,
+            recents: &recents,
+            locked: false,
+            ghost: false,
+            click_through: false,
+            always_on_top: false,
+            opacity_percent: 100,
+            note_selected: false,
+            selected_image: None,
+        });
+        let mut nodes = Vec::new();
+        let mut actions = HashMap::new();
+        let mut next_id = FIRST_MENU_ID;
+        build_children(&mut nodes, &mut actions, &mut next_id, &menu);
+        nodes
+            .into_iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some(label))
+            .unwrap_or_else(|| panic!("a {label} menu node"))
+    }
+
+    #[test]
+    fn menu_items_publish_their_keyboard_shortcut() {
+        let shortcuts = crate::shortcuts::Shortcuts::new();
+
+        let save = menu_node(&shortcuts, "Save");
+
+        assert_eq!(save.keyboard_shortcut(), Some("Ctrl+S"));
+        assert_eq!(
+            save.description(),
+            Some("Ctrl+S"),
+            "what Narrator reads today"
+        );
+    }
+
+    #[test]
+    fn a_rebound_shortcut_is_what_the_menu_node_publishes() {
+        use crate::shortcuts::{Key, KeyChord, ShortcutId};
+        let mut shortcuts = crate::shortcuts::Shortcuts::new();
+        shortcuts
+            .bind(ShortcutId::Undo, KeyChord::ctrl(Key::U))
+            .expect("free chord");
+
+        let undo = menu_node(&shortcuts, "Undo");
+
+        assert_eq!(undo.keyboard_shortcut(), Some("Ctrl+U"));
+    }
 
     #[test]
     fn leaf_nodes_carry_their_action_and_checked_state() {

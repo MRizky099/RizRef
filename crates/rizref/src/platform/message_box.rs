@@ -8,7 +8,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MESSAGEBOX_STYLE, MessageBoxW,
+    MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MESSAGEBOX_STYLE, MessageBoxW,
 };
 use windows::core::PCWSTR;
 
@@ -35,7 +35,8 @@ fn wide(text: &str) -> Vec<u16> {
 fn show(title: &str, message: &str) {
     // The error icon is the only severity the application reports today;
     // `warn` joins it when a non-fatal dialog has a caller.
-    let flags: MESSAGEBOX_STYLE = MB_OK | MB_SETFOREGROUND | MB_ICONERROR;
+    // Topmost: with always-on-top on, the RizRef window would cover it.
+    let flags: MESSAGEBOX_STYLE = MB_OK | MB_SETFOREGROUND | MB_ICONERROR | MB_TOPMOST;
     // Ownership of the buffers stays here; the pointers are valid for the
     // duration of the blocking call.
     let text = wide(message);

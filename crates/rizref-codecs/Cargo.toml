@@ -4,6 +4,7 @@ description = "Image decode/encode dispatch for RizRef, backed only by pure-Rust
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true

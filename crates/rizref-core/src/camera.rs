@@ -36,8 +36,13 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// Smallest supported zoom: 5%, one world unit covers 0.05 px.
-    pub const MIN_ZOOM: f64 = 0.05;
+    /// Smallest supported zoom: 0.5%, one world unit covers 0.005 px.
+    ///
+    /// Low enough that Fit can always frame a board of large photographs in a
+    /// small window — at the former 5% floor an 8000 px image did not fit a
+    /// 600 px window. Wheel zoom shares the floor, so zooming in from a fitted
+    /// view never jumps.
+    pub const MIN_ZOOM: f64 = 0.005;
 
     /// Largest supported zoom: 3200%, one world unit covers 32 px.
     pub const MAX_ZOOM: f64 = 32.0;
@@ -288,10 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn the_zoom_range_is_five_percent_to_3200_percent() {
-        assert_eq!(Camera::MIN_ZOOM, 0.05);
+    fn the_zoom_range_is_half_a_percent_to_3200_percent() {
+        assert_eq!(Camera::MIN_ZOOM, 0.005);
         assert_eq!(Camera::MAX_ZOOM, 32.0);
-        assert_eq!(Camera::clamp_zoom(0.04), Camera::MIN_ZOOM);
+        assert_eq!(Camera::clamp_zoom(0.004), Camera::MIN_ZOOM);
+        assert_eq!(Camera::clamp_zoom(0.05), 0.05, "the old floor is inside");
         assert_eq!(Camera::clamp_zoom(1.0), 1.0, "100% is inside the range");
         assert_eq!(Camera::clamp_zoom(100.0), Camera::MAX_ZOOM);
     }
@@ -368,6 +374,23 @@ mod tests {
                 "corner {corner:?} -> {world:?} should be inside {visible:?}"
             );
         }
+    }
+
+    #[test]
+    fn fit_frames_a_large_photograph_in_a_small_window() {
+        // The manual-test case: an 8000 px image beside smaller ones, framed
+        // in a 600 x 400 window. At the former 5% floor it overflowed.
+        let viewport = v(600.0, 400.0);
+        let rect = Rect::from_min_max(glam::Vec2::ZERO, glam::Vec2::new(11_000.0, 8_000.0));
+
+        let camera = Camera::fit_rect(rect, viewport, 24.0);
+
+        assert!(camera.zoom < 0.05, "below the old floor: {}", camera.zoom);
+        let visible = camera.visible_world_rect(viewport);
+        assert!(
+            visible.contains(rect.min) && visible.contains(rect.max()),
+            "{visible:?} holds {rect:?}"
+        );
     }
 
     #[test]
