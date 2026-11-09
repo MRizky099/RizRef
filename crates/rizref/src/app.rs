@@ -1066,8 +1066,17 @@ impl App {
             self.dirty_notes.insert(*id);
         }
         if effects.structural() {
+            let gone: Vec<AssetId> = self
+                .note_textures
+                .iter()
+                .filter(|(id, _)| !self.board.scene().contains(**id))
+                .map(|(_, entry)| entry.id)
+                .collect();
             self.note_textures
                 .retain(|id, _| self.board.scene().contains(*id));
+            for texture in gone {
+                self.release_note_texture(texture);
+            }
         }
         self.redraw();
     }
@@ -1377,7 +1386,7 @@ impl App {
             Action::About => {
                 self.shell.toast(
                     format!(
-                        "{} · pure-Rust reference board · F1 for shortcuts",
+                        "{} · pure-Rust reference board · math fonts: KaTeX (SIL OFL 1.1) · F1 for shortcuts",
                         version_line()
                     ),
                     now,
@@ -2277,13 +2286,27 @@ impl App {
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.upload_texture(wanted, &image, false);
             }
-            self.note_textures.insert(
+            let previous = self.note_textures.insert(
                 id,
                 NoteTexture {
                     id: wanted,
                     world_size: size,
                 },
             );
+            // One resident texture per note: the superseded one is freed as
+            // soon as no other note shares it, so typing or resizing never
+            // accumulates GPU memory.
+            if let Some(previous) = previous {
+                self.release_note_texture(previous.id);
+            }
+        }
+    }
+
+    /// Frees a note texture once no note references it any more.
+    fn release_note_texture(&mut self, texture: AssetId) {
+        let in_use = self.note_textures.values().any(|entry| entry.id == texture);
+        if !in_use && let Some(renderer) = self.renderer.as_mut() {
+            renderer.remove_texture(texture);
         }
     }
 
