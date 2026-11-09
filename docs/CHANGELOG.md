@@ -87,6 +87,30 @@ Reliability:
   the start view showed a bare canvas until the next input; attaching the GPU now
   forces a repaint. Both checked on the release build by launching it (the offer,
   Restore, the start view and a board opened from the command line draw unprompted).
+- Fixes from the second manual test run:
+  - File dialogs (Open images, Open board, Save board, Export PNG) are owned by the
+    main window: with always-on-top on they opened behind it, focused but unseen. The
+    fatal alert is `MB_TOPMOST`. (The unsaved-changes guard is in-app and was fine.)
+  - The revealed title bar was never drawn over a board: the GPU frame composited
+    the UI layer only for the start view, panels, toasts and window modes, so
+    hovering the top strip changed the bar's state invisibly. A revealed bar and a
+    note-toolbar tooltip now count, and a layer that becomes visible again is
+    uploaded even without a repaint.
+  - Scaling anchors the opposite corner or edge by default; `alt` scales about the
+    centre. Image corner drags keep the aspect ratio exactly (`shift` frees it);
+    notes resize freely (`shift` locks). This reverses the phase 04 default.
+  - The note hover toolbar and the ✗/✓ edit pill sit outside the card — above its
+    top corners, or below when there is no room above or the toolbar would cover
+    the rotate handle — so they never cover the note's text. A note larger than the
+    window gets them pinned to the window's top edge.
+  - The zoom floor is 0.5% (was 5%) for Fit and the wheel alike, so Fit frames any
+    board; the grid hides below 5%.
+  - Grid arrange packs row by row (selection order, rows as tall as their tallest
+    item, even gaps, near-square wrap) instead of uniform cells sized to the largest
+    item; still one undo step.
+  - The colour picker: no path was found by which it drops the next key or the
+    dirty mark (it changes neither selection nor history, and the dirty mark comes
+    from the board's effects); not reproduced, left unchanged.
 - Fix: the panic hook exited the process for every panic, so the `catch_unwind` guards
   around decoders and math never ran — one hostile image closed RizRef.
   `contain::contain` marks the boundary and the hook now lets it handle the panic.
@@ -107,7 +131,7 @@ Packaging and docs:
 - `docs/demo.rizref` (`examples/make_demo_board.rs`): four images drawn in code (CC0)
   and three markdown notes. README: status, layout, measured budgets, install and
   integration, releasing, licence. `LICENSE-MIT`, `LICENSE-APACHE`.
-- Tests: 668 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
+- Tests: 679 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
   clean; no new dependency crate and no new `-sys` crate (audit: `windows-sys`,
   `renderdoc-sys`).
 - Not verified here, by design or by environment: `register`/`unregister` and Explorer
