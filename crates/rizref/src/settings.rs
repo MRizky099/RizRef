@@ -147,7 +147,7 @@ impl Settings {
         self.max_decode_bytes = self
             .max_decode_bytes
             .clamp(128 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
-        self.opacity_percent = self.opacity_percent.clamp(20, 100);
+        self.opacity_percent = self.opacity_percent.min(100);
         self.ghost_opacity_percent = self.ghost_opacity_percent.clamp(10, 40);
     }
 
@@ -272,7 +272,10 @@ mod tests {
         };
         settings.sanitize();
 
-        assert_eq!(settings.opacity_percent, 20);
+        assert_eq!(
+            settings.opacity_percent, 0,
+            "0 % (an invisible canvas) is valid"
+        );
         assert_eq!(settings.ghost_opacity_percent, 40);
         assert_eq!(settings.max_decode_bytes, 128 * 1024 * 1024);
     }

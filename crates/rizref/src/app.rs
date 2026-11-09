@@ -1351,8 +1351,14 @@ impl App {
     /// surface without per-pixel alpha — the whole window.
     fn opacity_toast(&self) -> String {
         let percent = self.window_modes.opacity_percent;
+        let window = self.window_modes.effective_opacity_percent();
         if self.window_modes.canvas_alpha_supported || self.renderer.is_none() {
             format!("Canvas opacity {percent}%")
+        } else if window > percent {
+            // A fully faded window could never be clicked again.
+            format!(
+                "Window opacity {window}% (the lowest on this GPU, which has no per-pixel alpha)"
+            )
         } else {
             // Vulkan's Win32 surfaces have no per-pixel alpha.
             format!("Window opacity {percent}% (no per-pixel alpha on this GPU)")

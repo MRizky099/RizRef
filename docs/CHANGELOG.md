@@ -212,6 +212,14 @@ Reliability:
     whole-window 15 % (it is for tracing over another application, where the images
     must fade too). The setting is stored as `canvas_opacity_percent`; an older
     `opacity_percent` is read into it, the same value now meaning the canvas.
+  - Transparency gains a 0 % step (100/80/60/40/20/0 %, also on Ctrl+Shift+O and in
+    settings; `canvas_opacity_percent` accepts 0): the canvas background vanishes,
+    everything on it stays opaque. Checked live on DX12/DirectComposition: alpha-0
+    canvas still takes the mouse — a click on empty canvas deselects and a marquee
+    started there selects — because the window is not layered, so Windows hit-tests
+    its whole client area; no minimum alpha is needed. The whole-window fallback
+    (Vulkan) never goes below 20 %, the lowest step that leaves RizRef visible and
+    clickable, and its toast says so.
   - The colour picker: no path was found by which it drops the next key or the
     dirty mark (it changes neither selection nor history, and the dirty mark comes
     from the board's effects); not reproduced, left unchanged.

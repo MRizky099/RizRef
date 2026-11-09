@@ -29,11 +29,16 @@ use winit::window::{Fullscreen, Window};
 /// recognisable at a glance.
 pub const GHOST_OPACITY_PERCENT: u8 = 15;
 
-/// The smallest ordinary transparency the menu offers.
-pub const MIN_OPACITY_PERCENT: u8 = 20;
+/// The smallest transparency setting: a fully invisible canvas background.
+pub const MIN_OPACITY_PERCENT: u8 = 0;
+
+/// The lowest opacity ever applied to the whole window (the fallback where
+/// per-pixel alpha is unavailable): 0 % there would hide RizRef entirely,
+/// with nothing left to click to bring it back.
+pub const MIN_WINDOW_OPACITY_PERCENT: u8 = 20;
 
 /// The order the transparency menu cycles through.
-pub const OPACITY_STEPS: [u8; 5] = [100, 80, 60, 40, 20];
+pub const OPACITY_STEPS: [u8; 6] = [100, 80, 60, 40, 20, 0];
 
 /// The mode state, independent of any window handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +107,7 @@ impl WindowModes {
         match self.ghost {
             Some(_) => self.ghost_opacity_percent,
             None if self.canvas_alpha_supported => 100,
-            None => self.opacity_percent,
+            None => self.opacity_percent.max(MIN_WINDOW_OPACITY_PERCENT),
         }
     }
 
@@ -313,7 +318,8 @@ pub fn click_through_chord_down() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GHOST_OPACITY_PERCENT, MIN_OPACITY_PERCENT, OPACITY_STEPS, WindowModes, styled_ex_style,
+        GHOST_OPACITY_PERCENT, MIN_WINDOW_OPACITY_PERCENT, OPACITY_STEPS, WindowModes,
+        styled_ex_style,
     };
     use windows::Win32::UI::WindowsAndMessaging::{WS_EX_LAYERED, WS_EX_TRANSPARENT};
 
@@ -428,16 +434,42 @@ mod tests {
             modes.cycle_opacity();
             seen.push(modes.opacity_percent);
         }
-        assert_eq!(seen, vec![80, 60, 40, 20, 100]);
+        assert_eq!(seen, vec![80, 60, 40, 20, 0, 100]);
     }
 
     #[test]
     fn opacity_is_clamped_to_the_supported_band() {
         let mut modes = WindowModes::default();
-        modes.set_opacity(1);
-        assert_eq!(modes.opacity_percent, MIN_OPACITY_PERCENT);
+        modes.set_opacity(0);
+        assert_eq!(
+            modes.opacity_percent, 0,
+            "a fully invisible canvas is allowed"
+        );
         modes.set_opacity(200);
         assert_eq!(modes.opacity_percent, 100);
+    }
+
+    #[test]
+    fn zero_percent_hides_the_canvas_but_never_the_window() {
+        let mut modes = WindowModes {
+            canvas_alpha_supported: true,
+            ..WindowModes::default()
+        };
+        modes.set_opacity(0);
+        assert_eq!(modes.canvas_alpha(), 0.0);
+        assert_eq!(modes.effective_opacity_percent(), 100);
+        assert!(
+            !modes.needs_layered(),
+            "an opaque, unlayered window takes clicks"
+        );
+
+        // The whole-window fallback stops at the lowest safe step.
+        modes.canvas_alpha_supported = false;
+        assert_eq!(modes.canvas_alpha(), 1.0);
+        assert_eq!(
+            modes.effective_opacity_percent(),
+            MIN_WINDOW_OPACITY_PERCENT
+        );
     }
 
     #[test]
