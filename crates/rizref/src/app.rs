@@ -204,7 +204,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
         _ => {}
     }
 
-    let parsed = match parse_args(&args) {
+    let mut parsed = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(flag) => {
             eprintln!("rizref: unrecognised argument {flag:?}");
@@ -212,6 +212,14 @@ pub fn run(args: Vec<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Absolute now, against this process's working directory: a second
+    // instance forwards its paths to the first, which runs elsewhere.
+    for path in &mut parsed.paths {
+        if path != "-" {
+            *path = crate::paths::normalize_str(path);
+        }
+    }
 
     let log_dir = init_logging(parsed.verbose);
     let mut startup = StartupClock::new(perf::process_start());
@@ -4590,7 +4598,18 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             AppEvent::ForwardedArgs(args) => {
                 tracing::info!(count = args.len(), "accepted forwarded args");
-                self.pending_paths = args;
+                // The sender made them absolute; folding the spelling again
+                // also covers an older RizRef on the other end of the pipe.
+                self.pending_paths = args
+                    .into_iter()
+                    .map(|path| {
+                        if path == "-" {
+                            path
+                        } else {
+                            crate::paths::normalize_str(&path)
+                        }
+                    })
+                    .collect();
                 let pending = std::mem::take(&mut self.pending_paths);
                 let drop_world = self.drop_world();
                 let paths = pending.into_iter().map(PathBuf::from).collect();

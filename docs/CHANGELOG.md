@@ -138,6 +138,13 @@ Reliability:
     fallback, also for an empty board's 1 x 1 picture). `recents.json` stores the
     preview as base64 instead of a JSON array of numbers, about a third of the
     size; the array form is still read.
+  - Recent boards: the same board opened as `F:/a/b.rizref` and saved as
+    `F:\a\b.rizref` was two cards, and a relative command-line path was stored as
+    given. Paths are now made absolute against the working directory as they arrive
+    (command line, forwarded from a second instance, jump list) and normalised
+    (`\`, `.`/`..`, no `\\?\` prefix), and compared without regard to case.
+    Loading `recents.json` merges duplicates, keeping the most recent edit, and
+    drops a relative entry that does not resolve to a board.
   - A failed import was logged twice, by the worker and by the application; the
     worker's line is debug now. A failed full-resolution decode is a warning.
   - The colour picker: no path was found by which it drops the next key or the

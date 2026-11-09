@@ -155,7 +155,7 @@ impl Recents {
         match std::fs::read_to_string(&path) {
             Ok(body) => match serde_json::from_str::<Self>(&body) {
                 Ok(mut recents) => {
-                    recents.entries.truncate(RECENT_LIMIT);
+                    recents.normalize();
                     recents
                 }
                 Err(error) => {
@@ -169,6 +169,40 @@ impl Recents {
             },
             Err(_) => Self::default(),
         }
+    }
+
+    /// Brings a loaded list to the stored form: every path absolute and
+    /// normalised, one entry per board (the most recently edited wins), newest
+    /// first, at most [`RECENT_LIMIT`].
+    ///
+    /// Lists written before phase 07 can hold the same board in two
+    /// spellings and relative paths. A relative path was relative to a
+    /// working directory nobody remembers: it is resolved against the
+    /// current one and kept only if a board is there.
+    pub fn normalize(&mut self) {
+        let mut merged: Vec<RecentEntry> = Vec::with_capacity(self.entries.len());
+        for mut entry in std::mem::take(&mut self.entries) {
+            if Path::new(&entry.path).is_relative() {
+                let resolved = paths::normalize_str(&entry.path);
+                if !Path::new(&resolved).is_file() {
+                    continue;
+                }
+                entry.path = resolved;
+            } else {
+                entry.path = paths::normalize_str(&entry.path);
+            }
+            match merged
+                .iter_mut()
+                .find(|kept| paths::same_path(&kept.path, &entry.path))
+            {
+                Some(kept) if entry.edited_at > kept.edited_at => *kept = entry,
+                Some(_) => {}
+                None => merged.push(entry),
+            }
+        }
+        merged.sort_by_key(|entry| std::cmp::Reverse(entry.edited_at));
+        merged.truncate(RECENT_LIMIT);
+        self.entries = merged;
     }
 
     /// Writes the list atomically; errors are returned for the caller to log.
@@ -194,9 +228,9 @@ impl Recents {
         preview: Option<Vec<u8>>,
         now_unix: u64,
     ) {
-        let path = path.into();
+        let path = paths::normalize_str(&path.into());
         self.entries
-            .retain(|entry| !entry.path.eq_ignore_ascii_case(&path));
+            .retain(|entry| !paths::same_path(&entry.path, &path));
         self.entries.insert(
             0,
             RecentEntry {
@@ -213,7 +247,7 @@ impl Recents {
     pub fn remove(&mut self, path: &str) -> bool {
         let before = self.entries.len();
         self.entries
-            .retain(|entry| !entry.path.eq_ignore_ascii_case(path));
+            .retain(|entry| !paths::same_path(&entry.path, path));
         self.entries.len() != before
     }
 
@@ -261,9 +295,10 @@ mod tests {
         recents.record("c:/boards/A.rizref", 5, None, 30);
 
         assert_eq!(recents.entries.len(), 2);
-        assert_eq!(recents.entries[0].path, "c:/boards/A.rizref");
+        // Stored normalised: backslashes, as most recently spelled.
+        assert_eq!(recents.entries[0].path, r"c:\boards\A.rizref");
         assert_eq!(recents.entries[0].item_count, 5);
-        assert_eq!(recents.entries[1].path, "C:/boards/b.rizref");
+        assert_eq!(recents.entries[1].path, r"C:\boards\b.rizref");
     }
 
     #[test]
@@ -275,7 +310,7 @@ mod tests {
         assert_eq!(recents.entries.len(), RECENT_LIMIT);
         assert_eq!(
             recents.entries[0].path,
-            format!("C:/boards/{}.rizref", RECENT_LIMIT + 4)
+            format!(r"C:\boards\{}.rizref", RECENT_LIMIT + 4)
         );
     }
 
@@ -311,6 +346,51 @@ mod tests {
             body.contains("\"preview\":\"AQID\""),
             "base64 on disk: {body}"
         );
+    }
+
+    #[test]
+    fn one_board_in_two_spellings_is_one_card() {
+        let mut recents = Recents::default();
+        recents.record(
+            "F:/VibeCode/RizRef/.local/manual-test/board3.rizref",
+            3,
+            None,
+            10,
+        );
+        recents.record(
+            r"F:\VibeCode\RizRef\.local\manual-test\board3.rizref",
+            4,
+            None,
+            20,
+        );
+
+        assert_eq!(recents.entries.len(), 1);
+        assert_eq!(
+            recents.entries[0].path,
+            r"F:\VibeCode\RizRef\.local\manual-test\board3.rizref"
+        );
+        assert_eq!(recents.entries[0].item_count, 4, "the newer record wins");
+    }
+
+    #[test]
+    fn loading_merges_duplicates_and_drops_unresolvable_relative_paths() {
+        let body = r#"{"entries":[
+            {"path":"F:/x/board3.rizref","edited_at":30,"item_count":6},
+            {"path":"C:\\y\\other.rizref","edited_at":40,"item_count":1},
+            {"path":"f:\\X\\.\\board3.rizref","edited_at":50,"item_count":7},
+            {"path":"no\\such\\relative.rizref","edited_at":60,"item_count":2}
+        ]}"#;
+        let mut recents: Recents = serde_json::from_str(body).expect("parses");
+
+        recents.normalize();
+
+        let paths: Vec<&str> = recents.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, [r"f:\X\board3.rizref", r"C:\y\other.rizref"]);
+        assert_eq!(
+            recents.entries[0].edited_at, 50,
+            "the most recent edit wins"
+        );
+        assert_eq!(recents.entries[0].item_count, 7);
     }
 
     #[test]

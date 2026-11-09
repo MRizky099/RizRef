@@ -134,6 +134,8 @@ pub fn open_url(url: &str) -> Result<(), LaunchError> {
 pub fn add_to_recent_documents(path: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::{SHARD_PATHW, SHAddToRecentDocs};
+    // One spelling per board, or the jump list shows it twice.
+    let path = crate::paths::normalize(path);
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     unsafe { SHAddToRecentDocs(SHARD_PATHW.0 as u32, Some(wide.as_ptr().cast())) };
 }
