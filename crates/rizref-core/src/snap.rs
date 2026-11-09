@@ -218,7 +218,7 @@ mod tests {
         let target = rect(1000.0, 1000.0, 200.0, 200.0);
         let moving = rect(199.0, 500.0, 100.0, 100.0);
 
-        for zoom in [0.05, 0.1, 0.5, 1.0, 4.0, 8.0, 32.0] {
+        for zoom in [0.005, 0.05, 0.1, 0.5, 1.0, 4.0, 8.0, 32.0] {
             let tolerance = screen_tolerance(3.0, zoom);
             let result = snap_rect(moving, &[target], tolerance);
             let snapped = moving.translated(result.offset);
@@ -243,6 +243,7 @@ mod tests {
     #[test]
     fn tolerance_shrinks_as_the_view_zooms_in() {
         assert_eq!(screen_tolerance(3.0, 0.05), 60.0);
+        assert!((screen_tolerance(3.0, 0.005) - 600.0).abs() < 1.0e-9);
         assert!((screen_tolerance(3.0, 32.0) - 0.09375).abs() < 1.0e-6);
 
         // At 5% a 50-unit gap snaps; at 3200% the same gap is far away.

@@ -68,6 +68,10 @@ impl Globals {
     /// Zoom above which the grid hides (400%).
     const GRID_MAX_ZOOM: f64 = 4.0;
 
+    /// Zoom below which the grid hides (5%): further out its lines would be
+    /// closer than a pixel and shimmer.
+    const GRID_MIN_ZOOM: f64 = 0.05;
+
     /// Applies the user's view settings. Grid (with its origin axis) and
     /// border can only be switched off here: the zoom range and an empty
     /// board still hide them when the settings ask for them.
@@ -100,7 +104,9 @@ impl Globals {
             physical_scale: physical_scale as f32,
             scene_min,
             scene_max,
-            grid_visible: if camera.zoom >= Camera::MIN_ZOOM && camera.zoom <= Self::GRID_MAX_ZOOM {
+            grid_visible: if camera.zoom >= Self::GRID_MIN_ZOOM
+                && camera.zoom <= Self::GRID_MAX_ZOOM
+            {
                 1.0
             } else {
                 0.0
@@ -965,13 +971,21 @@ mod tests {
 
     #[test]
     fn the_grid_hides_outside_the_planned_zoom_band() {
-        let zoomed_out = Globals::new(
+        let floor = Globals::new(
+            &Camera::new(DVec2::ZERO, Globals::GRID_MIN_ZOOM, 0.0),
+            DVec2::ONE,
+            1.0,
+            None,
+        );
+        assert_eq!(floor.grid_visible, 1.0, "5% is the visible floor");
+
+        let fitted = Globals::new(
             &Camera::new(DVec2::ZERO, Camera::MIN_ZOOM, 0.0),
             DVec2::ONE,
             1.0,
             None,
         );
-        assert_eq!(zoomed_out.grid_visible, 1.0, "5% is the visible floor");
+        assert_eq!(fitted.grid_visible, 0.0, "below 5% the grid hides");
 
         let zoomed_in = Globals::new(&Camera::new(DVec2::ZERO, 5.0, 0.0), DVec2::ONE, 1.0, None);
         assert_eq!(zoomed_in.grid_visible, 0.0, "above 400% the grid hides");
