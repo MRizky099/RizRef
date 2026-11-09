@@ -1,67 +1,230 @@
+<div align="center">
+
+<img src="crates/rizref/assets/app_icon.png" alt="RizRef icon" width="128">
+
 # RizRef
 
-A fast, portable reference-image canvas for artists — collect, arrange and study
-reference images on an infinite board, always available over your painting app.
+**A fast, portable reference-image board for artists.**
+Collect, arrange and study reference images on an infinite canvas that stays on top of
+your painting app.
 
-RizRef is a from-scratch implementation written in **Rust** (pure Rust wherever a
-reasonable crate exists), with its own scene file format, `.rizref`.
+[![CI](https://github.com/MRizky099/RizRef/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MRizky099/RizRef/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/MRizky099/RizRef?include_prereleases&sort=semver)](https://github.com/MRizky099/RizRef/releases)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue)](docs/CHANGELOG.md)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
+[![Rust](https://img.shields.io/badge/rust-stable%20·%202024%20edition-orange?logo=rust)](rust-toolchain.toml)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-0078D6?logo=windows)](#requirements)
+[![Linux & macOS](https://img.shields.io/badge/Linux%20%26%20macOS-in%20progress-lightgrey)](#status)
+
+</div>
+
+---
+
+RizRef is written from scratch in **pure Rust** (no bundled C/C++ libraries) and saves
+each board as one self-contained `.rizref` file: the layout, the original image bytes,
+your notes and a thumbnail, all in one file you can copy anywhere.
+
+## Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Keyboard and mouse](#keyboard-and-mouse)
+- [Where RizRef keeps its files](#where-rizref-keeps-its-files)
+- [Status](#status)
+- [Building from source](#building-from-source)
+- [For developers](#for-developers)
+- [License](#license)
+- [Author](#author)
+
+## Features
+
+**Collect**
+- Drag images in from File Explorer, your browser, or Outlook attachments, or paste with
+  `Ctrl+V` and open with `Ctrl+O`.
+- PNG, JPEG, WebP, GIF (animated), BMP, TGA, PNM, QOI, ICO and HEIC/HEIF, all decoded in
+  Rust. AVIF works through Windows' own codec.
+- JPEG orientation from EXIF is respected. The same image imported twice is stored once.
+- Each image remembers where it came from: **Open file location**, **Open image URL**
+  (http/https only), and an **Image info** panel.
+
+**Arrange**
+- Infinite canvas with smooth pan, zoom (0.5 %–3200 %) and view rotation.
+- Move, scale from the opposite corner (`Alt` scales from the centre), rotate, flip,
+  group, align, distribute, and arrange as grid, stack, spread or hierarchy.
+- Snapping with smart guides, z-order, duplicate, and a full undo/redo history.
+- **Markdown notes** with headings, lists, task lists, tables, code, coloured
+  `<span style>` text and LaTeX math (`$…$`, `$$…$$`), on any background colour.
+
+**Stay out of the way**
+- Frameless window with an auto-hiding title bar and button hints.
+- **Always on top**, **click-through**, **borderless fullscreen** and **ghost mode**
+  (`Ctrl+Shift+G` fades the window and lets clicks pass to the app underneath).
+- **Canvas transparency** from 100 % to 0 %: only the canvas background fades, and
+  your images stay fully opaque.
+- Colour picker (`I`) that samples anywhere on screen and copies the hex code.
+- Grayscale view, checkerboard, grid, scene boundary, canvas lock.
+
+**Never lose work**
+- Saves are atomic, and later saves only append what changed.
+- Autosave to a separate recovery copy, offered back after a crash.
+- A damaged board opens at its last good save, and `rizref inspect --verify` checks
+  any board.
+
+**Fit into Windows**
+- `.rizref` thumbnails in File Explorer, a file icon, "Open with RizRef", and recent
+  boards in the taskbar jump list.
+- Start view with recent boards and their thumbnails. PNG export of the whole board.
+- Rebindable shortcuts (`F1`), settings (`Ctrl+,`), and a UI Automation tree for
+  assistive tools.
+
+## Requirements
+
+| | Minimum |
+|---|---|
+| Operating system | Windows 10 or 11, 64-bit (x64) |
+| Graphics | A GPU with a **DirectX 12** or **Vulkan** driver (DX12 is tried first) |
+| Disk | About 15 MB for the app, plus your boards |
+| Optional | [AV1 Video Extension](https://apps.microsoft.com/detail/9MVZQVXJBQ9V) from the Microsoft Store, for AVIF images |
+
+No runtime or redistributable is needed. The C runtime is linked in, and the exe only
+uses DLLs that ship with Windows.
+
+Linux and macOS 10.13+ builds are in progress (see [Status](#status)). v1.0.0 will be
+released for all three platforms together.
+
+## Installation
+
+Download from the [Releases](https://github.com/MRizky099/RizRef/releases) page.
+Choose one:
+
+**Installer** (`RizRef-<version>-x64-setup.exe`)
+1. Run it. No administrator rights are needed for a per-user install.
+2. Choose the folder. The default is `%LOCALAPPDATA%\Programs\RizRef`, or Program Files
+   if you choose "install for all users".
+3. Keep **"Open .rizref boards with RizRef"** ticked to get the file icon and Explorer
+   thumbnails.
+
+Uninstall from *Settings → Apps*. It removes the file association too. Silent install:
+`RizRef-…-setup.exe /VERYSILENT /DIR="D:\Apps\RizRef"`.
+
+**Portable** (`RizRef-<version>-x64.zip`)
+1. Unzip anywhere, even a USB stick, and run `rizref.exe`.
+2. Optional: associate `.rizref` files and enable thumbnails for your account:
+
+   ```bash
+   rizref register      # file icon, "Open with RizRef", jump list, Explorer thumbnails
+   rizref unregister    # removes exactly what register wrote
+   ```
+
+   `register` points Windows at the exe in its current folder, so run it again if you
+   move the folder.
+
+> **First run:** release builds aren't code-signed yet, so Windows SmartScreen may say
+> "Windows protected your PC". Choose **More info → Run anyway**.
+
+If Explorer keeps showing old icons or thumbnails, run `ie4uinit -show`. If that isn't
+enough, delete `%LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache_*.db` and
+`thumbcache_*.db`, then restart Explorer.
+
+## Quick start
+
+1. Start RizRef and choose **New board**, or open the sample
+   [`docs/demo.rizref`](docs/demo.rizref).
+2. Drop or paste a few images. Press `F` to fit everything in view.
+3. Drag to move, use the corner handles to scale and the top handle to rotate.
+4. Press `N` for a note, type markdown, and press `Ctrl+Enter` to finish.
+5. Press `Ctrl+Shift+T` to keep the board on top of your painting app, and
+   `Ctrl+Shift+O` to fade the canvas.
+6. Press `Ctrl+S` to save the board as one `.rizref` file.
+
+Right-click anywhere (or click **☰** in the title bar) for every command.
+
+## Keyboard and mouse
+
+| Mouse | Action |
+|---|---|
+| Wheel | Zoom at the cursor |
+| Middle-drag, or `Space` + drag | Pan |
+| `Alt` + wheel | Rotate the view |
+| Drag on empty canvas | Marquee select |
+| Double-click a note | Edit it |
+
+| Keys | Action | Keys | Action |
+|---|---|---|---|
+| `Ctrl+N` / `Ctrl+O` | New board / open images | `Ctrl+S` / `Ctrl+Shift+S` | Save / save as |
+| `Ctrl+V` | Paste image | `Ctrl+E` | Export PNG |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo | `Ctrl+D` / `Del` | Duplicate / delete |
+| `F` or `1` | Fit content | `0` / `2` | 100 % / reset rotation |
+| `Shift+H` / `Shift+V` | Flip | `Ctrl+G` / `Ctrl+Shift+U` | Group / ungroup |
+| `3` `4` `5` `6` | Arrange: grid, hierarchy, spread, stack | `Ctrl+Shift+Arrows` | Align |
+| `N` | New note | `I` | Colour picker |
+| `G` / `Ctrl+B` | Grid / scene boundary | `U` | Grayscale |
+| `Ctrl+Shift+T` | Always on top | `Ctrl+Shift+O` | Cycle canvas transparency |
+| `Ctrl+Shift+X` | Click-through | `Ctrl+Shift+G` | Ghost mode (works unfocused) |
+| `L` | Lock canvas | `F11` | Borderless fullscreen |
+| `F1` | All shortcuts, and rebinding | `Ctrl+,` | Settings |
+
+## Where RizRef keeps its files
+
+| What | Where |
+|---|---|
+| Settings, recent boards | `%APPDATA%\RizRef` |
+| Logs (14 days), crash dumps, autosave recovery copies | `%LOCALAPPDATA%\RizRef` (**Help → Open logs folder**) |
+
+Command line: `rizref --help`, `rizref --version`, `rizref <board.rizref>`,
+`rizref inspect <board.rizref> [--verify]`, and `-v` for debug logging.
+`RIZREF_GPU_BACKEND=dx12|vulkan` forces one GPU backend. Canvas-only transparency
+needs DX12; on Vulkan it fades the whole window instead.
 
 ## Status
 
-**1.0.0** — feature-complete for the first release. Progress was tracked on the issue
-tracker, one issue per delivery phase:
+| Phase | Scope | State |
+|---|---|---|
+| 00–07 | Windows app: canvas, import, editing, UI shell, `.rizref` format, notes, provenance, performance, packaging | ✅ merged |
+| 08 | Linux (X11 + Wayland) and macOS 10.13+ ports, installer + portable for every OS | 🚧 in progress |
+| **v1.0.0** | One release for Windows, Linux and macOS | ⏳ after phase 08 |
+
+Each phase is one GitHub issue and one PR, summarised in
+[`docs/CHANGELOG.md`](docs/CHANGELOG.md). The file format is specified in
+[`docs/format.md`](docs/format.md).
+
+## Building from source
+
+You need stable [Rust](https://rustup.rs) (2024 edition; `rust-toolchain.toml` pins the
+channel) and, on Windows, the MSVC linker from *Visual Studio Build Tools* ("Desktop
+development with C++"). Only its linker is used; no C/C++ is compiled.
 
 ```bash
-gh issue list --repo MRizky099/RizRef --state open
+git clone https://github.com/MRizky099/RizRef.git
+cd RizRef
+cargo run -p rizref --release                         # build and run
+cargo build --release -p rizref -p rizref-thumb       # exe + Explorer thumbnail DLL
+cargo test --workspace                                # all tests
 ```
 
-Phase 00 (workspace, dependency policy, lint/CI policy, budgets), phase 01 (window,
-Vulkan→DX12 surface, on-demand pacing, single instance, logs), phase 02 (f64 camera,
-pan/zoom/rotate, grid, quad + HUD pipelines), phase 03 (worker-thread image import
-with EXIF-aware decoding, BLAKE3 asset dedup, previews, an OLE drop target that also
-accepts virtual files such as Outlook attachments, clipboard paste, Ctrl+O and per-item
-sRGB textures), phase 04 (select/marquee, move/scale/rotate/flip, snapping with smart
-guides, arrange/align/distribute, groups, notes and a coalescing undo history) and
-phase 05 (custom context menus, a start view with recents, a rebindable shortcut table
-with an F1 overlay, settings, a frameless auto-hiding title bar that names the open
-document and marks unsaved work, an unsaved-changes close guard, always-on-top/
-opacity/click-through/borderless window modes, ghost mode, color picker, canvas lock
-and a UIA accessibility tree) and phase 06 (the complete `.rizref` container: header,
-chunk stream, JSON scene document, content-addressed image blobs, asset previews,
-board thumbnails, atomic fresh saves, incremental appends, recovery and compaction,
-`rizref inspect --verify`, and Save/Open/Export wiring in the application) and phase
-06a (markdown notes: a source editor with ✓/✗ chrome, rendered markdown with
-`<span style>` colours and sizes, inline/display math typeset by RaTeX, a hover
-toolbar with a background colour popover and auto-contrast ink, a fixed wrap width
-with explicit "Reflow to box width", no note rotation, a title-bar ☰ menu, and the
-additive `.rizref` note fields) and phase 06b (image provenance: browser source-URL
-capture on paste and drag, Open file location / Open image URL for one selected image
-with strict http/https launching, and a read-only image info dialog) and phase 07
-(polish and ship: every performance budget measured and met on the reference laptop,
-CPU-presented first frames while the GPU starts in the background, visible-set culling,
-a parallel board load, autosave to recovery copies with a restore prompt, crash
-minidumps, the Explorer thumbnail provider, per-user file-type registration and jump
-list, a 14.3 MB single exe with no C runtime, a packaging script, an Inno Setup
-installer and a draft-release workflow) have landed. The workspace builds, tests and
-lints clean. Hand-testing of the 1.0 build against the manual test plan is the step
-before tagging a release.
+Packaging (portable zip + installer; the installer needs
+[Inno Setup 6](https://jrsoftware.org/isinfo.php)):
 
-The sample board [`docs/demo.rizref`](docs/demo.rizref) holds four images drawn in code
-(CC0) and three markdown notes; open it to see a board without collecting anything
-first.
+```bash
+powershell -File packaging/package.ps1
+```
 
-## Design principles
+## For developers
+
+### Design principles
 
 - **Pure Rust first.** A dependency that vendors or links C/C++ is rejected unless no
-  viable Rust alternative exists; OS FFI bindings (Win32/COM declarations) are fine.
+  viable Rust alternative exists. OS FFI bindings (Win32/COM declarations) are fine.
 - **One portable file per board.** A `.rizref` file is self-contained: the scene,
   original image bytes (verbatim, so metadata like EXIF/C2PA survives), and an embedded
   preview thumbnail for fast browsing.
-- **Crash-safe by construction.** Saves are atomic; a board never loads corrupt.
+- **Crash-safe by construction.** Saves are atomic, and a board never loads corrupt.
 - **Always-available window.** Always-on-top, translucent, and click-through modes are
   first-class, not hacks.
 
-## Repository layout
+### Repository layout
 
 ```
 crates/
@@ -72,32 +235,75 @@ crates/
   rizref-thumb/    Explorer thumbnail provider DLL (reads through rizref-format)
 docs/
   format.md        the `.rizref` file-format specification
+  CHANGELOG.md     what each phase delivered
   demo.rizref      the sample board (CC0 images drawn in code)
-  ...              local working documents (not published to this remote)
 packaging/         package.ps1 (portable zip + installer), rizref.iss, README.txt
 scripts/           bench-startup.ps1, check-imports.ps1, release-notes.sh
 ```
 
-One line each, in the direction dependencies flow:
+In the direction dependencies flow:
 
 | Crate | Responsibility |
 |---|---|
-| `rizref-core` | Scene model, camera, rectangle geometry, selection and the undo history. Deterministic, no IO, no UI, no windowing. |
-| `rizref-format` | The `.rizref` container — header, chunk framing, scene document, content-addressed blobs, index/footer, recovery, incremental save and board thumbnails. The only crate allowed to write board files. See [`docs/format.md`](docs/format.md). |
+| `rizref-core` | Scene model, camera, rectangle geometry, selection and the undo history. Deterministic: no IO, no UI, no windowing. |
+| `rizref-format` | The `.rizref` container: header, chunk framing, scene document, content-addressed blobs, index/footer, recovery, incremental save and board thumbnails. The only crate allowed to write board files. See [`docs/format.md`](docs/format.md). |
 | `rizref-codecs` | Decodes every supported image format into one RGBA buffer and encodes PNG/JPEG. All backends are pure Rust. |
 | `rizref` | The binary: window, renderer, input, clipboard, dialogs and Windows platform glue. |
 | `rizref-thumb` | `rizref_thumb.dll`, the in-process COM thumbnail provider Explorer loads for `.rizref` files. Optional: the exe runs without it. |
 
-## Dependencies
+### Development commands
+
+```bash
+cargo run -p rizref -- --help                         # flags this build accepts
+cargo run -p rizref-codecs --example make_fixtures    # regenerate committed codec fixtures
+cargo run -p rizref --example make_icon               # regenerate both .ico files from assets/*.png
+cargo run -p rizref-format --example make_demo_board  # regenerate docs/demo.rizref
+cargo bench -p rizref-core -p rizref-format           # culling and container benches, board I/O budgets
+cargo fmt --all                                       # formatting
+cargo clippy --workspace --all-targets -- -D warnings # lint policy, as CI runs it
+```
+
+Fuzzing lives in the workspace-excluded `fuzz/` crate and needs nightly. CI runs one
+matrix job per codec family: 60 s per target on a pull request, 600 s per target on the
+nightly schedule. Locally:
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run decode_any -- -max_total_time=600
+```
+
+Lints are workspace-wide (`[workspace.lints]`):
+- `unsafe_code` is denied in every crate.
+- Public items must be documented.
+- `todo!()` and `unimplemented!()` are denied.
+- Win32 calls are confined to `rizref::platform`.
+
+CI runs `fmt`, `clippy`, `test` and the dependency audit on `windows-latest`, plus the
+fuzz matrix.
+
+Release builds use fat LTO at `opt-level = "s"` and link the C runtime statically
+(`.cargo/config.toml`), so `rizref.exe` imports operating-system DLLs only.
+`scripts/check-imports.ps1` reads the PE import table and fails on any C/C++ runtime.
+
+### Releasing
+
+Pushing a tag `vX.Y.Z` that matches the workspace version runs
+`.github/workflows/release.yml`. It tests, packages, signs when a certificate is
+configured, and creates a **draft** GitHub release with notes generated from the
+conventional commits (`scripts/release-notes.sh`). A maintainer reviews and publishes
+the draft by hand; the workflow never publishes. Signing activates once the secrets
+`RIZREF_SIGN_PFX_BASE64` and `RIZREF_SIGN_PASSWORD` exist.
+
+### Dependencies
 
 Every dependency is declared once in the root `Cargo.toml` under
-`[workspace.dependencies]` and opted into per crate, so a version cannot drift
-between crates. These are the pinned versions:
+`[workspace.dependencies]` and opted into per crate, so a version can't drift between
+crates. These are the pinned versions:
 
 | Concern | Crate | Version | Notes |
 |---|---|---|---|
 | Windowing/input | `winit` | 0.30.13 | pure Rust; talks to `windows-sys` |
-| GPU rendering | `wgpu` | 30.0.1 | Vulkan + DX12; Metal/WebGPU/GL off |
+| GPU rendering | `wgpu` | 30.0.1 | DX12 + Vulkan; Metal/WebGPU/GL off |
 | 2D raster fallback, HUD | `tiny-skia` | 0.12.0 | pure Rust |
 | Text shaping | `cosmic-text` | 0.19.0 | `fontconfig` off (it is a C library) |
 | Markdown (notes) | `pulldown-cmark` | 0.13.6 | `default-features = false`: no CLI, no HTML renderer |
@@ -117,12 +323,12 @@ between crates. These are the pinned versions:
 | Import workers | `crossbeam-channel` | 0.5.17 | pure Rust, no async runtime |
 | Serialization | `serde` / `serde_json` | 1.0.229 / 1.0.154 | pure Rust |
 | Compression | `lz4_flex` | 0.14.0 | pure Rust |
-| Hashing | `blake3` | 1.8.7 | asset identity and container checksums; `features = ["pure"]` — see below |
+| Hashing | `blake3` | 1.8.7 | asset identity and container checksums; `features = ["pure"]` (see below) |
 | Logging | `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | pure Rust |
-| Platform FFI | `windows` | 0.62.2 | Win32/COM declarations: mutex, pipe, dialogs, OLE drop target |
+| Platform FFI | `windows` | 0.62.2 | Win32/COM declarations: mutex, pipe, dialogs, OLE drop target, registry, shell |
 | COM support | `windows-core` | 0.62.2 | required by the `#[implement]` macro; pure Rust |
 
-### The pure-Rust rule, and how it is checked
+#### The pure-Rust rule, and how it is checked
 
 No dependency may vendor or link C/C++. Win32/COM **declaration** crates are the only
 accepted exception. `cargo tree` is audited for `*-sys`/`*_sys` crates on the Windows
@@ -130,173 +336,48 @@ target, and CI fails on anything outside the accepted list.
 
 Audit result for the current tree (`x86_64-pc-windows-msvc`, `normal,build`):
 
-- `windows-sys` — Win32/COM declarations only; the accepted family.
-- `renderdoc-sys` — declarations for the RenderDoc capture API, loaded at runtime and
+- `windows-sys`: Win32/COM declarations only; the accepted family.
+- `renderdoc-sys`: declarations for the RenderDoc capture API, loaded at runtime and
   linked against nothing. **Not removable:** `wgpu` 30 enables `wgpu-core/renderdoc`
-  unconditionally for every non-wasm target, and `wgpu` exposes no feature that turns
-  it off.
+  unconditionally for every non-wasm target, with no feature to turn it off.
 - `blake3` is built with `features = ["pure"]`. Without it, its build script assembles
-  BLAKE3's hand-written C assembly whenever a C compiler is on `PATH`. With `pure` no C
-  or assembly is compiled or linked; the build script still declares `cc` and probes one
-  compiler flag on x86_64, which compiles nothing into our artifacts. If a build with
-  zero C-toolchain involvement is ever required, swapping BLAKE3 for `sha2` or
-  `xxhash-rust` is the way out.
+  BLAKE3's hand-written C assembly whenever a C compiler is on `PATH`. With `pure`,
+  nothing is compiled or linked. The build script still probes one compiler flag on
+  x86_64, which adds nothing to our artifacts.
 
-- Phase 07 adds **no crate**. The `windows` feature list grows by `Console`,
-  `Diagnostics_Debug`, `Kernel`, `LibraryLoader`, `Registry` and
-  `Shell_PropertiesSystem` (declarations for the parent-console attach, the minidump
-  writer in the OS's `dbghelp.dll`, file-type registration and the thumbnail
-  provider's `IInitializeWithStream`); the audit list above is unchanged. The
-  plan named `minidump-writer` for crash dumps; the OS's own `MiniDumpWriteDump`
-  through the existing declarations needs no dependency at all.
-- Phase 06a's additions (`pulldown-cmark`, `csscolorparser`, the `ratex-*` crates and
-  their trees: `ab_glyph`, `ttf-parser`, `rust-embed`, `phf`) add **no** `-sys` crate;
-  the audit list above is unchanged. RaTeX brings its own `tiny-skia` 0.11 and `png`
-  0.17 alongside ours (duplicate versions, pure Rust); they stay — the release exe
-  is under its size budget with them (see below). The KaTeX fonts are licensed under the
-  SIL Open Font License 1.1 and are credited in the About notice.
+Phase 06a's additions (`pulldown-cmark`, `csscolorparser`, the `ratex-*` crates) and
+phase 07 add **no** `-sys` crate. Phase 07 only grows the `windows` feature list (crash
+dumps through the OS's `dbghelp.dll`, registration, the thumbnail provider).
 
-Two deliberate exclusions, both recorded rather than hidden:
+Deliberate exclusions, recorded rather than hidden:
 
-- **`wgpu`'s `gles` backend is off, and the GL fallback is dropped by decision.** It pulls
-  `glutin_wgl_sys`, an `-sys` crate outside the accepted family, so the backend order is
-  **Vulkan → DX12** only. The pure-Rust rule wins over the third backend: for a machine
-  with no usable Vulkan or DX12 driver, the intended last resort is the CPU raster path
-  (`tiny-skia`, already a dependency), not OpenGL. Revisiting this means either accepting
-  `glutin_wgl_sys` as an FFI-only exception or building the CPU path — both are recorded
-  options, not lost work.
-- **HEIF/HEIC is decoded in Rust.** `heic-rs` implements the ISOBMFF container and the
-  HEVC still-picture decoder itself — grid tiles, 10-bit, `irot`/`imir` — under
-  MIT OR Apache-2.0, with `#![forbid(unsafe_code)]` and no build script. It replaced the
-  earlier OS bridge, which needed a Store package and only worked on Windows.
-- **AVIF goes through the operating system, and that is a tooling decision, not a
-  licensing one.** `image`'s AVIF support is encoder-only (decoding needs the C `dav1d`),
-  and `avif-decode` — the pure-Rust option — enables `rav1d`'s `asm` feature on x86, which
-  fails to build without NASM installed. Rather than make `cargo build` depend on an
-  assembler, AVIF is bridged to Windows Imaging Component (`platform/imaging.rs`), which
-  decodes it when the free **AV1 Video Extension** is installed. A missing codec is
-  reported as the package to install, and HEIC still has the same bridge as a fallback for
-  coding tools `heic-rs` declines.
+- **`wgpu`'s `gles` backend is off on Windows.** It pulls `glutin_wgl_sys`, an `-sys`
+  crate outside the accepted family. The backend order is **DX12 → Vulkan**.
+- **HEIF/HEIC is decoded in Rust** by `heic-rs` (ISOBMFF + HEVC still pictures, grid
+  tiles, 10-bit, `irot`/`imir`), with `#![forbid(unsafe_code)]` and no build script.
+- **AVIF goes through Windows Imaging Component.** The pure-Rust decoder path
+  (`rav1d`) enables x86 assembly that needs NASM to build. Rather than make
+  `cargo build` depend on an assembler, AVIF uses the OS codec when the free AV1 Video
+  Extension is installed, and a missing codec is reported as the package to install.
 
-## Building
+### Performance budgets
 
-```bash
-cargo build --workspace        # build every crate
-cargo run -p rizref            # run the application (debug build)
-cargo run -p rizref -- --help  # flags this build accepts
-cargo test --workspace         # run all tests
-cargo run -p rizref-codecs --example make_fixtures   # regenerate committed codec fixtures
-cargo run -p rizref --example make_icon               # regenerate both .ico files from assets/*.png
-cargo run -p rizref-format --example make_demo_board  # regenerate docs/demo.rizref
-cargo bench -p rizref-core -p rizref-format   # culling and container benches, board I/O budgets
-cargo fmt --all                # formatting
-cargo clippy --workspace --all-targets -- -D warnings   # lint policy, as CI runs it
-```
-
-Fuzzing lives in the workspace-excluded `fuzz/` crate and needs nightly. CI runs one
-matrix job per codec family: 60 s per target on a pull request, 600 s per target on the
-nightly schedule (the phase-03 acceptance soak). Locally:
-
-```bash
-cargo install cargo-fuzz
-cargo +nightly fuzz run decode_any -- -max_total_time=600
-```
-
-Lints are workspace-wide (`[workspace.lints]`): `unsafe_code` is denied in every crate,
-public items must be documented, and `todo!()`/`unimplemented!()` are denied so no
-half-finished code path can ship. Win32 calls will be confined to `rizref::platform`
-with narrow, documented local overrides.
-
-CI runs `fmt`, `clippy` and `test` on `windows-latest`, plus the dependency audit above.
-
-Release builds (`cargo build --release -p rizref -p rizref-thumb`) use fat LTO at
-`opt-level = "s"` and link the C runtime statically (`.cargo/config.toml`), so
-`rizref.exe` imports operating-system DLLs only — `scripts/check-imports.ps1` reads
-the PE import table and fails on any C/C++ runtime. The release binary is linked for
-the GUI subsystem (no console window) and reattaches to the parent console for
-`--help`, `--version` and `inspect`.
-
-## Installing and Windows integration
-
-`rizref.exe` is the whole application: copy it anywhere and run it. Optionally:
-
-```bash
-rizref register              # .rizref -> RizRef: icon, "Open with RizRef", jump list;
-                             # Explorer thumbnails when rizref_thumb.dll sits beside the exe
-rizref unregister            # remove exactly what register wrote
-rizref register --machine    # for every user (an elevated installer)
-```
-
-Registration writes only `HKCU\Software\Classes` (no administrator rights). The
-optional installer (`packaging/rizref.iss`, Inno Setup 6) installs per user to
-`%LOCALAPPDATA%\Programs\RizRef` by default, or for all users into Program Files, always
-letting you choose the folder (silently: `/DIR="..."`), and runs the same command
-from the chosen folder.
-`packaging/package.ps1` builds both and the portable zip.
-
-Explorer caches icons and thumbnails. After registering, or after a build with new
-icons, `ie4uinit -show` refreshes the icon cache; if old icons persist, delete
-`%LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache_*.db` (and `thumbcache_*.db` for
-thumbnails) and restart Explorer.
-
-Settings and recents live in `%APPDATA%\RizRef`; logs, crash minidumps
-(`crashes\`) and autosave recovery copies (`autosave\`) in `%LOCALAPPDATA%\RizRef`
-(**Help → Open logs folder**). `-v`/`--verbose` logs at debug level; logs rotate daily
-and 14 are kept. `RIZREF_GPU_BACKEND=dx12` (or `vulkan`) restricts the GPU walk to one
-backend, for a machine whose driver misbehaves. On Windows DX12 is tried first, presented
-through a DirectComposition visual: it is what lets **Canvas → Transparency** make the
-canvas background alone see-through. On Vulkan (no per-pixel alpha on Win32 surfaces)
-the same setting fades the whole window instead.
-
-### Releasing
-
-Pushing a tag `vX.Y.Z` that matches the workspace version runs
-`.github/workflows/release.yml`: test, package, sign when a certificate is configured,
-and create a **draft** GitHub release with notes generated from the conventional
-commits since the previous tag (`scripts/release-notes.sh`). A maintainer reviews and
-publishes the draft by hand; the workflow never publishes. Code signing activates once
-the repository secrets `RIZREF_SIGN_PFX_BASE64` and `RIZREF_SIGN_PASSWORD` exist — no
-certificate exists yet, so artifacts are unsigned and SmartScreen will warn on first
-run.
-
-## Performance budgets
-
-The phase-00 targets, measured in phase 07 on the reference machine: a 2015 laptop,
-Intel Core i7-4720HQ, 12 GB RAM, NVIDIA GeForce GTX 950M (the only Vulkan/DX12
-adapter — its Intel HD 4600 is offered by neither API), Windows 10 Pro 22H2, release
-build of `feat/phase-07-polish-and-ship`, default 600 × 400 window, 60 Hz display. Every number comes from a
-committed, repeatable harness.
+Measured on the reference machine: a 2015 laptop with an Intel Core i7-4720HQ, 12 GB RAM,
+an NVIDIA GeForce GTX 950M and Windows 10 Pro 22H2. Release build, 600 × 400 window,
+60 Hz display. Every number comes from a committed, repeatable harness.
 
 | Budget | Target | Measured | Harness |
 |---|---|---|---|
-| Cold start to interactive canvas, 0 items | < 300 ms | **130 ms** median, 226 ms worst (20 warm launches); first GPU frame 1,038 ms | `scripts/bench-startup.ps1` |
-| Pan/zoom latency, input to presented frame | < 16 ms | **0.59 ms** median, 0.96 ms p95 frame work on a 100-item board; 1.04 ms p95 on 500 items / 1.6 GB; frames present every 16.5 ms (vsync) | `rizref --bench-frames=600 <board>` |
-| Loading a 100-item board (~200 MB) — first interactive frame | < 1 s | **905 ms** to the first frame with previews, on a *327 MB* 100-item board; the format's `load` alone takes 300 ms for 210 MB | `--bench-frames` (`board_load_ms`); `cargo bench -p rizref-format --bench board_io` |
-| Saving that board | < 500 ms incremental | **96 ms** after moving an item, **121 ms** after adding a 2 MiB image | `board_io` |
-| Release binary size | < 15 MB, single exe, no bundled C runtimes | **14.58 MB**; imports OS DLLs only | `scripts/check-imports.ps1` |
-
-Notes on reading the table:
-
-- **Cold start** is window-to-first-frame with the GPU still starting: until the
-  device is ready (on this laptop the NVIDIA driver needs ~740 ms to create it), frames
-  are the CPU-painted shell — start view, title bar, menus — copied to the window with
-  GDI, and the window takes input. Images draw from the first GPU frame. Before phase
-  07 the first frame waited for the GPU: 1,059 ms median.
-- **Frame work** is the frame's CPU time minus the time spent waiting on the swapchain
-  (acquire and present), i.e. the latency a change adds before the next vsync. The
-  plan asks for an integrated GPU; this machine has none usable, so the figures are on
-  a 2015 discrete GPU. One run showed a single 295 ms frame (out of 1,800 recorded on
-  the 100-item board), not reproduced in the other runs.
-- **Load** needed two fixes to fit: each original is now hashed once instead of twice,
-  and blob verification and preview decoding run on all cores.
-- **Size** came from the profile: thin LTO at `opt-level` 3 was 18.37 MB; fat LTO at
-  `opt-level = "s"` is 13.96 MB before the static C runtime (+0.25 MB). The runtime
-  cost (`cargo run --release -p rizref-codecs --example decode_bench`, 12 MP image):
-  JPEG decode 139 → 154 ms, PNG 116 → 154 ms. `opt-level = "z"` (12.52 MB) was
-  rejected: JPEG decode 496 ms.
-- Culling 500 items costs 5.8 µs per frame (`cargo bench -p rizref-core`).
+| Cold start to interactive canvas, 0 items | < 300 ms | **139 ms** median (first GPU frame ~0.7–1 s; the CPU-painted shell takes input before it) | `scripts/bench-startup.ps1` |
+| Pan/zoom, input to presented frame | < 16 ms | **0.54 ms** median, 0.77 ms p95 frame work; frames present every 16.5 ms (vsync) | `rizref --bench-frames=600 <board>` |
+| Load a 100-item, ~200 MB board | < 1 s | **330 ms** `load`; 905 ms to the first frame with previews on a 327 MB board | `cargo bench -p rizref-format --bench board_io` |
+| Save that board | < 500 ms incremental | **93–96 ms** | `board_io` |
+| Release binary size | < 15 MB, no bundled C runtime | **14.6 MB**, OS DLLs only | `scripts/check-imports.ps1` |
+| Note re-render, 4,000 characters | < 8 ms | **7.1–8.1 ms**, off the UI thread | `cargo test -p rizref --release -- --ignored note_budgets` |
 
 ## License
+
+Copyright (c) 2026 Muhammad Rizky Abdillah ([@MRizky099](https://github.com/MRizky099)).
 
 Licensed under either of
 
@@ -309,4 +390,10 @@ submitted for inclusion in RizRef, as defined in the Apache-2.0 license, shall b
 licensed as above, without any additional terms or conditions.
 
 The KaTeX fonts compiled into the binary for note math are licensed under the SIL Open
-Font License 1.1 (credited in About).
+Font License 1.1 (credited in **Help → About RizRef**).
+
+## Author
+
+**Muhammad Rizky Abdillah** · GitHub [@MRizky099](https://github.com/MRizky099)
+
+Bug reports and ideas are welcome in [Issues](https://github.com/MRizky099/RizRef/issues).

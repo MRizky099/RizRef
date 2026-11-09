@@ -33,7 +33,7 @@ AppId={{B7C1E2A4-5D3F-4E8B-9A61-2F4C8D9E7A13}
 AppName=RizRef
 AppVersion={#AppVersion}
 AppVerName=RizRef {#AppVersion}
-AppPublisher=RizRef
+AppPublisher=Muhammad Rizky Abdillah (MRizky099)
 AppPublisherURL=https://github.com/MRizky099/RizRef
 ; {autopf} is %LOCALAPPDATA%\Programs for a per-user install (unchanged
 ; from earlier builds) and Program Files for an all-users install.

@@ -132,6 +132,17 @@ pub fn version_line() -> String {
     format!("rizref {}", env!("CARGO_PKG_VERSION"))
 }
 
+/// The author credit shown in About and printed by `--version`.
+pub const AUTHOR: &str = "Muhammad Rizky Abdillah (MRizky099)";
+
+/// The one-line About text: version, author, project home and third-party credits.
+pub fn about_line() -> String {
+    format!(
+        "RizRef {} · by {AUTHOR} · github.com/MRizky099/RizRef · math fonts: KaTeX (SIL OFL 1.1) · F1 for shortcuts",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Command line
 // ---------------------------------------------------------------------------
@@ -197,6 +208,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => {
             println!("{}", version_line());
+            println!("by {AUTHOR}");
             return ExitCode::SUCCESS;
         }
         Some("--help" | "-h") => {
@@ -1950,13 +1962,7 @@ impl App {
                 }
             }
             Action::About => {
-                self.shell.toast(
-                    format!(
-                        "{} · pure-Rust reference board · math fonts: KaTeX (SIL OFL 1.1) · F1 for shortcuts",
-                        version_line()
-                    ),
-                    now,
-                );
+                self.shell.toast(about_line(), now);
             }
             Action::Quit => self.request_close(event_loop),
             Action::ToggleAlwaysOnTop => {
@@ -5348,9 +5354,9 @@ fn check_dialogs() {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANVAS_BACKGROUND, LOG_FILES_KEPT, Playback, ShortcutKey, WindowPlan, looks_like_image,
-        parse_args, resize_cursor, resize_direction, shortcut_key, stale_logs, tick_animations,
-        version_line,
+        CANVAS_BACKGROUND, LOG_FILES_KEPT, Playback, ShortcutKey, WindowPlan, about_line,
+        looks_like_image, parse_args, resize_cursor, resize_direction, shortcut_key, stale_logs,
+        tick_animations, version_line,
     };
     use glam::{DVec2, Vec2};
     use rizref_codecs::ImageBuffer;
@@ -5382,6 +5388,16 @@ mod tests {
 
         assert!(line.starts_with("rizref "));
         assert!(line.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn about_credits_the_author_and_the_project() {
+        let line = about_line();
+
+        assert!(line.contains(env!("CARGO_PKG_VERSION")));
+        assert!(line.contains("Muhammad Rizky Abdillah"));
+        assert!(line.contains("MRizky099"));
+        assert!(line.contains("github.com/MRizky099/RizRef"));
     }
 
     #[test]

@@ -141,9 +141,14 @@ fn version_info(version: &str) -> Vec<u8> {
         0,
         true,
         &[
+            string("CompanyName", "Muhammad Rizky Abdillah (MRizky099)"),
             string("FileDescription", "RizRef reference board"),
             string("FileVersion", version),
             string("InternalName", "rizref"),
+            string(
+                "LegalCopyright",
+                "Copyright (c) 2026 Muhammad Rizky Abdillah (MRizky099). MIT OR Apache-2.0.",
+            ),
             string("OriginalFilename", "rizref.exe"),
             string("ProductName", "RizRef"),
             string("ProductVersion", version),
