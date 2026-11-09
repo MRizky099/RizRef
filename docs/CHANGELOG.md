@@ -2,6 +2,67 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Phase 06b — Image provenance (done)
+
+Delivered on branch `feat/phase-06b-image-provenance`; closes issue #20. On-disk
+contract: [`format.md` → scene document](format.md) (`origin`, `source_path`,
+`source_url`; revision 1.2, no new members, `schema_version` stays 1).
+
+- `rizref`: `provenance.rs` — pure, tested capture helpers. `normalize_url` accepts only
+  `http`/`https` with a host, lowercases the scheme, keeps percent-encoding, and refuses
+  control characters, whitespace, backslashes and anything over 4,096 bytes.
+  `resolve_url` joins absolute, scheme-relative, root-relative, query/fragment-only and
+  dot-segment references. `parse_cf_html` reads the `CF_HTML` header with checked
+  offsets and a 4 MiB cap (a malformed header yields no URL); a tolerant `<img src>` /
+  `<base href>` scan decodes `&amp;`-style and numeric entities. `text/uri-list`,
+  `text/x-moz-url` and `UniformResourceLocatorW/A` payloads are decoded with size caps.
+- `rizref`: paste reads the raw `HTML Format` block (`platform::clipboard_html`, since
+  arboard returns only the fragment) and attaches the `<img src>` (else the page
+  `SourceURL`) to a pasted bitmap. HTML without pixels toasts "The clipboard holds a
+  link, not an image"; nothing is downloaded. Files still win over a bitmap.
+- `rizref`: the OLE drop target reads `UniformResourceLocatorW/A`, `text/uri-list`,
+  `text/x-moz-url` and `HTML Format`/`text/html`, preferring the image's own `src`,
+  and adds `DropEvent::source_url` only for a single-image drop. A registered `PNG`
+  payload without a file or virtual file imports as a virtual file named from the URL
+  (or `dropped.png`). A URL-only drag still shows "no drop".
+- `rizref`: `ImportSource::with_source_url` / `ImportedImage::source_url` thread the URL
+  through the workers. `apply_import` records it through `provenance::record_for` (a
+  URL suppresses a browser cache path; `origin` is `file` only for a path without a
+  URL, `clipboard` for URL-backed, virtual and bitmap imports) and `provenance::merge`
+  (keep an existing path/URL, fill missing fields, recompute `origin`).
+- `rizref`: `location.rs` plans *Open location* without launching — a launchable URL
+  wins, else the path (relative paths resolve against the board's folder), a moved file
+  opens its parent folder with a toast, a vanished one is reported.
+  `platform::launch` is the security boundary: the URL is re-validated and opened with
+  `ShellExecuteW("open")` (≤ 32 is a failure), and Explorer gets one raw argument,
+  `/select,"<path>"`, with quotes and control characters refused; no shell is involved.
+- `rizref`: the Image menu (title-bar ☰ menu and canvas context menu) leads with
+  **Image info…** and a dynamic **Open file location** / **Open image URL**, enabled only
+  for exactly one image (and a launchable location); they also lead the right-click menu
+  when one image is selected. No new default chord. Opening never touches the board,
+  dirty flag or undo history.
+- `rizref`: `ui/image_info.rs` — a read-only modal (~640 × 430, clamped to the
+  viewport) with the stored preview letterboxed via the new `Painter::image`, and rows
+  for location, source, format, pixels, board size, scale, file size (human and exact),
+  BLAKE3 asset id, animation frames and loop time, preview size, rotation/mirroring,
+  opacity, z-order and group. Long values are middle-elided; Open, Copy path/URL and
+  Copy asset ID buttons toast on success; `Esc`, Close or a click outside close it, and
+  pointer, wheel and keys never reach the board behind it. AccessKit publishes a modal
+  `Dialog` with full-value rows and named buttons; Tab cycles without a trap.
+- `rizref-format`: no code change. New tests cover provenance through fresh and
+  appended saves (local path, web URL, a hostile `javascript:` URL kept verbatim, and an
+  asset without a record) and a v1 asset entry without provenance members loading and
+  re-saving without them.
+- Tests: 627 workspace tests pass (3 ignored), up from 571; clippy `-D warnings` and fmt
+  clean; no dependency changes and no new `-sys` crate. The app launches cleanly.
+- Deferred: the manual browser matrix (drag and copy/paste from Chrome, Edge and
+  Firefox, a PNG-only payload, a multi-file drop, the HTML-only clipboard toast) and a
+  hand click-through of the dialog and the Explorer/browser launches were not run —
+  they need an interactive desktop, so only the parsers, planners and widgets are
+  covered by unit tests. `CF_DIBV5`-only drags stay unsupported, as planned. An OS drop
+  while the info dialog is open still imports behind it, as it does behind the close
+  guard.
+
 ## Phase 06a — Markdown notes (done)
 
 Merged 2026-11-09 in PR #21 (branch `feat/phase-06a-markdown-notes`, merge commit

@@ -3,8 +3,9 @@
 Status: **implemented** in `crates/rizref-format` (phase 06). This document is the
 normative description of the bytes; the crate is the reference implementation.
 The optional note fields in [Note payloads](#note-payloads-v11--phase-06a) are an
-additive revision implemented in phase 06a; the `source_url` provenance semantics are
-planned for phase 06b. The container and `schema_version` stay 1 in both.
+additive revision implemented in phase 06a; the `source_url` provenance semantics
+below were implemented in phase 06b. The container and `schema_version` stay 1 in
+both.
 
 A `.rizref` file is one board: the scene (items, groups, notes, assets, view), the
 original image bytes, a thumbnail and the provenance hints needed to re-link an image
@@ -149,10 +150,23 @@ reading the final 80 bytes.
   provenance is advisory; a board always loads from its embedded bytes.
 * `source_path` is a durable local path when the image was imported from one.
   `source_url` is populated for an image pasted or dragged from a browser when the
-  source exposes one (**planned, phase 06b**). It is the preferred *Open location*
-  target and only `http`/`https` URLs are ever launched. A browser drag that also
-  produces a temporary cache file stores the URL rather than the cache path; a
-  URL-only drag or clipboard link is never downloaded on paste.
+  source exposes one: the image's own `<img src>` from the `CF_HTML` fragment
+  (resolved against a `<base href>` or the page `SourceURL`), else a
+  `UniformResourceLocatorW/A`, `text/uri-list` or `text/x-moz-url` value, else the
+  page `SourceURL`. It is the preferred *Open location* target and only `http`/`https`
+  URLs are ever launched. A browser drag that also produces a temporary cache file
+  stores the URL rather than the cache path; a URL-only drag or clipboard link is never
+  downloaded on paste or drop. A writer stores the URL with its percent-encoding
+  intact, at most 4,096 bytes.
+* Readers treat both fields as untrusted. A `source_url` that is not `http`/`https`
+  (for example a hand-edited `javascript:` or `file:` value) is kept and shown, never
+  launched, and *Open location* falls back to `source_path`. A relative `source_path`
+  resolves against the board file's folder.
+* Provenance is per asset, not per item, because identical bytes are one asset. When
+  an import lands on an existing asset the records merge: an existing path or URL is
+  kept, a missing field is filled from the newer import, and `origin` is recomputed
+  (`clipboard` when a URL is recorded, `file` for a path alone). A later browser cache
+  path therefore never displaces a URL.
 * `preview` describes the corresponding `PREV` chunk when there is one.
 * `scene_rect` is informational; the live rectangle is recomputed from the items.
 
@@ -331,4 +345,4 @@ file; 2 means a bad command line.
 |---|---|---|
 | 1 | 06 | Initial container, chunk stream, index/footer, scene document, blobs and previews. |
 | 1.1 | 06a | Additive note members `text_format`, `background`, `wrap_width`. No container change; `schema_version` stays 1. |
-| 1.2 (planned) | 06b | No new members. `source_url` is populated for browser pastes/drags; `origin`/`source_path` semantics clarified. |
+| 1.2 | 06b | No new members. `source_url` is populated for browser pastes/drags; `origin`/`source_path` semantics, untrusted-URL handling and the dedup merge are specified. `schema_version` stays 1. |
