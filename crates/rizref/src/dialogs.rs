@@ -16,6 +16,21 @@
 
 use std::path::PathBuf;
 
+use winit::window::Window;
+
+/// A dialog owned by `owner` when there is one.
+///
+/// The owner matters: with always-on-top on, the RizRef window is
+/// `HWND_TOPMOST`, and an unowned dialog opened behind it — keyboard focus in
+/// a dialog nobody could see. An owned dialog is kept above its owner.
+fn dialog(owner: Option<&Window>) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new();
+    match owner {
+        Some(window) => dialog.set_parent(window),
+        None => dialog,
+    }
+}
+
 /// Extensions the open dialog offers, without dots.
 pub const IMAGE_EXTENSIONS: [&str; 13] = [
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "tga", "pnm", "qoi", "ico", "heic", "heif", "avif",
@@ -25,16 +40,16 @@ pub const IMAGE_EXTENSIONS: [&str; 13] = [
 ///
 /// Returns the chosen paths, or `None` when the user cancels — cancellation is
 /// not an error and must not be reported as one.
-pub fn pick_images() -> Option<Vec<PathBuf>> {
-    rfd::FileDialog::new()
+pub fn pick_images(owner: Option<&Window>) -> Option<Vec<PathBuf>> {
+    dialog(owner)
         .set_title("Open images")
         .add_filter("Images", &IMAGE_EXTENSIONS)
         .pick_files()
 }
 
 /// Opens the native "open board" dialog.
-pub fn pick_board() -> Option<PathBuf> {
-    rfd::FileDialog::new()
+pub fn pick_board(owner: Option<&Window>) -> Option<PathBuf> {
+    dialog(owner)
         .set_title("Open board")
         .add_filter("RizRef board", &["rizref"])
         .pick_file()
@@ -45,8 +60,8 @@ pub fn pick_board() -> Option<PathBuf> {
 /// The returned path always carries the `.rizref` extension, even when the user
 /// typed a bare name: a board whose extension is missing would not be offered
 /// back by the open dialog or the Explorer thumbnail provider.
-pub fn save_board(default_name: &str) -> Option<PathBuf> {
-    rfd::FileDialog::new()
+pub fn save_board(owner: Option<&Window>, default_name: &str) -> Option<PathBuf> {
+    dialog(owner)
         .set_title("Save board")
         .add_filter("RizRef board", &["rizref"])
         .set_file_name(default_name)
@@ -55,8 +70,8 @@ pub fn save_board(default_name: &str) -> Option<PathBuf> {
 }
 
 /// Opens the native "export board as PNG" dialog.
-pub fn export_png(default_name: &str) -> Option<PathBuf> {
-    rfd::FileDialog::new()
+pub fn export_png(owner: Option<&Window>, default_name: &str) -> Option<PathBuf> {
+    dialog(owner)
         .set_title("Export board as PNG")
         .add_filter("PNG image", &["png"])
         .set_file_name(default_name)

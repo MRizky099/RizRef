@@ -513,6 +513,10 @@ struct App {
     next_document: u32,
     /// The cached, dirty-tracked screen-space shell layer.
     ui_layer: UiLayer,
+    /// Whether the last GPU frame composited the UI layer. The renderer drops
+    /// its UI texture while the layer is hidden, so a layer that becomes
+    /// visible again is uploaded even when it was not repainted.
+    ui_was_visible: bool,
     /// Persisted settings.
     settings: Settings,
     /// The rebindable keyboard table built from the settings.
@@ -659,6 +663,7 @@ impl App {
                 Mode::Canvas
             }),
             ui_layer: UiLayer::new(),
+            ui_was_visible: false,
             document: None,
             next_document: 1,
             settings,
@@ -1118,7 +1123,7 @@ impl App {
                 .map(Document::name)
                 .unwrap_or("Board.rizref")
                 .to_owned();
-            let Some(path) = dialogs::save_board(&default) else {
+            let Some(path) = dialogs::save_board(self.window.as_deref(), &default) else {
                 return;
             };
             path
@@ -1207,7 +1212,7 @@ impl App {
                 .map(Document::stem)
                 .unwrap_or("Board")
         );
-        let Some(path) = dialogs::export_png(&default) else {
+        let Some(path) = dialogs::export_png(self.window.as_deref(), &default) else {
             return;
         };
         match rizref_format::thumbnail::export_png(
@@ -1760,7 +1765,7 @@ impl App {
                 self.redraw();
             }
             Action::OpenBoard => {
-                if let Some(path) = dialogs::pick_board() {
+                if let Some(path) = dialogs::pick_board(self.window.as_deref()) {
                     self.request_destructive(
                         PendingAction::OpenBoard(path),
                         "Discard changes",
@@ -2439,7 +2444,7 @@ impl App {
 
     /// Ctrl+O: the native multi-select image dialog.
     fn open_images(&mut self) {
-        if let Some(paths) = crate::dialogs::pick_images() {
+        if let Some(paths) = crate::dialogs::pick_images(self.window.as_deref()) {
             let drop_world = self.drop_world();
             // `import_paths` switches to the canvas only for actual images, so
             // cancelling or picking a non-image never strands the start view.
@@ -3171,6 +3176,12 @@ impl App {
     // Note chrome: hover toolbar, edit pill, background popover
     // -----------------------------------------------------------------------
 
+    /// The lowest visible logical y: note chrome flips below a note only
+    /// while it stays on screen.
+    fn chrome_bottom(&self) -> f32 {
+        self.view.viewport().y as f32
+    }
+
     /// The note's on-screen bounding box, in logical pixels.
     fn note_screen_rect(&self, id: ItemId) -> Option<ScreenRect> {
         let item = self.board.scene().item(id)?;
@@ -3212,12 +3223,16 @@ impl App {
             if self.shell.mode() != Mode::Canvas {
                 return None;
             }
-            let layout = PillLayout::new(self.note_screen_rect(session.item())?);
+            let layout = PillLayout::new(
+                self.note_screen_rect(session.item())?,
+                0.0,
+                self.chrome_bottom(),
+            );
             let hovered = cursor.and_then(|c| layout.hit(c));
             return Some(NoteChrome::Pill { layout, hovered });
         }
         let id = self.toolbar_note()?;
-        let layout = ToolbarLayout::new(self.note_screen_rect(id)?);
+        let layout = ToolbarLayout::new(self.note_screen_rect(id)?, 0.0, self.chrome_bottom());
         let background = self
             .board
             .scene()
@@ -3283,8 +3298,9 @@ impl App {
             .filter(|id| self.board.scene().item(*id).is_some_and(Item::is_note));
         // Moving from the note onto its toolbar keeps the toolbar.
         let on_toolbar = self.note_hover.filter(|id| {
-            self.note_screen_rect(*id)
-                .is_some_and(|rect| ToolbarLayout::new(rect).contains(point))
+            self.note_screen_rect(*id).is_some_and(|rect| {
+                ToolbarLayout::new(rect, 0.0, self.chrome_bottom()).contains(point)
+            })
         });
         let hover = on_toolbar.or(under);
         let mut changed = hover != self.note_hover;
@@ -3388,7 +3404,8 @@ impl App {
     fn note_color_anchor(&self, id: ItemId) -> DVec2 {
         self.note_screen_rect(id)
             .map_or(self.viewport() * 0.5, |rect| {
-                let swatch = ToolbarLayout::new(rect).button(ToolbarButton::Background);
+                let swatch = ToolbarLayout::new(rect, 0.0, self.chrome_bottom())
+                    .button(ToolbarButton::Background);
                 DVec2::new(f64::from(swatch.min.x), f64::from(swatch.max.y))
             })
     }
@@ -4439,13 +4456,12 @@ impl ApplicationHandler<AppEvent> for App {
                     );
                 }
                 let ui_visible = !picking
-                    && (self.shell.mode() == Mode::Start
-                        || self.shell.has_overlay()
-                        || self.shell.toast.is_some()
-                        || self.shell.picker
+                    && (self.shell.draws_over_board()
                         || self.window_modes.effective_click_through()
                         || self.window_modes.effective_opacity_percent() < 100);
-                let ui_bytes = if ui_visible && repaint_ui {
+                let upload_ui = repaint_ui || !self.ui_was_visible;
+                self.ui_was_visible = ui_visible;
+                let ui_bytes = if ui_visible && upload_ui {
                     self.ui_layer.upload()
                 } else {
                     None
@@ -4457,7 +4473,7 @@ impl ApplicationHandler<AppEvent> for App {
                             width: *width,
                             height: *height,
                         },
-                        None if repaint_ui => UiUpload::None,
+                        None if upload_ui => UiUpload::None,
                         None => UiUpload::Keep,
                     }
                 } else {
@@ -4943,7 +4959,7 @@ fn print_startup_summary() {
 /// phase-05 blocker best discovered on a real desktop now, which is the whole
 /// purpose of this flag.
 fn check_dialogs() {
-    match crate::dialogs::pick_images() {
+    match crate::dialogs::pick_images(None) {
         Some(paths) if !paths.is_empty() => {
             println!("chose {} file(s):", paths.len());
             for path in paths {

@@ -8,8 +8,14 @@
 
 use glam::Vec2;
 
-/// Inset of the chrome from the note's corner, in logical pixels.
+/// Gap between the chrome and the note's edge, in logical pixels. It clears
+/// the selection frame's corner handles (7 px), so a handle is never under a
+/// toolbar button.
 pub const CHROME_INSET: f32 = 8.0;
+
+/// Half-width of the strip above the note's top centre kept clear for the
+/// selection frame's rotate handle (7 px radius plus a margin).
+const ROTATE_CLEARANCE: f32 = 12.0;
 
 /// Side of a toolbar button.
 pub const TOOLBAR_BUTTON: f32 = 26.0;
@@ -50,6 +56,7 @@ impl ScreenRect {
     }
 
     /// Width and height.
+    #[cfg(test)]
     pub fn size(&self) -> Vec2 {
         self.max - self.min
     }
@@ -67,6 +74,33 @@ impl ScreenRect {
             .reduce(Vec2::max)
             .unwrap_or(Vec2::ZERO);
         Self { min, max }
+    }
+}
+
+/// Where chrome of `size` goes for `note`: outside the card so it never
+/// covers the note's text — above it at the `left` or right corner, or below
+/// it when above would leave the visible area (`top` is the topmost visible
+/// logical y) or cover the rotate handle at the top centre. A note filling
+/// the whole window has no outside left on screen (`bottom` is the lowest
+/// visible y): the chrome is then pinned to the window's top edge.
+fn outside(note: ScreenRect, size: Vec2, left: bool, top: f32, bottom: f32) -> Vec2 {
+    let x = if left {
+        note.min.x
+    } else {
+        note.max.x - size.x
+    };
+    let above = Vec2::new(x, note.min.y - CHROME_INSET - size.y);
+    let centre = (note.min.x + note.max.x) * 0.5;
+    let clear_of_rotate = x + size.x <= centre - ROTATE_CLEARANCE || x >= centre + ROTATE_CLEARANCE;
+    let below = Vec2::new(x, note.max.y + CHROME_INSET);
+    if above.y >= top && clear_of_rotate {
+        above
+    } else if below.y + size.y <= bottom || above.y < top && note.max.y < bottom {
+        below
+    } else if above.y >= top {
+        above
+    } else {
+        Vec2::new(x, top + CHROME_INSET)
     }
 }
 
@@ -124,18 +158,13 @@ pub struct ToolbarLayout {
 }
 
 impl ToolbarLayout {
-    /// Places the toolbar at the note's top-left, inset; a note too small to
-    /// hold it gets the toolbar just outside its top-left corner instead.
-    pub fn new(note: ScreenRect) -> Self {
+    /// Places the toolbar outside the note, above its top-left corner (below
+    /// its bottom-left when there is no room above): drawn over the card it
+    /// covered the note's first line (phase 07 manual test).
+    pub fn new(note: ScreenRect, top: f32, bottom: f32) -> Self {
         let width = 3.0 * TOOLBAR_BUTTON + 2.0 * TOOLBAR_GAP + 2.0 * PILL_PAD;
         let height = TOOLBAR_BUTTON + 2.0 * PILL_PAD;
-        let size = note.size();
-        let fits = size.x >= width + 2.0 * CHROME_INSET && size.y >= height + 2.0 * CHROME_INSET;
-        let origin = if fits {
-            note.min + Vec2::splat(CHROME_INSET)
-        } else {
-            Vec2::new(note.min.x, note.min.y - height - TOOLBAR_GAP)
-        };
+        let origin = outside(note, Vec2::new(width, height), true, top, bottom);
         let pill = ScreenRect::new(origin, Vec2::new(width, height));
         let buttons = ToolbarButton::ORDER.map(|button| {
             let index = ToolbarButton::ORDER
@@ -157,9 +186,16 @@ impl ToolbarLayout {
             .map(|(button, _)| *button)
     }
 
-    /// Whether `point` is anywhere on the toolbar.
+    /// Whether `point` is on the toolbar or the gap between it and the note,
+    /// so the pointer can travel from the note to a button without the
+    /// toolbar disappearing on the way.
     pub fn contains(&self, point: Vec2) -> bool {
-        self.pill.contains(point)
+        let bridge = Vec2::new(0.0, CHROME_INSET);
+        ScreenRect {
+            min: self.pill.min - bridge,
+            max: self.pill.max + bridge,
+        }
+        .contains(point)
     }
 
     /// The rectangle of one button.
@@ -183,18 +219,12 @@ pub struct PillLayout {
 }
 
 impl PillLayout {
-    /// Places the pill at the note's top-right, inset; it moves outside the
-    /// note's top-right corner when the note is too small to hold it.
-    pub fn new(note: ScreenRect) -> Self {
+    /// Places the pill outside the note, above its top-right corner (below
+    /// its bottom-right when there is no room above), clear of the text.
+    pub fn new(note: ScreenRect, top: f32, bottom: f32) -> Self {
         let width = 2.0 * PILL_BUTTON + TOOLBAR_GAP + 2.0 * PILL_PAD;
         let height = PILL_BUTTON + 2.0 * PILL_PAD;
-        let size = note.size();
-        let fits = size.x >= width + 2.0 * CHROME_INSET && size.y >= height + 2.0 * CHROME_INSET;
-        let origin = if fits {
-            Vec2::new(note.max.x - CHROME_INSET - width, note.min.y + CHROME_INSET)
-        } else {
-            Vec2::new(note.max.x - width, note.min.y - height - TOOLBAR_GAP)
-        };
+        let origin = outside(note, Vec2::new(width, height), false, top, bottom);
         let pill = ScreenRect::new(origin, Vec2::new(width, height));
         let cancel = ScreenRect::new(origin + Vec2::splat(PILL_PAD), Vec2::splat(PILL_BUTTON));
         let confirm = ScreenRect::new(
@@ -254,8 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn the_toolbar_is_swatch_pencil_trash_from_the_top_left() {
-        let layout = ToolbarLayout::new(note());
+    fn the_toolbar_is_swatch_pencil_trash_above_the_top_left() {
+        let layout = ToolbarLayout::new(note(), 0.0, 10_000.0);
         let order: Vec<ToolbarButton> = layout.buttons.iter().map(|(b, _)| *b).collect();
         assert_eq!(
             order,
@@ -265,7 +295,8 @@ mod tests {
                 ToolbarButton::Delete
             ]
         );
-        assert_eq!(layout.pill.min, Vec2::splat(100.0 + CHROME_INSET));
+        assert_eq!(layout.pill.min.x, 100.0);
+        assert_eq!(layout.pill.max.y, 100.0 - CHROME_INSET, "above the card");
         let xs: Vec<f32> = layout.buttons.iter().map(|(_, r)| r.min.x).collect();
         assert!(xs[0] < xs[1] && xs[1] < xs[2]);
         for (button, rect) in layout.buttons {
@@ -276,19 +307,66 @@ mod tests {
         assert_eq!(layout.hit(Vec2::new(300.0, 300.0)), None);
     }
 
-    #[test]
-    fn a_small_note_gets_the_toolbar_outside_its_corner() {
-        let small = ScreenRect::new(Vec2::new(50.0, 80.0), Vec2::new(40.0, 30.0));
-        let layout = ToolbarLayout::new(small);
-        assert!(layout.pill.max.y < small.min.y, "above the note");
-        assert_eq!(layout.pill.min.x, small.min.x);
+    fn overlaps(a: ScreenRect, b: ScreenRect) -> bool {
+        a.min.x < b.max.x && b.min.x < a.max.x && a.min.y < b.max.y && b.min.y < a.max.y
     }
 
     #[test]
-    fn the_pill_puts_confirm_rightmost_at_the_top_right() {
-        let layout = PillLayout::new(note());
+    fn the_chrome_never_covers_the_note_at_any_zoom() {
+        // From a 20 px speck to a note far bigger than the window, near the
+        // top edge and away from it: neither the toolbar nor the pill
+        // overlaps the card.
+        for size in [20.0, 60.0, 150.0, 360.0, 4000.0] {
+            for top_y in [-500.0, 0.0, 10.0, 60.0, 300.0] {
+                let note = ScreenRect::new(Vec2::new(50.0, top_y), Vec2::new(size, size * 0.6));
+                let toolbar = ToolbarLayout::new(note, 0.0, 10_000.0);
+                let pill = PillLayout::new(note, 0.0, 10_000.0);
+                assert!(!overlaps(toolbar.pill, note), "toolbar {size} at {top_y}");
+                assert!(!overlaps(pill.pill, note), "pill {size} at {top_y}");
+            }
+        }
+    }
+
+    #[test]
+    fn without_room_above_the_chrome_flips_below() {
+        let note = ScreenRect::new(Vec2::new(50.0, 10.0), Vec2::new(360.0, 200.0));
+        let toolbar = ToolbarLayout::new(note, 0.0, 10_000.0);
+        assert_eq!(toolbar.pill.min.y, note.max.y + CHROME_INSET);
+        let pill = PillLayout::new(note, 0.0, 10_000.0);
+        assert_eq!(pill.pill.min.y, note.max.y + CHROME_INSET);
+    }
+
+    #[test]
+    fn a_note_filling_the_window_pins_the_chrome_to_its_top() {
+        let huge = ScreenRect::new(Vec2::new(-100.0, -300.0), Vec2::new(2000.0, 2000.0));
+        let toolbar = ToolbarLayout::new(huge, 0.0, 400.0);
+        assert_eq!(toolbar.pill.min.y, CHROME_INSET, "visible, at the top");
+    }
+
+    #[test]
+    fn a_narrow_note_keeps_its_rotate_handle_clear() {
+        // The toolbar would reach the top-centre rotate handle: it goes below.
+        let narrow = ScreenRect::new(Vec2::new(50.0, 200.0), Vec2::new(80.0, 60.0));
+        let layout = ToolbarLayout::new(narrow, 0.0, 10_000.0);
+        assert!(layout.pill.min.y > narrow.max.y, "below the note");
+        assert_eq!(layout.pill.min.x, narrow.min.x);
+    }
+
+    #[test]
+    fn the_gap_between_note_and_toolbar_keeps_the_toolbar() {
+        let note = note();
+        let layout = ToolbarLayout::new(note, 0.0, 10_000.0);
+        // A point in the gap, straight below the first button.
+        let gap = Vec2::new(layout.buttons[0].1.min.x + 2.0, note.min.y - 2.0);
+        assert!(layout.contains(gap));
+    }
+
+    #[test]
+    fn the_pill_puts_confirm_rightmost_above_the_top_right() {
+        let layout = PillLayout::new(note(), 0.0, 10_000.0);
         assert!(layout.confirm.min.x > layout.cancel.min.x);
-        assert!((layout.pill.max.x - (460.0 - CHROME_INSET)).abs() < 0.01);
+        assert!((layout.pill.max.x - 460.0).abs() < 0.01);
+        assert_eq!(layout.pill.max.y, 100.0 - CHROME_INSET);
         assert_eq!(layout.cancel.size(), Vec2::splat(28.0));
         let centre = |rect: ScreenRect| (rect.min + rect.max) * 0.5;
         assert_eq!(
@@ -302,8 +380,16 @@ mod tests {
     #[test]
     fn the_layout_is_screen_constant() {
         // The same note at two zoom levels: the buttons keep their size.
-        let near = ToolbarLayout::new(ScreenRect::new(Vec2::ZERO, Vec2::new(2000.0, 1500.0)));
-        let far = ToolbarLayout::new(ScreenRect::new(Vec2::ZERO, Vec2::new(200.0, 150.0)));
+        let near = ToolbarLayout::new(
+            ScreenRect::new(Vec2::ZERO, Vec2::new(2000.0, 1500.0)),
+            0.0,
+            10_000.0,
+        );
+        let far = ToolbarLayout::new(
+            ScreenRect::new(Vec2::ZERO, Vec2::new(200.0, 150.0)),
+            0.0,
+            10_000.0,
+        );
         assert_eq!(near.buttons[0].1.size(), far.buttons[0].1.size());
     }
 }

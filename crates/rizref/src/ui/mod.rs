@@ -139,6 +139,21 @@ impl Shell {
             || self.image_info.is_some()
     }
 
+    /// Whether the shell draws anything over the board this frame, so the GPU
+    /// frame must composite the UI layer.
+    ///
+    /// The revealed title bar and tooltips count: leaving them out (phase 05
+    /// to 07) meant hovering the top strip of a board updated the bar's state
+    /// but never drew it — it showed only on the start view or over a panel.
+    pub fn draws_over_board(&self) -> bool {
+        self.mode() == Mode::Start
+            || self.has_overlay()
+            || self.toast.is_some()
+            || self.picker
+            || self.title_bar.visible()
+            || self.tooltip.is_some()
+    }
+
     /// Opens the image information dialog, closing the other overlays.
     pub fn open_image_info(&mut self, panel: image_info::ImageInfoPanel) {
         self.menu = None;
@@ -636,6 +651,23 @@ mod tests {
         layer.scale = 1.0;
         // A pixmap is still required; the dummy values model a built layer.
         assert!(layer.needs_paint(viewport, 1.0, 1), "no pixmap yet");
+    }
+
+    #[test]
+    fn a_revealed_title_bar_is_drawn_over_the_board() {
+        let mut shell = Shell::new(Mode::Canvas);
+        let viewport = DVec2::new(600.0, 400.0);
+        assert!(!shell.draws_over_board(), "a bare board draws no UI");
+
+        // The pointer 1 px inside the top edge reveals the bar ...
+        assert!(
+            shell
+                .title_bar
+                .pointer_moved(Some(DVec2::new(78.0, 1.0)), viewport, true)
+        );
+
+        // ... and the frame must then composite the UI layer.
+        assert!(shell.draws_over_board());
     }
 
     #[test]
