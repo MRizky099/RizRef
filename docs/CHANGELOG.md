@@ -34,6 +34,12 @@ unchanged: the Win32 code moved, it was not rewritten.
   the window gets its icon and `WM_CLASS`/`app_id` `rizref`; error boxes go through
   `rfd`; clipboard HTML through `arboard` (an absolute `<img src>` is the source URL).
   File drops use winit's `DroppedFile` (X11 and macOS).
+- **GPU on macOS:** wgpu's `metal` feature is enabled for `target_os = "macos"` only
+  (Windows stays DX12 + Vulkan, Linux Vulkan); `RIZREF_GPU_BACKEND=metal` is accepted.
+  `renderer::has_usable_backend` guards every `wgpu::Instance::new`, so a build without
+  a backend for its OS logs an error and shows the "no GPU surface" alert, naming the
+  API that OS needs, instead of panicking. The offscreen pipeline test skips, saying
+  so, only when no adapter exists.
 - **Fonts:** with `fontconfig` still off, `cosmic-text` scans system font directories;
   on Linux and macOS KaTeX_SansSerif (already embedded for math, SIL OFL 1.1) is added
   as the last-resort face so a system without fonts still renders text.

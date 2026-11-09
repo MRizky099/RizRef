@@ -1076,12 +1076,16 @@ mod tests {
     /// (CI runners without Vulkan/DX12) skip it rather than fail it.
     #[test]
     fn the_pipelines_render_an_offscreen_frame() {
+        // A missing backend feature is a build bug, asserted by the renderer
+        // tests; here it would only turn into wgpu's panic.
+        assert!(crate::renderer::has_usable_backend());
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = crate::renderer::preferred_backends();
         let instance = wgpu::Instance::new(descriptor);
-        let adapters = pollster::block_on(
-            instance.enumerate_adapters(wgpu::Backends::VULKAN | wgpu::Backends::DX12),
-        );
+        // CI runners may have no GPU (or only a software one): the test then
+        // skips, saying so, rather than failing.
+        let adapters =
+            pollster::block_on(instance.enumerate_adapters(crate::renderer::preferred_backends()));
         let adapter = adapters.into_iter().next();
         let Some(adapter) = adapter else {
             eprintln!("skipping: no GPU adapter in this environment");

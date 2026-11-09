@@ -50,6 +50,12 @@ windows-core.workspace = true
 # `rizref thumbnail` (the freedesktop thumbnailer) and the icon PNGs inside the
 # committed `.ico` assets, plus the fallback UI font. On Windows the exe never
 # links `rizref-thumb`, whose COM exports belong to the DLL.
+# macOS renders through Metal, and only macOS compiles wgpu's Metal backend
+# (`objc2-metal` / `objc2-quartz-core` declarations; the framework ships with
+# the OS). Windows stays DX12 + Vulkan, Linux Vulkan.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
 [target.'cfg(unix)'.dependencies]
 rizref-thumb = { path = "../rizref-thumb" }
 ratex-katex-fonts.workspace = true

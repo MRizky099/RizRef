@@ -4022,7 +4022,10 @@ impl App {
                 // images yet; be loud and honest rather than a grey box.
                 platform::alert(
                     "RizRef",
-                    "RizRef could not initialise a GPU surface (Vulkan or DirectX 12)\nand must close.",
+                    &format!(
+                        "RizRef could not initialise a GPU surface ({})\nand must close.",
+                        crate::renderer::backend_requirement()
+                    ),
                 );
                 event_loop.exit();
             }

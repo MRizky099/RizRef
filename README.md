@@ -311,7 +311,7 @@ crates. These are the pinned versions:
 | Concern | Crate | Version | Notes |
 |---|---|---|---|
 | Windowing/input | `winit` | 0.30.13 | pure Rust; `windows-sys` on Windows, X11/Wayland through `dlopen` on Linux, `objc2` on macOS |
-| GPU rendering | `wgpu` | 30.0.1 | DX12 + Vulkan; Metal/WebGPU/GL off |
+| GPU rendering | `wgpu` | 30.0.1 | DX12 + Vulkan on Windows, Vulkan on Linux, **Metal on macOS** (`metal` is a macOS-only feature); WebGPU/GL off |
 | 2D raster fallback, HUD | `tiny-skia` | 0.12.0 | pure Rust |
 | Text shaping | `cosmic-text` | 0.19.0 | `fontconfig` off (it is a C library) |
 | Markdown (notes) | `pulldown-cmark` | 0.13.6 | `default-features = false`: no CLI, no HTML renderer |
@@ -369,6 +369,7 @@ states:
 | Linux | `linux-raw-sys` | `rustix`'s system-call declarations, pure Rust |
 | macOS | `core-foundation-sys` | CoreFoundation declarations; the framework ships with the OS |
 | macOS | `objc-sys` | Objective-C runtime declarations (`objc2` 0.5, via winit and AccessKit); `libobjc` ships with the OS |
+| macOS | — | Metal adds no `-sys` crate: `objc2-metal` / `objc2-quartz-core` are declaration crates for frameworks that ship with the OS (audited for `aarch64-apple-darwin` and `x86_64-apple-darwin`) |
 | all | `renderdoc-sys`, the `windows-sys` family | as above (Win32 crates appear only as host-side build-tool dependencies off Windows) |
 
 `wayland-backend` lists `cc` as a build dependency but compiles its C log shim only with

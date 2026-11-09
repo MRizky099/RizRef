@@ -94,9 +94,9 @@ accesskit_winit = { version = "0.32.2", default-features = false, features = ["r
 # The import worker pool: std threads coordinated by bounded/unbounded MPMC
 # channels. Pure Rust, no async runtime.
 crossbeam-channel = "0.5.17"
-# Backend order: Vulkan -> DX12 (see README.md); the Metal and WebGPU backends are
-# switched off deliberately, and the GL fallback is dropped by decision rather than
-# left ambiguous.
+# Backend order: DX12 -> Vulkan on Windows, Vulkan on Linux (see README.md). Metal is
+# added for macOS only, by `crates/rizref/Cargo.toml`'s macOS target table; WebGPU
+# stays off, and the GL fallback is dropped by decision rather than left ambiguous.
 #
 # `gles` is deliberately NOT enabled here: it pulls `glutin_wgl_sys`, an `-sys`
 # crate outside the accepted `windows` family, which the pure-Rust rule does not

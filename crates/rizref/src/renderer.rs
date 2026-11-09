@@ -18,6 +18,10 @@ use crate::textures::{MAX_TEXTURE_SIDE, TextureCache};
 
 /// Backends this build tries, in preference order.
 ///
+/// macOS has exactly one: **Metal** (the `metal` wgpu feature is enabled for
+/// `target_os = "macos"` only; Vulkan there would need MoltenVK, a C++
+/// library).
+///
 /// On Windows DX12 is tried first (phase 07): presented through a
 /// DirectComposition visual it is the one backend whose window surface
 /// composites per-pixel alpha, which canvas-only transparency needs, and it
@@ -32,7 +36,31 @@ use crate::textures::{MAX_TEXTURE_SIDE, TextureCache};
 /// Vulkan/DX12 driver is the CPU raster path (`tiny-skia`), not OpenGL. See
 /// the dependency audit in the repository README.
 pub fn preferred_backends() -> wgpu::Backends {
-    wgpu::Backends::VULKAN | wgpu::Backends::DX12
+    if cfg!(target_os = "macos") {
+        wgpu::Backends::METAL
+    } else {
+        wgpu::Backends::VULKAN | wgpu::Backends::DX12
+    }
+}
+
+/// Whether this build was compiled with at least one wgpu backend this OS can
+/// run. `wgpu::Instance::new` panics without one, so every instance is
+/// created behind this check: a build with the wrong feature set reports a
+/// GPU failure (and the app shows its "no GPU surface" alert) instead of
+/// aborting on a panic.
+pub fn has_usable_backend() -> bool {
+    wgpu::Instance::enabled_backend_features().intersects(preferred_backends())
+}
+
+/// The GPU APIs this OS's build can use, for messages.
+pub fn backend_requirement() -> &'static str {
+    if cfg!(windows) {
+        "DirectX 12 or Vulkan"
+    } else if cfg!(target_os = "macos") {
+        "Metal"
+    } else {
+        "Vulkan"
+    }
 }
 
 /// The backend order as a list, for the adapter walk.
@@ -49,6 +77,8 @@ fn backend_priority() -> Vec<wgpu::Backends> {
 fn default_priority() -> Vec<wgpu::Backends> {
     if cfg!(windows) {
         vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN]
+    } else if cfg!(target_os = "macos") {
+        vec![wgpu::Backends::METAL]
     } else {
         vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12]
     }
@@ -59,6 +89,7 @@ fn backend_override(value: Option<&str>) -> Option<wgpu::Backends> {
     match value?.trim().to_ascii_lowercase().as_str() {
         "dx12" | "d3d12" => Some(wgpu::Backends::DX12),
         "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
+        "metal" | "mtl" => Some(wgpu::Backends::METAL),
         _ => None,
     }
 }
@@ -233,6 +264,14 @@ impl GpuDevice {
     /// express order. Hardware adapters win over software ones inside a
     /// backend; every adapter found is logged at debug for bug reports.
     pub fn create() -> Option<Self> {
+        if !has_usable_backend() {
+            tracing::error!(
+                compiled = %describe_backends(wgpu::Instance::enabled_backend_features()),
+                wanted = %describe_backends(preferred_backends()),
+                "this build has no GPU backend for this OS"
+            );
+            return None;
+        }
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = instance_backends();
         // A swapchain on a DirectComposition visual rather than on the HWND:
@@ -630,6 +669,8 @@ mod tests {
         let order = default_priority();
         if cfg!(windows) {
             assert_eq!(order, [wgpu::Backends::DX12, wgpu::Backends::VULKAN]);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(order, [wgpu::Backends::METAL]);
         } else {
             assert_eq!(order[0], wgpu::Backends::VULKAN);
         }
@@ -648,8 +689,17 @@ mod tests {
     use crate::app::CANVAS_BACKGROUND;
 
     #[test]
-    fn this_build_prefers_vulkan_then_dx12() {
-        assert_eq!(describe_backends(preferred_backends()), "vulkan -> dx12");
+    fn this_build_prefers_its_platform_backends() {
+        let expected = if cfg!(target_os = "macos") {
+            "metal"
+        } else {
+            "vulkan -> dx12"
+        };
+        assert_eq!(describe_backends(preferred_backends()), expected);
+        assert_eq!(
+            super::backend_override(Some("Metal")),
+            Some(wgpu::Backends::METAL)
+        );
         assert_eq!(
             super::backend_override(Some("DX12")),
             Some(wgpu::Backends::DX12)
@@ -660,6 +710,18 @@ mod tests {
         );
         assert_eq!(super::backend_override(Some("gl")), None);
         assert_eq!(super::backend_override(None), None);
+    }
+
+    #[test]
+    fn every_build_compiles_a_backend_its_os_can_run() {
+        // The macOS CI failure this guards: wgpu without `metal` panics in
+        // `Instance::new` on macOS.
+        assert!(
+            super::has_usable_backend(),
+            "compiled backends {} do not include {}",
+            describe_backends(wgpu::Instance::enabled_backend_features()),
+            describe_backends(preferred_backends())
+        );
     }
 
     #[test]
