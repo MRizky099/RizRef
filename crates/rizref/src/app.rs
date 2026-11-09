@@ -589,6 +589,9 @@ enum PendingAction {
     NewBoard,
     /// Replace the board with the file at this path.
     OpenBoard(PathBuf),
+    /// The launch-time crash-recovery offer: its safe button restores this
+    /// copy, its destructive one deletes it.
+    Recover(Recovery),
 }
 
 impl App {
@@ -786,15 +789,17 @@ impl App {
     /// unclean previous exit that left nothing to recover.
     fn offer_recovery(&mut self) {
         let recoveries = std::mem::take(&mut self.pending_recoveries);
-        if let Some(recovery) = recoveries.first() {
-            let text = autosave::prompt_text(recovery, now_unix());
-            if platform::confirm("RizRef recovered", &text) {
-                self.restore_recovery(recovery);
-            } else {
-                tracing::info!(board = %recovery.board.display(), "recovery declined");
-                let _ = std::fs::remove_file(&recovery.board);
-                let _ = std::fs::remove_file(&recovery.sidecar);
-            }
+        if let Some(recovery) = recoveries.into_iter().next() {
+            // An in-app dialog, painted with the first frames: a native modal
+            // box opened here, before the window had ever presented, was
+            // never shown and blocked the event loop (manual test 7.7).
+            let (message, note) = autosave::prompt_text(&recovery, now_unix());
+            let dialog = panels::ConfirmClose::recovery(message, note);
+            tracing::info!(board = %recovery.board.display(), "offering recovery");
+            self.pending_action = Some(PendingAction::Recover(recovery));
+            self.shell.title_bar.hide();
+            self.shell.open_recovery(dialog);
+            self.redraw();
             return;
         }
         if self.previous_session == PreviousSession::Crashed {
@@ -879,11 +884,27 @@ impl App {
         }
     }
 
+    /// The dialog's safe button (or Esc): keeps the document open — or, for
+    /// the recovery offer, restores the copy.
+    fn cancel_confirm(&mut self) {
+        self.shell.close_confirm_close();
+        if let Some(PendingAction::Recover(recovery)) = self.pending_action.take() {
+            self.restore_recovery(&recovery);
+        }
+        self.redraw();
+    }
+
     /// Confirms the unsaved-changes guard and runs the pending action.
     fn confirm_discard(&mut self, event_loop: &ActiveEventLoop) {
         self.shell.confirm_close = None;
         self.shell.touch();
         match self.pending_action.take() {
+            Some(PendingAction::Recover(recovery)) => {
+                tracing::info!(board = %recovery.board.display(), "recovery declined");
+                let _ = std::fs::remove_file(&recovery.board);
+                let _ = std::fs::remove_file(&recovery.sidecar);
+                self.redraw();
+            }
             Some(PendingAction::NewBoard) => self.new_board_now(),
             Some(PendingAction::OpenBoard(path)) => {
                 self.open_board_now(&path);
@@ -901,7 +922,7 @@ impl App {
                 PendingAction::OpenBoard(path) => {
                     self.open_board_now(&path);
                 }
-                PendingAction::Quit => {}
+                PendingAction::Quit | PendingAction::Recover(_) => {}
             }
             return;
         }
@@ -1696,10 +1717,7 @@ impl App {
     fn execute(&mut self, action: Action, event_loop: &ActiveEventLoop) {
         if self.shell.confirm_close.is_some() {
             match action {
-                Action::ConfirmCloseCancel => {
-                    self.shell.close_confirm_close();
-                    self.redraw();
-                }
+                Action::ConfirmCloseCancel => self.cancel_confirm(),
                 Action::ConfirmCloseDiscard => self.confirm_discard(event_loop),
                 // The close guard is modal: nothing behind it runs.
                 _ => {}
@@ -3608,6 +3626,9 @@ impl App {
             Some(renderer) => {
                 self.startup.mark(Milestone::Gpu);
                 self.renderer = Some(renderer);
+                // The CPU frames consumed the UI layer; the GPU's first frame
+                // must upload it, not `Keep` a texture it never had.
+                self.ui_layer.invalidate();
                 // Anything opened during the CPU frames gets its previews now.
                 self.upload_asset_previews();
                 if self.bench_frames.is_some() {
@@ -3976,10 +3997,7 @@ impl ApplicationHandler<AppEvent> for App {
                             .as_mut()
                             .map(|dialog| dialog.pointer_click(position, viewport));
                         match choice {
-                            Some(CloseChoice::Cancel) => {
-                                self.shell.close_confirm_close();
-                                self.redraw();
-                            }
+                            Some(CloseChoice::Cancel) => self.cancel_confirm(),
                             Some(CloseChoice::Discard) => self.confirm_discard(event_loop),
                             _ => {}
                         }
@@ -4229,10 +4247,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 .map(|dialog| dialog.key(chord))
                         });
                         match choice {
-                            Some(CloseChoice::Cancel) => {
-                                self.shell.close_confirm_close();
-                                self.redraw();
-                            }
+                            Some(CloseChoice::Cancel) => self.cancel_confirm(),
                             Some(CloseChoice::Discard) => self.confirm_discard(event_loop),
                             Some(CloseChoice::Changed) => {
                                 self.shell.touch();

@@ -173,6 +173,16 @@ impl Shell {
         );
     }
 
+    /// Opens the crash-recovery offer over whatever is showing.
+    pub fn open_recovery(&mut self, dialog: panels::ConfirmClose) {
+        self.menu = None;
+        self.shortcuts = None;
+        self.settings = None;
+        self.image_info = None;
+        self.confirm_close = Some(dialog);
+        self.touch();
+    }
+
     /// Opens the unsaved-changes guard for a non-close destructive step.
     pub fn open_confirm(&mut self, title: String, discard_label: &str, note: &str) {
         if self.confirm_close.is_some() {
@@ -311,6 +321,16 @@ impl UiLayer {
             scale: 1.0,
             built_revision: 0,
         }
+    }
+
+    /// Forces the next [`needs_paint`](Self::needs_paint) to say yes.
+    ///
+    /// The GPU attaches after the CPU frames have already painted (and
+    /// consumed) the layer; without this, its first frame would `Keep` a UI
+    /// texture that was never uploaded and show a bare canvas until the next
+    /// shell change (phase 07 manual test: a blank start view until a click).
+    pub fn invalidate(&mut self) {
+        self.pixmap = None;
     }
 
     /// Whether the layer must be repainted for this size/scale/revision.
@@ -508,7 +528,7 @@ fn paint_picker_hint(painter: &mut Painter, viewport: DVec2, cursor: DVec2) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, Shell, TOAST_LIFETIME, UiLayer};
+    use super::{Mode, Shell, TOAST_LIFETIME, UiLayer, panels};
     use glam::DVec2;
     use std::time::{Duration, Instant};
 
@@ -616,5 +636,37 @@ mod tests {
         layer.scale = 1.0;
         // A pixmap is still required; the dummy values model a built layer.
         assert!(layer.needs_paint(viewport, 1.0, 1), "no pixmap yet");
+    }
+
+    #[test]
+    fn invalidating_a_built_layer_forces_a_repaint() {
+        // The GPU attaches after the CPU frames painted the layer: its first
+        // frame must repaint and upload it, or the start view is blank.
+        let mut layer = UiLayer::new();
+        let viewport = DVec2::new(800.0, 600.0);
+        layer.pixmap = tiny_skia::Pixmap::new(800, 600);
+        layer.built_revision = 1;
+        layer.width = 800;
+        layer.height = 600;
+        layer.scale = 1.0;
+        assert!(!layer.needs_paint(viewport, 1.0, 1), "built and current");
+
+        layer.invalidate();
+
+        assert!(layer.needs_paint(viewport, 1.0, 1));
+    }
+
+    #[test]
+    fn the_recovery_offer_is_modal_and_replaces_other_overlays() {
+        let mut shell = Shell::new(Mode::Start);
+        shell.open_recovery(panels::ConfirmClose::recovery(
+            "\"Board\" (3 items) was not saved.".to_owned(),
+            "It belongs to x.rizref.".to_owned(),
+        ));
+
+        assert!(shell.has_overlay());
+        let dialog = shell.confirm_close.as_ref().expect("open");
+        assert_eq!(dialog.heading, "Recover unsaved work");
+        assert_eq!(dialog.cancel_label, "Restore");
     }
 }

@@ -8,8 +8,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDYES, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_YESNO, MESSAGEBOX_STYLE,
-    MessageBoxW,
+    MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MESSAGEBOX_STYLE, MessageBoxW,
 };
 use windows::core::PCWSTR;
 
@@ -44,22 +43,6 @@ fn show(title: &str, message: &str) {
     unsafe {
         MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(caption.as_ptr()), flags);
     }
-}
-
-/// Asks a yes/no question; `true` for Yes.
-///
-/// Used once per launch, by the crash-recovery prompt, before the board is
-/// interactive — the one moment a modal native box is the right shape.
-// SAFETY: as for `show`: two NUL-terminated buffers that outlive the call and
-// a null owner window.
-#[allow(unsafe_code)]
-pub fn confirm(title: &str, message: &str) -> bool {
-    let flags: MESSAGEBOX_STYLE = MB_YESNO | MB_SETFOREGROUND | MB_ICONWARNING;
-    let text = wide(message);
-    let caption = wide(title);
-    let answer =
-        unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(caption.as_ptr()), flags) };
-    answer == IDYES
 }
 
 /// Reports an error that ends the process.

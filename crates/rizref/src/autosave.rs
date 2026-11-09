@@ -238,8 +238,9 @@ pub fn release_session(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// The recovery prompt's text for `recovery`, given the current time.
-pub fn prompt_text(recovery: &Recovery, now_unix: u64) -> String {
+/// The recovery offer's two body lines for `recovery`, given the current
+/// time: what was saved and when, then whose work it is.
+pub fn prompt_text(recovery: &Recovery, now_unix: u64) -> (String, String) {
     let age = now_unix.saturating_sub(recovery.info.saved_unix);
     let when = match age {
         0..=59 => "less than a minute ago".to_owned(),
@@ -251,12 +252,12 @@ pub fn prompt_text(recovery: &Recovery, now_unix: u64) -> String {
         || "a board that was never saved".to_owned(),
         |p| p.display().to_string(),
     );
-    format!(
-        "RizRef did not close properly last time.\n\n\
-         Unsaved work on \"{}\" ({} items, autosaved {when}) can be restored.\n\
-         It belongs to {target}.\n\n\
-         Restore it now? Choosing No deletes the recovery copy.",
-        recovery.info.name, recovery.info.items
+    (
+        format!(
+            "\"{}\" ({} items, autosaved {when}) was not saved.",
+            recovery.info.name, recovery.info.items
+        ),
+        format!("RizRef did not close properly. It belongs to {target}."),
     )
 }
 
@@ -498,12 +499,12 @@ mod tests {
             },
         };
 
-        let text = prompt_text(&recovery, 1_000 + 125);
+        let (message, note) = prompt_text(&recovery, 1_000 + 125);
 
         assert!(
-            text.contains("\"Moodboard\" (12 items, autosaved 2 min ago)"),
-            "{text}"
+            message.contains("\"Moodboard\" (12 items, autosaved 2 min ago)"),
+            "{message}"
         );
-        assert!(text.contains("never saved"));
+        assert!(note.contains("never saved"), "{note}");
     }
 }

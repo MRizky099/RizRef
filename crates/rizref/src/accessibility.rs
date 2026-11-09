@@ -278,20 +278,20 @@ fn build_update(
 
     if let Some(dialog) = confirm_close {
         let mut node = Node::new(Role::Dialog);
-        node.set_label("Unsaved changes");
-        node.set_description(dialog.title.as_str());
+        node.set_label(dialog.heading.as_str());
+        node.set_description(dialog.message.as_str());
         node.push_child(NodeId(CONFIRM_CANCEL_ID));
         node.push_child(NodeId(CONFIRM_DISCARD_ID));
         nodes.push((NodeId(CONFIRM_ID), node));
 
         let mut cancel = Node::new(Role::Button);
-        cancel.set_label("Cancel");
+        cancel.set_label(dialog.cancel_label.as_str());
         cancel.add_action(A11yAction::Click);
         actions.insert(CONFIRM_CANCEL_ID, Action::ConfirmCloseCancel);
         nodes.push((NodeId(CONFIRM_CANCEL_ID), cancel));
 
         let mut discard = Node::new(Role::Button);
-        discard.set_label("Close without saving");
+        discard.set_label(dialog.discard_label.as_str());
         discard.add_action(A11yAction::Click);
         actions.insert(CONFIRM_DISCARD_ID, Action::ConfirmCloseDiscard);
         nodes.push((NodeId(CONFIRM_DISCARD_ID), discard));

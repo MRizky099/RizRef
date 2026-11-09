@@ -37,5 +37,5 @@ pub mod single_instance;
 pub mod window_modes;
 
 pub use drop_target::{DropEvent, Registration as DropRegistration};
-pub use message_box::{alert, confirm};
+pub use message_box::alert;
 pub use single_instance::{SingleInstance, forward_args_to_primary, serve_forwarded_args};
