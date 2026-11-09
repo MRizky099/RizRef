@@ -229,6 +229,12 @@ pub fn run(args: Vec<String>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // The benches measure a launch of their own: they neither hand their
+    // arguments to a running RizRef nor touch its session marker.
+    if parsed.exit_after_first_frame || parsed.bench_frames.is_some() {
+        return run_window(None, parsed, startup);
+    }
+
     match SingleInstance::acquire() {
         Ok(guard) => run_window(Some(guard), parsed, startup),
         Err(()) => {
@@ -1060,6 +1066,7 @@ impl App {
         if let Err(error) = self.recents.save() {
             tracing::warn!(%error, "cannot save the recent-board list");
         }
+        launch::add_to_recent_documents(path);
     }
 
     /// Saves the board to its file, or asks for one first.
@@ -1138,6 +1145,20 @@ impl App {
                     generation = report.generation,
                     "board saved"
                 );
+            }
+            Err(error) if error.is_denied() && existing => {
+                // Read-only file, read-only share, or a lock another program
+                // holds: retrying cannot help, saving elsewhere can.
+                tracing::warn!(path = %path.display(), %error, "save refused; offering Save As");
+                self.shell.toast(
+                    format!(
+                        "{} is read-only or in use — choose where to save a copy",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    now,
+                );
+                self.save_document(true);
+                return;
             }
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "cannot save board");
@@ -1770,6 +1791,15 @@ impl App {
                 self.commit_note_edit();
                 self.shell.toggle_settings();
                 self.redraw();
+            }
+            Action::OpenLogsFolder => {
+                let dir = logs_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                if let Err(error) = launch::open_folder(&dir) {
+                    tracing::warn!(dir = %dir.display(), ?error, "cannot open the logs folder");
+                    self.shell
+                        .toast(format!("Could not open {}", dir.display()), now);
+                }
             }
             Action::About => {
                 self.shell.toast(
@@ -4645,19 +4675,26 @@ fn run_window(
 
     // The pipe server must exist before the window: a secondary that arrives
     // during startup finds it waiting instead of racing it.
+    let benchmark = parsed.exit_after_first_frame || parsed.bench_frames.is_some();
     let proxy = event_loop.create_proxy();
     let app_proxy = proxy.clone();
-    serve_forwarded_args(move |args| {
-        let _ = proxy.send_event(AppEvent::ForwardedArgs(args));
-    });
+    if !benchmark {
+        serve_forwarded_args(move |args| {
+            let _ = proxy.send_event(AppEvent::ForwardedArgs(args));
+        });
+    }
 
     startup.mark(Milestone::EventLoop);
     let marker = autosave::session_marker();
-    let previous_session = autosave::claim_session(&marker);
+    let previous_session = if benchmark {
+        PreviousSession::Clean
+    } else {
+        autosave::claim_session(&marker)
+    };
     let mut app = App::new(WindowPlan::default(), app_proxy, parsed.paths.is_empty());
     app.previous_session = previous_session;
     // The benches measure a launch, not a recovery prompt.
-    if !parsed.exit_after_first_frame && parsed.bench_frames.is_none() {
+    if !benchmark {
         app.pending_recoveries = autosave::pending_recoveries(&app.autosave_dir);
     }
     if previous_session == PreviousSession::Crashed {
@@ -4673,7 +4710,9 @@ fn run_window(
     match event_loop.run_app(&mut app) {
         Ok(()) => {
             tracing::info!("exited cleanly");
-            autosave::release_session(&marker);
+            if !benchmark {
+                autosave::release_session(&marker);
+            }
             drop(guard);
             ExitCode::SUCCESS
         }

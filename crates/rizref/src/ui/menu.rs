@@ -79,6 +79,8 @@ pub enum Action {
     ShowSettings,
     /// Show the version toast.
     About,
+    /// Open `%LOCALAPPDATA%\RizRef` (logs, crash dumps) in Explorer.
+    OpenLogsFolder,
     /// Quit the application.
     Quit,
     /// Cancel the unsaved-changes close dialog.
@@ -671,6 +673,7 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
         ),
         MenuEntry::shortcut("Settings…", S::ShowSettings, Action::ShowSettings),
         MenuEntry::separator(),
+        MenuEntry::item("Open logs folder", Action::OpenLogsFolder),
         MenuEntry::item("About RizRef", Action::About),
     ];
 

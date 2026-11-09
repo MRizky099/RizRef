@@ -2279,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "rizref"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "rizref-codecs"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gif",
  "heic-rs",
@@ -2327,7 +2327,7 @@ dependencies = [
 
 [[package]]
 name = "rizref-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "glam",
@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "rizref-format"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "glam",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "rizref-thumb"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "glam",
  "rizref-codecs",

@@ -4,6 +4,7 @@ description = "The RizRef application: window, renderer, input and Windows platf
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true
