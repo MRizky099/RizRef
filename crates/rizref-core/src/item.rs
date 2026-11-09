@@ -22,6 +22,78 @@ use crate::transform::Transform;
 /// Default on-board size of a freshly created note, in world units.
 pub const DEFAULT_NOTE_SIZE: Vec2 = Vec2::new(360.0, 220.0);
 
+/// Inner padding between a note's frame and its content, in world units.
+pub const NOTE_PADDING: f32 = 14.0;
+
+/// The default note card colour, `#302c25`.
+pub const DEFAULT_NOTE_BACKGROUND: [u8; 3] = [0x30, 0x2c, 0x25];
+
+/// Smallest stored note wrap width, in world units.
+pub const MIN_WRAP_WIDTH: f32 = 16.0;
+
+/// Largest stored note wrap width, in world units.
+pub const MAX_WRAP_WIDTH: f32 = 10_000.0;
+
+/// Clamps a stored wrap width to [`MIN_WRAP_WIDTH`]`..=`[`MAX_WRAP_WIDTH`].
+///
+/// A non-finite or non-positive value is not a wrap width at all and yields
+/// `None`, which means "use the note's inner box width".
+pub fn clamp_wrap_width(width: f32) -> Option<f32> {
+    (width.is_finite() && width > 0.0).then(|| width.clamp(MIN_WRAP_WIDTH, MAX_WRAP_WIDTH))
+}
+
+/// How a note's text is interpreted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteFormat {
+    /// Plain UTF-8 with `\n` line breaks: the phase-04 meaning, and the default
+    /// for any payload that does not say otherwise.
+    #[default]
+    Plain,
+    /// The markdown subset rendered by the application.
+    Markdown,
+}
+
+/// Everything that describes a note's content, as one before/after unit.
+///
+/// The edit command stores two of these, so text, format, background and wrap
+/// width all move through undo together.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NoteContent {
+    /// The note's source text.
+    pub text: String,
+    /// How `text` is interpreted.
+    pub format: NoteFormat,
+    /// An opaque background override; `None` is the default card colour.
+    pub background: Option<[u8; 3]>,
+    /// The width the content is laid out at, in world units; `None` uses the
+    /// note's inner box width.
+    pub wrap_width: Option<f32>,
+}
+
+impl NoteContent {
+    /// A markdown note with the given source and no overrides.
+    pub fn markdown(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            format: NoteFormat::Markdown,
+            background: None,
+            wrap_width: None,
+        }
+    }
+
+    /// The background colour to paint.
+    pub fn background_or_default(&self) -> [u8; 3] {
+        self.background.unwrap_or(DEFAULT_NOTE_BACKGROUND)
+    }
+}
+
+/// The inner (content) width of a note box `width` wide, never below
+/// [`MIN_WRAP_WIDTH`].
+pub fn inner_note_width(width: f32) -> f32 {
+    (width - 2.0 * NOTE_PADDING).max(MIN_WRAP_WIDTH)
+}
+
 /// What an item shows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -33,8 +105,17 @@ pub enum ItemBody {
     },
     /// A text note drawn by the application.
     Note {
-        /// The note's text, plain UTF-8 with `\n` line breaks.
+        /// The note's source text; see `format`.
         text: String,
+        /// How `text` is interpreted; absent in older payloads, meaning plain.
+        #[serde(default)]
+        format: NoteFormat,
+        /// An opaque background override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<[u8; 3]>,
+        /// The content wrap width in world units.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wrap_width: Option<f32>,
     },
 }
 
@@ -78,15 +159,31 @@ impl Item {
         }
     }
 
-    /// An opaque, unrotated note centred on `center`.
+    /// An opaque, unrotated markdown note centred on `center`.
     pub fn note(id: ItemId, text: impl Into<String>, center: Vec2, size: Vec2) -> Self {
+        Self::note_with(id, NoteContent::markdown(text), center, size)
+    }
+
+    /// An opaque, unrotated note with exactly `content`, as a reader builds it.
+    pub fn note_with(id: ItemId, content: NoteContent, center: Vec2, size: Vec2) -> Self {
+        let NoteContent {
+            text,
+            format,
+            background,
+            wrap_width,
+        } = content;
         Self {
             id,
             transform: Transform::new(center, size),
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
-            body: ItemBody::Note { text: text.into() },
+            body: ItemBody::Note {
+                text,
+                format,
+                background,
+                wrap_width: wrap_width.and_then(clamp_wrap_width),
+            },
         }
     }
 
@@ -116,15 +213,81 @@ impl Item {
     /// The note text, when this item is a note.
     pub fn text(&self) -> Option<&str> {
         match &self.body {
-            ItemBody::Note { text } => Some(text),
+            ItemBody::Note { text, .. } => Some(text),
             ItemBody::Image { .. } => None,
+        }
+    }
+
+    /// The note's full content, when this item is a note.
+    pub fn note_content(&self) -> Option<NoteContent> {
+        match &self.body {
+            ItemBody::Note {
+                text,
+                format,
+                background,
+                wrap_width,
+            } => Some(NoteContent {
+                text: text.clone(),
+                format: *format,
+                background: *background,
+                wrap_width: *wrap_width,
+            }),
+            ItemBody::Image { .. } => None,
+        }
+    }
+
+    /// The note's text format, when this item is a note.
+    pub fn note_format(&self) -> Option<NoteFormat> {
+        match &self.body {
+            ItemBody::Note { format, .. } => Some(*format),
+            ItemBody::Image { .. } => None,
+        }
+    }
+
+    /// The width a note's content is laid out at: the stored wrap width, or the
+    /// inner box width for a note that has none yet.
+    pub fn note_wrap_width(&self) -> Option<f32> {
+        match &self.body {
+            ItemBody::Note { wrap_width, .. } => {
+                Some(wrap_width.unwrap_or_else(|| inner_note_width(self.size().x)))
+            }
+            ItemBody::Image { .. } => None,
+        }
+    }
+
+    /// Replaces the whole note content, returning whether anything changed.
+    ///
+    /// The wrap width is clamped on the way in, so a stored note never carries
+    /// a value the format would reject.
+    pub fn set_note(&mut self, content: &NoteContent) -> bool {
+        match &mut self.body {
+            ItemBody::Note {
+                text,
+                format,
+                background,
+                wrap_width,
+            } => {
+                let new_wrap = content.wrap_width.and_then(clamp_wrap_width);
+                let changed = *text != content.text
+                    || *format != content.format
+                    || *background != content.background
+                    || *wrap_width != new_wrap;
+                if changed {
+                    text.clone_from(&content.text);
+                    *format = content.format;
+                    *background = content.background;
+                    *wrap_width = new_wrap;
+                }
+                changed
+            }
+            ItemBody::Image { .. } => false,
         }
     }
 
     /// Replaces the note text, returning whether it changed.
     pub fn set_text(&mut self, new_text: &str) -> bool {
         match &mut self.body {
-            ItemBody::Note { text } => {
+            ItemBody::Note { text, .. } => {
                 if text == new_text {
                     false
                 } else {
@@ -222,7 +385,10 @@ impl Item {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_NOTE_SIZE, Item, ItemBody, ItemState};
+    use super::{
+        DEFAULT_NOTE_BACKGROUND, DEFAULT_NOTE_SIZE, Item, ItemBody, ItemState, MAX_WRAP_WIDTH,
+        MIN_WRAP_WIDTH, NoteContent, NoteFormat, clamp_wrap_width,
+    };
     use crate::asset::AssetId;
     use crate::scene::ItemId;
     use crate::transform::Transform;
@@ -335,5 +501,77 @@ mod tests {
         assert_eq!(item.state(), state);
         assert_eq!(item.center(), Vec2::splat(5.0));
         assert!(item.flip_x() && item.flip_y());
+    }
+
+    #[test]
+    fn a_new_note_is_markdown_with_no_overrides() {
+        let item = Item::note(ItemId::from_raw(4), "**hi**", Vec2::ZERO, DEFAULT_NOTE_SIZE);
+        let content = item.note_content().expect("a note");
+
+        assert_eq!(content.format, NoteFormat::Markdown);
+        assert_eq!(content.background, None);
+        assert_eq!(content.wrap_width, None);
+        assert_eq!(content.background_or_default(), DEFAULT_NOTE_BACKGROUND);
+        assert_eq!(item.note_wrap_width(), Some(360.0 - 28.0));
+        assert_eq!(image().note_content(), None);
+    }
+
+    #[test]
+    fn set_note_reports_changes_field_by_field() {
+        let mut item = Item::note(ItemId::from_raw(4), "a", Vec2::ZERO, DEFAULT_NOTE_SIZE);
+        let mut content = item.note_content().expect("a note");
+
+        assert!(
+            !item.set_note(&content),
+            "identical content is not a change"
+        );
+        content.background = Some([255, 255, 255]);
+        assert!(item.set_note(&content));
+        content.wrap_width = Some(200.0);
+        assert!(item.set_note(&content));
+        assert_eq!(item.note_wrap_width(), Some(200.0));
+        content.format = NoteFormat::Plain;
+        assert!(item.set_note(&content));
+        assert_eq!(item.note_content(), Some(content));
+        assert!(!image().set_note(&NoteContent::default()));
+    }
+
+    #[test]
+    fn wrap_width_is_clamped_and_rejects_non_numbers() {
+        assert_eq!(clamp_wrap_width(1.0), Some(MIN_WRAP_WIDTH));
+        assert_eq!(clamp_wrap_width(1.0e9), Some(MAX_WRAP_WIDTH));
+        assert_eq!(clamp_wrap_width(300.0), Some(300.0));
+        assert_eq!(clamp_wrap_width(0.0), None);
+        assert_eq!(clamp_wrap_width(-5.0), None);
+        assert_eq!(clamp_wrap_width(f32::NAN), None);
+        assert_eq!(clamp_wrap_width(f32::INFINITY), None);
+
+        let mut content = NoteContent::markdown("x");
+        content.wrap_width = Some(4.0);
+        let item = Item::note_with(ItemId::from_raw(1), content, Vec2::ZERO, Vec2::splat(50.0));
+        assert_eq!(item.note_wrap_width(), Some(MIN_WRAP_WIDTH));
+    }
+
+    #[test]
+    fn a_legacy_payload_without_format_reads_as_plain() {
+        let body: ItemBody =
+            serde_json::from_str(r#"{"kind":"note","text":"old"}"#).expect("parses");
+        assert_eq!(
+            body,
+            ItemBody::Note {
+                text: "old".into(),
+                format: NoteFormat::Plain,
+                background: None,
+                wrap_width: None,
+            }
+        );
+        let json = serde_json::to_string(&ItemBody::Note {
+            text: "new".into(),
+            format: NoteFormat::Markdown,
+            background: None,
+            wrap_width: None,
+        })
+        .expect("serialises");
+        assert_eq!(json, r#"{"kind":"note","text":"new","format":"markdown"}"#);
     }
 }

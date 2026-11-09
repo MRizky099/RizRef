@@ -15,9 +15,10 @@ use std::collections::BTreeSet;
 use glam::{DVec2, Vec2};
 use rizref_core::{
     AddGroup, AddItems, Align, ArrangeMode, Camera, DEFAULT_NOTE_SIZE, DissolveGroup, Effects,
-    GroupChild, Handle, History, Item, ItemId, ItemState, Orientation, Pivot, RemoveItems,
-    ReorderItems, Selection, SelectionFrame, SetNoteText, SetTransforms, SizeAxis, align, arrange,
-    distribute, scale_item, scale_item_in_frame, screen_tolerance, snap_rect,
+    GroupChild, Handle, History, Item, ItemId, ItemState, NOTE_PADDING, NoteContent, NoteFormat,
+    Orientation, Pivot, RemoveItems, ReorderItems, Selection, SelectionFrame, SetNoteContent,
+    SetTransforms, SizeAxis, align, arrange, distribute, scale_item, scale_item_in_frame,
+    screen_tolerance, snap_rect,
 };
 
 /// Screen-pixel tolerance for edge/centre snapping.
@@ -767,34 +768,164 @@ impl Board {
             .collect()
     }
 
-    /// Creates an empty note, selects it and returns its id.
-    pub fn create_note(&mut self, center: Vec2) -> ItemId {
+    /// Creates an empty markdown note, selects it and returns its id — as a
+    /// *provisional* item: it is on the board but not in the history yet.
+    /// [`Self::commit_new_note`] turns it into one undo step; cancelling
+    /// removes it with [`Self::discard_provisional_note`].
+    pub fn create_provisional_note(&mut self, center: Vec2) -> ItemId {
         let id = self.scene.allocate_item_id();
         let item = Item::note(id, "", center, DEFAULT_NOTE_SIZE);
-        self.run(Box::new(AddItems::on_top("Add note", vec![item])));
+        let top = self.scene.items().len();
+        self.scene.insert_item_at(top, item);
+        self.pending.added.insert(id);
+        self.pending.content.insert(id);
         self.selection.set_single(id);
         id
     }
 
-    /// Writes note text during an edit session, outside the history.
-    pub fn set_note_text_live(&mut self, id: ItemId, text: &str) -> bool {
+    /// Removes a provisional note without touching the history.
+    pub fn discard_provisional_note(&mut self, id: ItemId) -> bool {
+        if self.scene.remove(id).is_none() {
+            return false;
+        }
+        self.selection.remove(id);
+        if self.hover == Some(id) {
+            self.hover = None;
+        }
+        self.pending.removed.insert(id);
+        true
+    }
+
+    /// Commits a provisional note: the live item is replaced by the same
+    /// item inserted through `AddItems`, so create + first text are one undo
+    /// step. An empty note is discarded instead and adds nothing.
+    pub fn commit_new_note(&mut self, id: ItemId, content: &NoteContent) -> bool {
+        let Some(mut item) = self.scene.item(id).cloned() else {
+            return false;
+        };
+        self.discard_provisional_note(id);
+        if content.text.trim().is_empty() {
+            return false;
+        }
+        item.set_note(content);
+        self.run(Box::new(AddItems::on_top("Add note", vec![item])));
+        self.selection.set_single(id);
+        true
+    }
+
+    /// Writes note content during an edit session, outside the history.
+    pub fn set_note_live(&mut self, id: ItemId, content: &NoteContent) -> bool {
         let changed = self
             .scene
             .item_mut(id)
-            .is_some_and(|item| item.set_text(text));
+            .is_some_and(|item| item.set_note(content));
         if changed {
             self.pending.content.insert(id);
         }
         changed
     }
 
+    /// Restores a note's pre-edit content outside the history (cancel).
+    pub fn restore_note(&mut self, id: ItemId, content: &NoteContent) -> bool {
+        self.set_note_live(id, content)
+    }
+
     /// Commits an edit session as one undo step.
-    pub fn commit_note_text(&mut self, id: ItemId, before: &str, after: &str) -> bool {
+    pub fn commit_note(&mut self, id: ItemId, before: &NoteContent, after: &NoteContent) -> bool {
         if before == after {
             return false;
         }
-        self.run(Box::new(SetNoteText::new(id, before, after)));
+        self.run(Box::new(SetNoteContent::new(
+            id,
+            before.clone(),
+            after.clone(),
+        )));
         true
+    }
+
+    /// Replaces a note's content as one undo step (background, reflow).
+    pub fn set_note_content(&mut self, id: ItemId, after: &NoteContent) -> bool {
+        let Some(before) = self.scene.item(id).and_then(Item::note_content) else {
+            return false;
+        };
+        self.commit_note(id, &before, after)
+    }
+
+    /// The single selected note, when the selection is exactly one note.
+    pub fn selected_note(&self) -> Option<ItemId> {
+        let mut ids = self.selection.iter();
+        let id = ids.next()?;
+        (ids.next().is_none() && self.scene.item(id).is_some_and(Item::is_note)).then_some(id)
+    }
+
+    /// Sets a note's wrap width to its current inner box width: one undo
+    /// step, and the only way line breaks follow a resize.
+    pub fn reflow_note(&mut self, id: ItemId) -> bool {
+        let Some(item) = self.scene.item(id) else {
+            return false;
+        };
+        let Some(mut content) = item.note_content() else {
+            return false;
+        };
+        content.wrap_width = Some(rizref_core::inner_note_width(item.size().x));
+        if content.format == NoteFormat::Plain {
+            content.format = NoteFormat::Markdown;
+        }
+        self.set_note_content(id, &content)
+    }
+
+    /// Sets a note's box height to fit `content_height` world units of laid
+    /// out content (plus padding), keeping its top edge and width: one
+    /// undoable transform.
+    pub fn fit_note_height(&mut self, id: ItemId, content_height: f32) -> bool {
+        let Some(item) = self.scene.item(id) else {
+            return false;
+        };
+        let before = item.state();
+        let height = (content_height + 2.0 * NOTE_PADDING).max(rizref_core::MIN_ITEM_SIZE);
+        let old = before.transform.size();
+        if (old.y - height).abs() < 0.01 {
+            return false;
+        }
+        let mut transform = before.transform;
+        // Grow or shrink downwards along the note's own vertical axis.
+        let (sin, cos) = transform.rotation().sin_cos();
+        let shift = (height - old.y) * 0.5;
+        let down = Vec2::new(-sin, cos) * if before.flip_y { -shift } else { shift };
+        transform.set_center(transform.center() + down);
+        transform.set_size(Vec2::new(old.x, height));
+        let after = ItemState {
+            transform,
+            ..before
+        };
+        self.run(Box::new(SetTransforms::new(
+            "Fit note to content",
+            vec![(id, before)],
+            vec![(id, after)],
+        )));
+        true
+    }
+
+    /// Whether a selection-frame handle (scale, or rotate when allowed) is
+    /// under `screen`.
+    pub fn handle_at(&self, screen: DVec2, view: ViewInfo) -> bool {
+        let world = view.world(screen);
+        let rotate_offset = view.pixels_to_world(ROTATE_HANDLE_PIXELS);
+        let radius = view.pixels_to_world(HANDLE_PIXELS);
+        self.frame().is_some_and(|frame| {
+            frame
+                .hit(world, radius, rotate_offset)
+                .is_some_and(|handle| handle != Handle::Rotate || self.selection_rotatable())
+        })
+    }
+
+    /// Whether the selection has anything the rotate gesture may turn.
+    /// Notes are never rotated, so a note-only selection has no rotate
+    /// handle.
+    pub fn selection_rotatable(&self) -> bool {
+        self.selection
+            .iter()
+            .any(|id| self.scene.item(id).is_some_and(|item| !item.is_note()))
     }
 
     // -----------------------------------------------------------------------
@@ -827,7 +958,9 @@ impl Board {
         let radius = view.pixels_to_world(HANDLE_PIXELS);
 
         if let Some(frame) = self.frame()
-            && let Some(handle) = frame.hit(world, radius, rotate_offset)
+            && let Some(handle) = frame
+                .hit(world, radius, rotate_offset)
+                .filter(|handle| *handle != Handle::Rotate || self.selection_rotatable())
         {
             let before = self.selected_states();
             self.hover = None;
@@ -1029,13 +1162,21 @@ impl Board {
                     } else {
                         *accumulated
                     };
+                    // Notes are never rotated: in a mixed selection they
+                    // keep their exact state while the images turn.
                     let states: Vec<(ItemId, ItemState)> = before
                         .iter()
                         .map(|(id, state)| {
+                            let note = self.scene.item(*id).is_some_and(Item::is_note);
+                            let transform = if note {
+                                state.transform
+                            } else {
+                                state.transform.rotated_about(*pivot, applied)
+                            };
                             (
                                 *id,
                                 ItemState {
-                                    transform: state.transform.rotated_about(*pivot, applied),
+                                    transform,
                                     ..*state
                                 },
                             )
@@ -1116,7 +1257,9 @@ impl Board {
         }
 
         if let Some(frame) = self.frame()
-            && let Some(handle) = frame.hit(world, radius, rotate_offset)
+            && let Some(handle) = frame
+                .hit(world, radius, rotate_offset)
+                .filter(|handle| *handle != Handle::Rotate || self.selection_rotatable())
         {
             return resize_cursor(handle, &frame, view);
         }
@@ -1181,7 +1324,8 @@ mod tests {
     use super::{Board, CLICK_SLOP_PIXELS, Modifiers, SNAP_PIXELS, ViewInfo};
     use glam::{DVec2, Vec2};
     use rizref_core::{
-        ArrangeMode, Camera, Item, ItemId, Scene, SceneId, SelectionFrame, Transform,
+        ArrangeMode, Camera, Item, ItemId, NOTE_PADDING, NoteContent, Scene, SceneId,
+        SelectionFrame, Transform,
     };
     use std::f32::consts::FRAC_PI_2;
 
@@ -1204,18 +1348,35 @@ mod tests {
         camera.world_to_screen(world.as_dvec2(), viewport())
     }
 
-    /// A board of `count` notes in a grid, ids 1..=count, 20 x 20 each.
+    /// A shared 20 x 20 image asset.
+    fn image_asset(scene: &mut Scene) -> rizref_core::AssetId {
+        let pixels = rizref_codecs::ImageBuffer::filled(20, 20, [90, 90, 90, 255]);
+        let asset = rizref_core::Asset::from_decoded(
+            std::sync::Arc::from(&b"test image"[..]),
+            rizref_codecs::ImageFormat::Png,
+            &pixels,
+            rizref_codecs::ImageBuffer::filled(2, 2, [90, 90, 90, 255]),
+        );
+        scene.insert_asset(asset).0
+    }
+
+    /// A board of `count` images in a grid, ids 1..=count, 20 x 20 each.
+    /// Images rather than notes: notes are never rotated, and the scripted
+    /// session rotates.
     fn board(count: usize) -> Board {
         let mut scene = Scene::new(SceneId::from_bytes([5; 16]));
+        let asset = image_asset(&mut scene);
         let columns = 5;
         for index in 0..count {
             let column = (index % columns) as f32;
             let row = (index / columns) as f32;
-            scene.insert_note(
-                format!("n{index}"),
-                Vec2::new(column * 40.0, row * 40.0),
-                Vec2::splat(20.0),
-            );
+            scene
+                .insert_image(
+                    asset,
+                    Vec2::new(column * 40.0, row * 40.0),
+                    Vec2::splat(20.0),
+                )
+                .expect("asset stored");
         }
         Board::new(scene)
     }
@@ -1726,18 +1887,198 @@ mod tests {
     }
 
     #[test]
-    fn notes_can_be_created_edited_and_undone() {
+    fn create_and_first_commit_are_one_undo_step() {
         let mut board = Board::new(Scene::new(SceneId::from_bytes([13; 16])));
-        let note = board.create_note(Vec2::new(10.0, 20.0));
+        let note = board.create_provisional_note(Vec2::new(10.0, 20.0));
+        assert_eq!(
+            board.history().undo_len(),
+            0,
+            "a provisional note is not history"
+        );
+        assert!(board.selection().contains(note));
 
-        assert!(board.set_note_text_live(note, "first draft"));
-        assert!(board.commit_note_text(note, "", "first draft"));
+        let mut content = NoteContent::markdown("first draft");
+        assert!(board.set_note_live(note, &content));
+        content.wrap_width = Some(300.0);
+        assert!(board.commit_new_note(note, &content));
+        assert_eq!(board.history().undo_len(), 1);
+        assert_eq!(
+            board.scene().item(note).and_then(Item::note_content),
+            Some(content)
+        );
+        board.undo();
+        assert!(
+            board.scene().item(note).is_none(),
+            "one undo removes the note"
+        );
+        board.redo();
         assert_eq!(
             board.scene().item(note).and_then(Item::text),
             Some("first draft")
         );
+    }
+
+    #[test]
+    fn an_empty_or_cancelled_new_note_leaves_no_trace() {
+        let mut board = Board::new(Scene::new(SceneId::from_bytes([13; 16])));
+        let empty = board.create_provisional_note(Vec2::ZERO);
+        assert!(!board.commit_new_note(empty, &NoteContent::markdown("  \n")));
+        assert!(board.scene().is_empty());
+        let cancelled = board.create_provisional_note(Vec2::ZERO);
+        board.set_note_live(cancelled, &NoteContent::markdown("typed"));
+        assert!(board.discard_provisional_note(cancelled));
+        assert!(board.scene().is_empty());
+        assert_eq!(board.history().undo_len(), 0);
+        let effects = board.take_effects();
+        assert!(effects.removed.contains(&cancelled));
+    }
+
+    #[test]
+    fn editing_an_existing_note_is_one_step_and_restore_is_exact() {
+        let mut scene = Scene::new(SceneId::from_bytes([13; 16]));
+        let id = scene.insert_note("before", Vec2::ZERO, Vec2::splat(100.0));
+        let mut board = Board::new(scene);
+        let before = board
+            .scene()
+            .item(id)
+            .and_then(Item::note_content)
+            .expect("note");
+        let mut after = before.clone();
+        after.text = "after".into();
+        assert!(board.set_note_live(id, &after));
+        assert!(board.restore_note(id, &before));
+        assert_eq!(
+            board.scene().item(id).and_then(Item::note_content),
+            Some(before.clone())
+        );
+        assert_eq!(board.history().undo_len(), 0, "cancel adds no history");
+
+        board.set_note_live(id, &after);
+        assert!(board.commit_note(id, &before, &after));
+        assert!(!board.commit_note(id, &after, &after), "no change, no step");
+        assert_eq!(board.history().undo_len(), 1);
         board.undo();
-        assert_eq!(board.scene().item(note).and_then(Item::text), Some(""));
+        assert_eq!(
+            board.scene().item(id).and_then(Item::note_content),
+            Some(before)
+        );
+    }
+
+    #[test]
+    fn background_reflow_and_fit_are_undoable_steps() {
+        let mut scene = Scene::new(SceneId::from_bytes([13; 16]));
+        let id = scene.insert_note("text", Vec2::ZERO, Vec2::new(300.0, 100.0));
+        let mut board = Board::new(scene);
+        board.select_only(id);
+        assert_eq!(board.selected_note(), Some(id));
+
+        let mut content = board
+            .scene()
+            .item(id)
+            .and_then(Item::note_content)
+            .expect("note");
+        content.background = Some([250, 250, 250]);
+        assert!(board.set_note_content(id, &content));
+        assert_eq!(board.history().undo_len(), 1);
+
+        // Resize the box, then reflow to the new inner width.
+        if let Some(item) = board.scene_mut().item_mut(id) {
+            let mut transform = item.transform();
+            transform.set_size(Vec2::new(500.0, 100.0));
+            item.set_transform(transform);
+        }
+        assert!(board.reflow_note(id));
+        assert_eq!(
+            board
+                .scene()
+                .item(id)
+                .and_then(Item::note_content)
+                .and_then(|c| c.wrap_width),
+            Some(500.0 - 2.0 * NOTE_PADDING)
+        );
+        assert!(!board.reflow_note(id), "already at the box width");
+
+        let top = board
+            .scene()
+            .item(id)
+            .map(|item| item.world_rect().min.y)
+            .expect("note");
+        assert!(board.fit_note_height(id, 40.0));
+        let item = board.scene().item(id).expect("note");
+        assert_eq!(item.size(), Vec2::new(500.0, 40.0 + 2.0 * NOTE_PADDING));
+        assert!(
+            (item.world_rect().min.y - top).abs() < 1.0e-3,
+            "the top edge stays"
+        );
+        assert_eq!(board.history().undo_len(), 3);
+        board.undo();
+        assert_eq!(
+            board.scene().item(id).map(Item::size),
+            Some(Vec2::new(500.0, 100.0))
+        );
+    }
+
+    #[test]
+    fn notes_are_never_rotated_and_have_no_rotate_handle() {
+        let camera = view();
+        let info = info(&camera);
+        let mut scene = Scene::new(SceneId::from_bytes([14; 16]));
+        let note = scene.insert_note("n", Vec2::ZERO, Vec2::splat(100.0));
+        let mut board = Board::new(scene);
+        board.select_only(note);
+        assert!(!board.selection_rotatable());
+
+        // Where the rotate handle would be: pressing there starts no rotation.
+        let frame = board.frame().expect("frame");
+        let handle =
+            frame.handle_position(rizref_core::Handle::Rotate, super::ROTATE_HANDLE_PIXELS);
+        assert!(!board.handle_at(screen(&camera, handle), info));
+        board.pointer_down(screen(&camera, handle), info, Modifiers::default());
+        board.pointer_move(
+            screen(&camera, handle + Vec2::new(200.0, 200.0)),
+            info,
+            Modifiers::default(),
+        );
+        board.pointer_up(DVec2::ZERO, info, Modifiers::default());
+        assert_eq!(board.scene().item(note).map(Item::rotation), Some(0.0));
+    }
+
+    #[test]
+    fn a_mixed_selection_rotates_only_its_images() {
+        let camera = view();
+        let info = info(&camera);
+        let mut scene = Scene::new(SceneId::from_bytes([15; 16]));
+        let asset = image_asset(&mut scene);
+        let image = scene
+            .insert_image(asset, Vec2::new(-100.0, 0.0), Vec2::splat(40.0))
+            .expect("image");
+        let note = scene.insert_note("n", Vec2::new(100.0, 0.0), Vec2::splat(40.0));
+        let note_before = scene.item(note).map(Item::state).expect("note");
+        let mut board = Board::new(scene);
+        board.select_all();
+        assert!(board.selection_rotatable());
+
+        let frame = board.frame().expect("frame");
+        let handle =
+            frame.handle_position(rizref_core::Handle::Rotate, super::ROTATE_HANDLE_PIXELS);
+        board.pointer_down(screen(&camera, handle), info, Modifiers::default());
+        board.pointer_move(
+            screen(&camera, frame.center + Vec2::new(300.0, 0.0)),
+            info,
+            Modifiers::default(),
+        );
+        board.pointer_up(DVec2::ZERO, info, Modifiers::default());
+
+        assert!(
+            board
+                .scene()
+                .item(image)
+                .map(Item::rotation)
+                .expect("image")
+                .abs()
+                > 0.5
+        );
+        assert_eq!(board.scene().item(note).map(Item::state), Some(note_before));
     }
 
     #[test]

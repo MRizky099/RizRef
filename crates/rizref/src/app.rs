@@ -47,7 +47,10 @@ use crate::hud::HudSurface;
 use crate::import::{ImportOutcome, ImportPurpose, ImportRequest, Importer};
 use crate::input::{self, Button as InputButton, Command, Trigger};
 use crate::memory::DecodeCache;
-use crate::note::{self, NoteSession};
+use crate::note::{self, NoteRenderer, NoteSession};
+use crate::note_chrome::{
+    NoteChrome, PillButton, PillLayout, ScreenRect, ToolbarButton, ToolbarLayout,
+};
 use crate::overlay::{self, OverlayState, OverlayVertex};
 use crate::placement;
 use crate::platform::window_modes::WindowModes;
@@ -61,6 +64,7 @@ use crate::settings::Settings;
 use crate::shortcuts::{Key as ShortcutKey, KeyChord, ShortcutId, Shortcuts};
 use crate::text::TextEngine;
 use crate::ui::menu::{self, Action, MenuContext, MenuEntry, MenuResult};
+use crate::ui::note_color::{NoteColorPopover, PopoverResult};
 use crate::ui::panels::{self, CloseChoice, PanelResult, SettingId};
 use crate::ui::start::{self, StartLayout};
 use crate::ui::titlebar::{self, TitleBarButton};
@@ -432,6 +436,12 @@ struct App {
     next_frame_at: Option<Instant>,
     /// The active note edit session, if any.
     note_session: Option<NoteSession>,
+    /// Markdown layout and math caches shared by every note.
+    note_renderer: NoteRenderer,
+    /// The note whose hover toolbar is showing.
+    note_hover: Option<ItemId>,
+    /// The note the eyedropper was armed for from its popover.
+    pick_for_note: Option<ItemId>,
     /// Resident note textures.
     note_textures: HashMap<ItemId, NoteTexture>,
     /// Notes whose texture must be re-rendered on the next frame.
@@ -547,6 +557,9 @@ impl App {
             pending_textures: BTreeSet::new(),
             next_frame_at: None,
             note_session: None,
+            note_renderer: NoteRenderer::new(),
+            note_hover: None,
+            pick_for_note: None,
             note_textures: HashMap::new(),
             dirty_notes: BTreeSet::new(),
             last_click: None,
@@ -702,9 +715,13 @@ impl App {
                     name,
                     thumbnail,
                     missing,
+                    warnings,
                     recovered,
                     ..
                 } = loaded;
+                for warning in &warnings {
+                    tracing::warn!(path = %path.display(), "{warning}");
+                }
                 let item_count = scene.items().len();
                 let provenance: BTreeMap<AssetId, AssetProvenance> = document
                     .assets
@@ -996,6 +1013,7 @@ impl App {
         if let Some(button) = layout.button_at(position) {
             self.last_title_click = None;
             match button {
+                TitleBarButton::Menu => self.execute(Action::OpenMainMenu, event_loop),
                 TitleBarButton::Pin => self.execute(Action::ToggleAlwaysOnTop, event_loop),
                 TitleBarButton::Minimize => self.execute(Action::WindowMinimize, event_loop),
                 TitleBarButton::Maximize => self.execute(Action::WindowToggleMaximize, event_loop),
@@ -1048,8 +1066,17 @@ impl App {
             self.dirty_notes.insert(*id);
         }
         if effects.structural() {
+            let gone: Vec<AssetId> = self
+                .note_textures
+                .iter()
+                .filter(|(id, _)| !self.board.scene().contains(**id))
+                .map(|(_, entry)| entry.id)
+                .collect();
             self.note_textures
                 .retain(|id, _| self.board.scene().contains(*id));
+            for texture in gone {
+                self.release_note_texture(texture);
+            }
         }
         self.redraw();
     }
@@ -1163,8 +1190,9 @@ impl App {
                 .board
                 .distribute_selection(rizref_core::Orientation::Vertical),
             CreateNote => {
-                let id = self.board.create_note(self.drop_world());
-                self.begin_note_edit(id);
+                let id = self.board.create_provisional_note(self.drop_world());
+                self.after_board();
+                self.begin_note_edit(id, true);
                 true
             }
             _ => false,
@@ -1207,13 +1235,35 @@ impl App {
             click_through: self.window_modes.click_through,
             always_on_top: self.window_modes.always_on_top,
             opacity_percent: self.window_modes.opacity_percent,
+            note_selected: self.board.selected_note().is_some(),
         })
     }
 
-    /// Opens the full context menu at a logical point.
+    /// Opens the right-click menu at a logical point: the note commands (or
+    /// `New note`) first, then the full command tree.
     fn open_context_menu(&mut self, position: DVec2) {
-        let tree = self.menu_tree();
+        let tree = menu::build_context(&MenuContext {
+            settings: &self.settings,
+            shortcuts: &self.shortcuts,
+            recents: &self.recents,
+            locked: self.shell.locked,
+            ghost: self.window_modes.ghost(),
+            click_through: self.window_modes.click_through,
+            always_on_top: self.window_modes.always_on_top,
+            opacity_percent: self.window_modes.opacity_percent,
+            note_selected: self.board.selected_note().is_some(),
+        });
+        self.shell.tooltip = None;
         self.shell.open_menu(tree, position, self.viewport());
+        self.redraw();
+    }
+
+    /// Opens the full command menu under the title bar's ☰ button.
+    fn open_main_menu(&mut self) {
+        let tree = self.menu_tree();
+        let anchor = DVec2::new(0.0, f64::from(titlebar::HEIGHT));
+        self.shell.tooltip = None;
+        self.shell.open_menu(tree, anchor, self.viewport());
         self.redraw();
     }
 
@@ -1336,7 +1386,7 @@ impl App {
             Action::About => {
                 self.shell.toast(
                     format!(
-                        "{} · pure-Rust reference board · F1 for shortcuts",
+                        "{} · pure-Rust reference board · math fonts: KaTeX (SIL OFL 1.1) · F1 for shortcuts",
                         version_line()
                     ),
                     now,
@@ -1460,7 +1510,52 @@ impl App {
                 self.shell.touch();
                 self.redraw();
             }
+            Action::OpenMainMenu => {
+                if self.shell.mode() == Mode::Canvas {
+                    self.commit_note_edit();
+                }
+                self.open_main_menu();
+            }
+            Action::EditNote => {
+                if let Some(id) = self.board.selected_note() {
+                    self.begin_note_edit(id, false);
+                }
+            }
+            Action::NoteBackground => {
+                self.commit_note_edit();
+                if let Some(id) = self.board.selected_note() {
+                    let anchor = self.note_color_anchor(id);
+                    self.open_note_color(id, anchor);
+                }
+            }
+            Action::ReflowNote => {
+                self.commit_note_edit();
+                if let Some(id) = self.board.selected_note()
+                    && self.board.reflow_note(id)
+                {
+                    self.dirty_notes.insert(id);
+                    self.after_board();
+                }
+                self.redraw();
+            }
+            Action::FitNote => {
+                self.commit_note_edit();
+                self.fit_selected_note();
+                self.redraw();
+            }
+            Action::DeleteNote => {
+                self.cancel_provisional_or_commit();
+                if self.board.selected_note().is_some() && self.board.delete_selection() {
+                    self.note_hover = None;
+                    self.shell.tooltip = None;
+                    self.after_board();
+                }
+                self.redraw();
+            }
+            Action::ConfirmNoteEdit => self.commit_note_edit(),
+            Action::CancelNoteEdit => self.cancel_note_edit(),
             Action::ColorPicker => {
+                self.pick_for_note = None;
                 self.shell.picker = true;
                 self.shell.title_bar.hide();
                 self.shell
@@ -1641,6 +1736,14 @@ impl App {
         let hex = format!("#{r:02X}{g:02X}{b:02X}");
         self.shell.picker = false;
         self.pending_pick = None;
+        if let Some(id) = self.pick_for_note.take() {
+            self.apply_note_background(id, [r, g, b]);
+            self.shell
+                .toast(format!("Note background set to {hex}"), Instant::now());
+            self.shell.touch();
+            self.redraw();
+            return;
+        }
         match clipboard::write_text(&hex) {
             Ok(()) => self
                 .shell
@@ -1662,6 +1765,7 @@ impl App {
             return;
         };
         let tree = self.menu_tree();
+        let notes = self.note_controls();
         let status = if self.shell.mode() == Mode::Start {
             "Start view: drop images or open a recent board".to_owned()
         } else {
@@ -1674,6 +1778,7 @@ impl App {
                 &window,
                 &self.shell.title_bar,
                 self.shell.confirm_close.as_ref(),
+                &notes,
             );
         }
         self.published_accessibility = self.shell.revision();
@@ -2125,19 +2230,23 @@ impl App {
         }
         let active = self.note_session.as_ref().map(NoteSession::item);
         let gesture = self.board.is_gesture_active();
-        let notes: Vec<(ItemId, String, Vec2)> = self
+        let notes: Vec<(ItemId, rizref_core::NoteContent, Vec2)> = self
             .board
             .scene()
             .items()
             .iter()
             .filter_map(|item| {
-                item.text()
-                    .map(|text| (item.id(), text.to_owned(), item.size()))
+                item.note_content()
+                    .map(|content| (item.id(), content, item.size()))
             })
             .collect();
 
-        for (id, text, size) in notes {
-            let wanted = note::texture_id(&text, size);
+        for (id, content, size) in notes {
+            let density = match self.note_session.as_ref().filter(|s| s.item() == id) {
+                Some(session) => session.pixels_per_world(),
+                None => note::pixels_per_world(size),
+            };
+            let wanted = note::texture_id(&content, size, density);
             let current = self.note_textures.get(&id).copied();
             let resident = self
                 .renderer
@@ -2159,20 +2268,45 @@ impl App {
                 .note_session
                 .as_mut()
                 .filter(|session| session.item() == id);
-            let Some(image) = note::render(&mut self.text, &text, size, session) else {
+            let session = match session {
+                Some(session) => {
+                    // A resize changes the visible area, never the wrap width.
+                    session.resize(size);
+                    Some(session)
+                }
+                None => None,
+            };
+            let Some(image) = self
+                .note_renderer
+                .render(&mut self.text, &content, size, session)
+            else {
                 continue;
             };
             self.dirty_notes.remove(&id);
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.upload_texture(wanted, &image, false);
             }
-            self.note_textures.insert(
+            let previous = self.note_textures.insert(
                 id,
                 NoteTexture {
                     id: wanted,
                     world_size: size,
                 },
             );
+            // One resident texture per note: the superseded one is freed as
+            // soon as no other note shares it, so typing or resizing never
+            // accumulates GPU memory.
+            if let Some(previous) = previous {
+                self.release_note_texture(previous.id);
+            }
+        }
+    }
+
+    /// Frees a note texture once no note references it any more.
+    fn release_note_texture(&mut self, texture: AssetId) {
+        let in_use = self.note_textures.values().any(|entry| entry.id == texture);
+        if !in_use && let Some(renderer) = self.renderer.as_mut() {
+            renderer.remove_texture(texture);
         }
     }
 
@@ -2252,6 +2386,8 @@ impl App {
             hover: self.board.hover(),
             marquee: self.board.marquee(),
             guides: self.board.guides(),
+            rotatable: self.board.selection_rotatable(),
+            chrome: self.note_chrome(),
         };
         overlay::build(&state)
     }
@@ -2304,33 +2440,109 @@ impl App {
     // Notes
     // -----------------------------------------------------------------------
 
-    /// Starts editing `id` and selects it.
-    fn begin_note_edit(&mut self, id: ItemId) {
+    /// Starts editing `id` and selects it. `provisional` marks a note created
+    /// for this edit that is not in the history yet.
+    fn begin_note_edit(&mut self, id: ItemId, provisional: bool) {
+        if self.note_session.as_ref().is_some_and(|s| s.item() != id) {
+            self.commit_note_edit();
+        }
+        if self.note_session.is_some() {
+            return;
+        }
+        let was_clean = self
+            .document
+            .as_ref()
+            .is_some_and(|document| !document.is_dirty());
         let Some(item) = self.board.scene().item(id) else {
             return;
         };
-        self.note_session = NoteSession::begin(&mut self.text, item);
+        self.note_session = NoteSession::begin(&mut self.text, item, provisional, was_clean);
         if self.note_session.is_some() {
             // The space bar types a space while editing; make sure a pan
             // armed before the double-click does not stay held.
             self.view.set_space_held(false);
             self.board.select_only(id);
+            self.note_hover = None;
+            self.shell.note_color = None;
+            self.shell.tooltip = None;
             self.dirty_notes.insert(id);
+            self.shell.touch();
             self.redraw();
         }
     }
 
-    /// Ends the edit session, committing the text as one undo step.
+    /// Ends the edit session, committing it as one undo step. A new note
+    /// that is still empty is discarded and adds nothing.
     fn commit_note_edit(&mut self) {
         let Some(session) = self.note_session.take() else {
             return;
         };
         let id = session.item();
-        let original = session.original().to_owned();
-        let text = session.text();
-        self.board.commit_note_text(id, &original, &text);
+        let after = session.content();
+        if session.is_provisional() {
+            let added = self.board.commit_new_note(id, &after);
+            self.after_board();
+            if !added && session.was_clean() {
+                self.restore_clean_title();
+            }
+        } else if after.text == session.original().text {
+            // Nothing was typed (or it was typed and undone): a legacy plain
+            // note stays plain, and the board keeps its saved state.
+            self.board.restore_note(id, session.original());
+            self.after_board();
+            if session.was_clean() {
+                self.restore_clean_title();
+            }
+        } else {
+            self.board.commit_note(id, session.original(), &after);
+            self.after_board();
+        }
         self.dirty_notes.insert(id);
+        self.shell.touch();
+        self.redraw();
+    }
+
+    /// Ends the edit session without keeping anything: a new note is removed,
+    /// an existing one gets its exact pre-edit content back, and a board that
+    /// was saved before the edit is "not dirty" again.
+    fn cancel_note_edit(&mut self) {
+        let Some(session) = self.note_session.take() else {
+            return;
+        };
+        let id = session.item();
+        if session.is_provisional() {
+            self.board.discard_provisional_note(id);
+        } else {
+            self.board.restore_note(id, session.original());
+            self.dirty_notes.insert(id);
+        }
         self.after_board();
+        if session.was_clean() {
+            self.restore_clean_title();
+        }
+        self.shell.touch();
+        self.redraw();
+    }
+
+    /// Before deleting: a provisional note is simply discarded; any other
+    /// edit is committed so the delete undoes back to the edited text.
+    fn cancel_provisional_or_commit(&mut self) {
+        if self
+            .note_session
+            .as_ref()
+            .is_some_and(NoteSession::is_provisional)
+        {
+            self.cancel_note_edit();
+        } else {
+            self.commit_note_edit();
+        }
+    }
+
+    /// Marks the document saved again after an edit that left no change.
+    fn restore_clean_title(&mut self) {
+        if self.document.as_mut().is_some_and(Document::mark_saved) {
+            self.refresh_window_title();
+        }
     }
 
     /// Copies the editor's text into the scene so the live preview updates.
@@ -2339,8 +2551,8 @@ impl App {
             return;
         };
         let id = session.item();
-        let text = session.text();
-        self.board.set_note_text_live(id, &text);
+        let content = session.live_content();
+        self.board.set_note_live(id, &content);
         self.dirty_notes.insert(id);
         self.after_board();
     }
@@ -2394,6 +2606,10 @@ impl App {
         let ctrl = self.modifiers.control_key();
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
+                self.cancel_note_edit();
+                true
+            }
+            Key::Named(NamedKey::Enter) if ctrl => {
                 self.commit_note_edit();
                 true
             }
@@ -2407,6 +2623,10 @@ impl App {
             }
             Key::Named(NamedKey::Enter) => {
                 self.note_action(Action::Enter);
+                true
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.note_insert("    ");
                 true
             }
             Key::Named(NamedKey::ArrowLeft) => {
@@ -2452,13 +2672,302 @@ impl App {
                 }
                 true
             }
-            Key::Character(_) => {
+            Key::Character(_) | Key::Named(NamedKey::Space) => {
                 if let Some(text) = &event.text {
                     self.note_insert(text);
                 }
                 true
             }
             _ => false,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Note chrome: hover toolbar, edit pill, background popover
+    // -----------------------------------------------------------------------
+
+    /// The note's on-screen bounding box, in logical pixels.
+    fn note_screen_rect(&self, id: ItemId) -> Option<ScreenRect> {
+        let item = self.board.scene().item(id)?;
+        let viewport = self.view.viewport();
+        let corners = item.transform().corners().map(|corner| {
+            self.view
+                .camera
+                .world_to_screen(corner.as_dvec2(), viewport)
+                .as_vec2()
+        });
+        Some(ScreenRect::bounding(&corners))
+    }
+
+    /// The note whose hover toolbar should show, if any.
+    fn toolbar_note(&self) -> Option<ItemId> {
+        if self.shell.mode() != Mode::Canvas || self.shell.locked || self.note_session.is_some() {
+            return None;
+        }
+        // While its popover is open the toolbar stays pinned to that note.
+        if let Some(popover) = &self.shell.note_color {
+            return Some(popover.note);
+        }
+        if self.shell.has_overlay() || self.shell.picker || self.board.is_gesture_active() {
+            return None;
+        }
+        let id = self.note_hover?;
+        let selection = self.board.selection();
+        if selection.len() > 1 || (selection.len() == 1 && !selection.contains(id)) {
+            return None;
+        }
+        self.board.scene().item(id).filter(|item| item.is_note())?;
+        Some(id)
+    }
+
+    /// What the overlay draws for notes this frame.
+    fn note_chrome(&self) -> Option<NoteChrome> {
+        let cursor = self.view.cursor_position().map(|c| c.as_vec2());
+        if let Some(session) = &self.note_session {
+            if self.shell.mode() != Mode::Canvas {
+                return None;
+            }
+            let layout = PillLayout::new(self.note_screen_rect(session.item())?);
+            let hovered = cursor.and_then(|c| layout.hit(c));
+            return Some(NoteChrome::Pill { layout, hovered });
+        }
+        let id = self.toolbar_note()?;
+        let layout = ToolbarLayout::new(self.note_screen_rect(id)?);
+        let background = self
+            .board
+            .scene()
+            .item(id)
+            .and_then(Item::note_content)?
+            .background_or_default();
+        let hovered = cursor.and_then(|c| layout.hit(c));
+        Some(NoteChrome::Toolbar {
+            layout,
+            background,
+            hovered,
+        })
+    }
+
+    /// The note chrome for the accessibility tree: the edit pill while
+    /// editing, otherwise the toolbar actions for a single selected or
+    /// hovered note.
+    fn note_controls(&self) -> crate::accessibility::NoteControls {
+        if let Some(session) = &self.note_session {
+            return crate::accessibility::NoteControls {
+                buttons: vec![
+                    (PillButton::Cancel.label(), Action::CancelNoteEdit),
+                    (PillButton::Confirm.label(), Action::ConfirmNoteEdit),
+                ],
+                source: Some(session.text()),
+            };
+        }
+        if self.shell.mode() == Mode::Canvas && self.board.selected_note().is_some() {
+            return crate::accessibility::NoteControls {
+                buttons: vec![
+                    (ToolbarButton::Background.label(), Action::NoteBackground),
+                    (ToolbarButton::Edit.label(), Action::EditNote),
+                    (ToolbarButton::Delete.label(), Action::DeleteNote),
+                ],
+                source: None,
+            };
+        }
+        crate::accessibility::NoteControls::default()
+    }
+
+    /// Whether `point` is on a chrome button.
+    fn chrome_button_at(&self, point: DVec2) -> bool {
+        let point = point.as_vec2();
+        match self.note_chrome() {
+            Some(NoteChrome::Pill { layout, .. }) => layout.hit(point).is_some(),
+            Some(NoteChrome::Toolbar { layout, .. }) => layout.hit(point).is_some(),
+            None => false,
+        }
+    }
+
+    /// Tracks which note the toolbar belongs to and its tooltip. Returns
+    /// whether anything visible changed.
+    fn update_note_hover(&mut self, logical: DVec2) -> bool {
+        let point = logical.as_vec2();
+        let world = self
+            .view
+            .camera
+            .screen_to_world(logical, self.view.viewport())
+            .as_vec2();
+        let under = self
+            .board
+            .item_at(world)
+            .filter(|id| self.board.scene().item(*id).is_some_and(Item::is_note));
+        // Moving from the note onto its toolbar keeps the toolbar.
+        let on_toolbar = self.note_hover.filter(|id| {
+            self.note_screen_rect(*id)
+                .is_some_and(|rect| ToolbarLayout::new(rect).contains(point))
+        });
+        let hover = on_toolbar.or(under);
+        let mut changed = hover != self.note_hover;
+        self.note_hover = hover;
+
+        let tooltip = match self.note_chrome() {
+            Some(NoteChrome::Toolbar { layout, .. }) if self.shell.note_color.is_none() => {
+                layout.hit(point).map(|button| {
+                    let rect = layout.button(button);
+                    (
+                        button.label().to_owned(),
+                        DVec2::new(f64::from(rect.min.x), f64::from(rect.max.y)),
+                    )
+                })
+            }
+            Some(NoteChrome::Pill { layout, .. }) => layout.hit(point).map(|button| {
+                let rect = match button {
+                    PillButton::Cancel => layout.cancel,
+                    PillButton::Confirm => layout.confirm,
+                };
+                (
+                    button.label().to_owned(),
+                    DVec2::new(f64::from(rect.min.x), f64::from(rect.max.y)),
+                )
+            }),
+            _ => None,
+        };
+        if tooltip != self.shell.tooltip {
+            self.shell.tooltip = tooltip;
+            self.shell.touch();
+            changed = true;
+        }
+        changed
+    }
+
+    /// Handles a left press on the note chrome. Returns whether it hit a
+    /// button (and so must not reach the board).
+    fn chrome_press(&mut self, position: DVec2, event_loop: &ActiveEventLoop) -> bool {
+        let point = position.as_vec2();
+        match self.note_chrome() {
+            Some(NoteChrome::Pill { layout, .. }) => match layout.hit(point) {
+                Some(PillButton::Confirm) => {
+                    self.execute(Action::ConfirmNoteEdit, event_loop);
+                    true
+                }
+                Some(PillButton::Cancel) => {
+                    self.execute(Action::CancelNoteEdit, event_loop);
+                    true
+                }
+                None => false,
+            },
+            Some(NoteChrome::Toolbar { layout, .. }) => {
+                let Some(button) = layout.hit(point) else {
+                    return false;
+                };
+                let Some(id) = self.toolbar_note() else {
+                    return false;
+                };
+                self.shell.tooltip = None;
+                match button {
+                    ToolbarButton::Background => {
+                        let rect = layout.button(ToolbarButton::Background);
+                        self.open_note_color(
+                            id,
+                            DVec2::new(f64::from(rect.min.x), f64::from(rect.max.y)),
+                        );
+                    }
+                    ToolbarButton::Edit => self.begin_note_edit(id, false),
+                    ToolbarButton::Delete => {
+                        self.board.select_only(id);
+                        self.execute(Action::DeleteNote, event_loop);
+                    }
+                }
+                self.shell.touch();
+                self.redraw();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Opens the background popover for `id` under `anchor`.
+    fn open_note_color(&mut self, id: ItemId, anchor: DVec2) {
+        let Some(content) = self.board.scene().item(id).and_then(Item::note_content) else {
+            return;
+        };
+        self.board.select_only(id);
+        self.shell.menu = None;
+        self.shell.note_color = Some(NoteColorPopover::open(
+            id,
+            content.background_or_default(),
+            anchor,
+            self.viewport(),
+        ));
+        self.shell.touch();
+        self.redraw();
+    }
+
+    /// The anchor for a popover opened from a menu: under the toolbar
+    /// swatch, where the hover toolbar would put it.
+    fn note_color_anchor(&self, id: ItemId) -> DVec2 {
+        self.note_screen_rect(id)
+            .map_or(self.viewport() * 0.5, |rect| {
+                let swatch = ToolbarLayout::new(rect).button(ToolbarButton::Background);
+                DVec2::new(f64::from(swatch.min.x), f64::from(swatch.max.y))
+            })
+    }
+
+    /// Runs a popover result.
+    fn apply_popover_result(&mut self, result: PopoverResult) {
+        match result {
+            PopoverResult::None => {}
+            PopoverResult::Changed => self.shell.touch(),
+            PopoverResult::Closed => {
+                self.shell.note_color = None;
+                self.shell.touch();
+            }
+            PopoverResult::Apply(rgb) => {
+                if let Some(popover) = self.shell.note_color.take() {
+                    self.apply_note_background(popover.note, rgb);
+                }
+                self.shell.touch();
+            }
+            PopoverResult::Pick => {
+                if let Some(popover) = self.shell.note_color.take() {
+                    self.pick_for_note = Some(popover.note);
+                    self.shell.picker = true;
+                    self.shell.title_bar.hide();
+                    self.shell.toast(
+                        "Click a pixel to use it as the note background",
+                        Instant::now(),
+                    );
+                }
+                self.shell.touch();
+            }
+        }
+        self.redraw();
+    }
+
+    /// Sets a note's background as one undo step.
+    fn apply_note_background(&mut self, id: ItemId, rgb: [u8; 3]) {
+        let Some(mut content) = self.board.scene().item(id).and_then(Item::note_content) else {
+            return;
+        };
+        content.background = Some(rgb);
+        if self.board.set_note_content(id, &content) {
+            self.dirty_notes.insert(id);
+            self.after_board();
+        }
+    }
+
+    /// Sets the selected note's height to its laid-out content.
+    fn fit_selected_note(&mut self) {
+        let Some(id) = self.board.selected_note() else {
+            return;
+        };
+        let Some(item) = self.board.scene().item(id) else {
+            return;
+        };
+        let Some(content) = item.note_content() else {
+            return;
+        };
+        let size = item.size();
+        let height = self
+            .note_renderer
+            .content_height(&mut self.text, &content, size);
+        if self.board.fit_note_height(id, height) {
+            self.after_board();
         }
     }
 
@@ -2502,6 +3011,8 @@ impl App {
             }
         } else if self.shell.locked {
             CursorIcon::Default
+        } else if self.chrome_button_at(screen) {
+            CursorIcon::Pointer
         } else {
             let hint = if self.note_session.is_some() {
                 CursorHint::Text
@@ -2547,6 +3058,20 @@ impl App {
         });
         self.last_click = Some((now, item));
 
+        if self.note_session.is_some() && self.board.handle_at(screen, self.view_info()) {
+            // The box stays resizable while editing; a handle press scales
+            // the frame and never moves the caret or ends the edit.
+            let mods = self.current_mods();
+            let view = ViewInfo {
+                camera: &self.view.camera,
+                viewport: self.view.viewport(),
+            };
+            if self.board.pointer_down(screen, view, mods) {
+                self.after_board();
+            }
+            self.redraw();
+            return;
+        }
         if let Some(session_item) = self.note_session.as_ref().map(NoteSession::item) {
             if item == Some(session_item) {
                 self.note_click(world);
@@ -2557,7 +3082,7 @@ impl App {
 
         if double_click && let Some(id) = item {
             if self.board.scene().item(id).is_some_and(Item::is_note) {
-                self.begin_note_edit(id);
+                self.begin_note_edit(id, false);
                 self.note_click(world);
                 return;
             }
@@ -2716,6 +3241,17 @@ impl ApplicationHandler<AppEvent> for App {
                 if menu_changed {
                     self.shell.touch();
                 }
+                if let Some(popover) = self.shell.note_color.as_mut()
+                    && popover.pointer_moved(logical)
+                {
+                    self.shell.touch();
+                }
+                if self.shell.mode() == Mode::Canvas
+                    && self.shell.menu.is_none()
+                    && self.update_note_hover(logical)
+                {
+                    self.redraw();
+                }
                 if self.shell.title_bar.visible()
                     && titlebar::TitleBarLayout::new(viewport).contains(logical)
                 {
@@ -2747,6 +3283,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 if self.shell.title_bar.pointer_left() {
+                    self.shell.touch();
+                    self.redraw();
+                }
+                if self.note_hover.take().is_some() || self.shell.tooltip.take().is_some() {
                     self.shell.touch();
                     self.redraw();
                 }
@@ -2820,6 +3360,15 @@ impl ApplicationHandler<AppEvent> for App {
                     self.apply_menu_result(result, event_loop);
                     return;
                 }
+                if let Some(popover) = self.shell.note_color.as_mut() {
+                    if pressed && button == MouseButton::Left {
+                        let result = popover.click(position);
+                        self.apply_popover_result(result);
+                    } else if pressed {
+                        self.apply_popover_result(PopoverResult::Closed);
+                    }
+                    return;
+                }
                 if self.shell.shortcuts.is_some() || self.shell.settings.is_some() {
                     if pressed
                         && !panels::shortcuts_contains(viewport, position)
@@ -2862,6 +3411,17 @@ impl ApplicationHandler<AppEvent> for App {
                     if pressed {
                         self.start_click(position, event_loop);
                     }
+                    return;
+                }
+                // Note chrome is hit-tested before the board, so pressing a
+                // button never starts a drag or changes the selection.
+                if pressed
+                    && button == MouseButton::Left
+                    && !self.shell.locked
+                    && !self.shell.picker
+                    && self.chrome_press(position, event_loop)
+                {
+                    self.update_cursor_icon(&window, position);
                     return;
                 }
 
@@ -3010,6 +3570,34 @@ impl ApplicationHandler<AppEvent> for App {
                     };
                     if let Some(result) = result {
                         self.apply_settings_panel_result(result);
+                    }
+                    return;
+                }
+                if self.shell.note_color.is_some() {
+                    if pressed {
+                        let ctrl = self.modifiers.control_key();
+                        let result = match (&event.logical_key, chord) {
+                            (Key::Character(_), _) if !ctrl => {
+                                let typed = event.text.as_deref().unwrap_or_default();
+                                let changed = self
+                                    .shell
+                                    .note_color
+                                    .as_mut()
+                                    .is_some_and(|popover| popover.type_text(typed));
+                                if changed {
+                                    PopoverResult::Changed
+                                } else {
+                                    PopoverResult::None
+                                }
+                            }
+                            (_, Some(chord)) => self
+                                .shell
+                                .note_color
+                                .as_mut()
+                                .map_or(PopoverResult::None, |popover| popover.key(chord.key)),
+                            _ => PopoverResult::None,
+                        };
+                        self.apply_popover_result(result);
                     }
                     return;
                 }

@@ -127,6 +127,17 @@ fn print_help() {
     println!("    -h, --help  print this help and exit");
 }
 
+/// The note line, e.g. `notes: 12 (markdown 9, styled 4)`; "styled" counts
+/// notes with a background override.
+fn note_summary(document: &SceneDocument) -> String {
+    format!(
+        "notes: {} (markdown {}, styled {})",
+        document.note_count(),
+        document.markdown_note_count(),
+        document.styled_note_count()
+    )
+}
+
 fn print_document(document: &SceneDocument) {
     println!(
         "  document        schema {}, {} items ({} images, {} notes), {} groups, {} assets",
@@ -137,6 +148,7 @@ fn print_document(document: &SceneDocument) {
         document.groups.len(),
         document.assets.len()
     );
+    println!("  {}", note_summary(document));
     let camera = document.camera();
     println!(
         "  view            eye ({:.2}, {:.2}), zoom {:.0}%, rotation {:.1}°",
@@ -290,5 +302,20 @@ mod tests {
     fn timestamps_are_utc_and_zero_padded() {
         assert_eq!(timestamp(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(timestamp(1_700_000_000_000), "2023-11-14 22:13:20 UTC");
+    }
+
+    #[test]
+    fn the_note_line_counts_markdown_and_styled_notes() {
+        let json = br##"{"schema_version":1,"scene_id":"0123456789abcdeffedcba9876543210","items":[
+            {"id":1,"kind":"note","text":"a","position":[0,0],"size":[10,10]},
+            {"id":2,"kind":"note","text":"b","text_format":"markdown","position":[0,0],"size":[10,10]},
+            {"id":3,"kind":"note","text":"c","text_format":"markdown","background":"#ffffff","position":[0,0],"size":[10,10]},
+            {"id":4,"kind":"note","text":"d","background":"bogus","position":[0,0],"size":[10,10]}
+        ]}"##;
+        let document = rizref_format::SceneDocument::from_json(json).expect("parses");
+        assert_eq!(
+            super::note_summary(&document),
+            "notes: 4 (markdown 2, styled 1)"
+        );
     }
 }

@@ -2,6 +2,70 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Phase 06a — Markdown notes (done)
+
+Delivered on branch `feat/phase-06a-markdown-notes`; closes issue #19. On-disk
+contract: [`format.md` → Note payloads](format.md#note-payloads-v11--phase-06a).
+
+- `rizref-core`: `NoteFormat` (`plain` | `markdown`) and `NoteContent` (text, format,
+  optional opaque background, optional wrap width). `ItemBody::Note` carries all four;
+  absent fields deserialize as plain/default so old payloads keep their meaning.
+  `SetNoteContent` replaces `SetNoteText`, so text, format, background and wrap width
+  undo together; it is one step per commit (coalescing is opt-in). `Item::note_with`
+  builds a note from parsed content; `Item::set_note` reports changes; wrap widths are
+  clamped to 16–10,000 world units.
+- `rizref-format`: `ItemEntry` gains `text_format`, `background` and `wrap_width`
+  (skipped when absent; plain notes omit `text_format`). An invalid background, unknown
+  format or bad wrap width is ignored with a load warning (`LoadedBoard::warnings`),
+  never an error. `schema_version` stays 1; unknown members still round-trip.
+  Thumbnails and PNG export paint note cards in their stored background with a
+  contrast-derived border. `rizref inspect` prints `notes: N (markdown M, styled S)`.
+- `rizref`: `markdown/` — a math pre-pass (`$…$`, `\(…\)`, `$$…$$`, `\[…\]`, skipping
+  code, `\$` escapes, 4 KiB / 128-equation limits), a pulldown-cmark fold into a small
+  block/inline model (headings, emphasis, strike, inline/fenced/indented code, ordered/
+  unordered/task lists, quotes, rules, links, GFM tables, image alt text), and
+  `<span style>` with only `color` (csscolorparser) and `font-size` in px (6–200); all
+  other HTML stays literal. The layout is in world units at the wrap width only, so a
+  resize never moves a line break; glyphs are rasterised at the texture density from
+  the same shaping. Inline math is an atom whose advance and line height reserve the
+  equation; display math is centred in its own block. RaTeX 0.1.15 (embedded KaTeX
+  fonts, transparent background) produces alpha masks tinted by the span colour; parse
+  errors are cached and shown as underlined source.
+- `rizref`: the note renderer (`note.rs`, texture id `rizref-note-v2`) paints the card in
+  its background with WCAG auto-contrast ink (`#f2eee8` / `#1b1b1b`), links in the
+  accent only when it clears 3:1, span colours never adjusted; plain notes keep the
+  phase-04 path. Layouts and math masks are cached; superseded note textures are freed.
+- `rizref`: edit mode edits the source with a screen-constant ✗/✓ pill (top-right);
+  `Esc` cancels, `Ctrl+Enter`/✓/click-outside commit, `Enter` is a newline. New notes
+  are provisional: create + first commit is one undo step, an empty commit or a cancel
+  adds nothing, and cancelling on a saved board restores the clean title. The box stays
+  resizable while editing without rewrapping.
+- `rizref`: rendered-mode hover toolbar (background swatch · edit · delete) drawn in the
+  overlay, hit-tested before board input, with tooltips; a background popover (6 × 2
+  palette, validated `#rrggbb` field, "Pick from screen" through the GPU eyedropper;
+  each applied colour is one undo step). A title-bar ☰ button opens the full menu with
+  a left click; a new **Note** menu holds New note (moved from Image) plus Edit note,
+  Background colour…, Reflow to box width, Fit box to content and Delete note, which
+  also lead the right-click menu when a note is selected.
+- `rizref`: notes are never rotated — the rotate handle is hidden for note-only
+  selections and a mixed selection rotates only its images; legacy rotations load
+  unchanged. AccessKit exposes the ☰ button, the note toolbar/pill buttons and the
+  edited source (read-only).
+- Tests: format round trip with and without the new members, v1-reader simulation,
+  invalid-background tolerance, wrap-width clamping, parser/span/math unit tests with a
+  generated malformed-input corpus, layout structure (wrapping, 24 px line height, math
+  baseline and centring, resize invariance), sampled pixel colours for the two span
+  examples and auto-contrast, board undo semantics, and a `markdown` fuzz target.
+  571 workspace tests pass (3 ignored); clippy and fmt clean; no new `-sys` crate.
+  Measured (release, dev machine): a 4,000-character note lays out in ~116 ms cold and
+  re-renders in ~35 ms with its layout cached; a resize that keeps the wrap width costs
+  ~9 µs of layout; 20 equations render in ~21 ms cold.
+- Deferred: math rasterises on the UI thread rather than a worker (20 equations stay
+  within the 40 ms budget); the warm 4,000-character re-render misses the 8 ms budget
+  (~35 ms) and the 64 MiB note-texture LRU with off-screen eviction is not implemented
+  (one texture per note is kept instead) — both go to phase 07's performance pass; an
+  AccessKit set-value request on the note source is not applied yet.
+
 ## Phase 06 — The `.rizref` file format (done)
 
 Merged 2026-10-29 in PR #18 (branch `feat/phase-06-rizref-format`, merge commit

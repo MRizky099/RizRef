@@ -30,8 +30,8 @@ use std::sync::Arc;
 use glam::{DVec2, Vec2};
 use rizref_codecs::{ImageBuffer, ImageFormat};
 use rizref_core::{
-    Asset, AssetId, Camera, Group, GroupChild, GroupId, Item, ItemId, Rect, Scene, SceneId,
-    Transform,
+    Asset, AssetId, Camera, Group, GroupChild, GroupId, Item, ItemId, NoteContent, NoteFormat,
+    Rect, Scene, SceneId, Transform, clamp_wrap_width,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -160,6 +160,23 @@ pub struct ItemEntry {
     /// Note text, for note items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// How a note's `text` is interpreted: `"plain"` or `"markdown"`. Absent
+    /// means plain, the v1 meaning. An unrecognised value also reads as plain
+    /// (with a load warning) rather than failing the board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_format: Option<String>,
+    /// A note's opaque background, lowercase `#rrggbb`. Kept as written so an
+    /// invalid value can be reported and ignored instead of failing the load.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_string"
+    )]
+    pub background: Option<String>,
+    /// A note's content wrap width in world units, clamped to 16–10,000 on
+    /// load. Absent means the note's inner box width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_width: Option<f32>,
     /// Centre in world units.
     pub position: [f32; 2],
     /// Extent in world units.
@@ -180,6 +197,102 @@ pub struct ItemEntry {
 
 const fn unit_opacity() -> f32 {
     1.0
+}
+
+/// Reads any JSON value as an optional string: a string stays itself, `null`
+/// is absent, and any other value becomes its JSON text, which then fails
+/// validation and is reported as a warning instead of failing the load.
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Null => None,
+        Value::String(text) => Some(text),
+        other => Some(other.to_string()),
+    })
+}
+
+/// The document spelling of a note format.
+pub const fn text_format_name(format: NoteFormat) -> &'static str {
+    match format {
+        NoteFormat::Plain => "plain",
+        NoteFormat::Markdown => "markdown",
+    }
+}
+
+/// Parses a document note format; `None` for an unrecognised value.
+pub fn parse_text_format(name: &str) -> Option<NoteFormat> {
+    match name {
+        "plain" => Some(NoteFormat::Plain),
+        "markdown" => Some(NoteFormat::Markdown),
+        _ => None,
+    }
+}
+
+/// Serialises an opaque colour as lowercase `#rrggbb`.
+pub fn format_background(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+}
+
+/// Parses `#rrggbb` or `#rgb` (any case) into an opaque colour.
+pub fn parse_background(text: &str) -> Option<[u8; 3]> {
+    let hex = text.strip_prefix('#')?;
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let digit = |index: usize| u8::from_str_radix(&hex[index..=index], 16).ok();
+    match hex.len() {
+        6 => {
+            let pair = |index: usize| u8::from_str_radix(&hex[index..index + 2], 16).ok();
+            Some([pair(0)?, pair(2)?, pair(4)?])
+        }
+        3 => Some([digit(0)? * 17, digit(1)? * 17, digit(2)? * 17]),
+        _ => None,
+    }
+}
+
+impl ItemEntry {
+    /// The note content this entry describes. Invalid optional members are
+    /// ignored and reported in `warnings`; they never fail the load.
+    pub fn note_content(&self, warnings: &mut Vec<String>) -> NoteContent {
+        let format = match self.text_format.as_deref() {
+            None => NoteFormat::Plain,
+            Some(name) => parse_text_format(name).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "note {} has unknown text_format {name:?}; read as plain text",
+                    self.id
+                ));
+                NoteFormat::Plain
+            }),
+        };
+        let background = self.background.as_deref().and_then(|text| {
+            let parsed = parse_background(text);
+            if parsed.is_none() {
+                warnings.push(format!(
+                    "note {} has invalid background {text:?}; using the default card",
+                    self.id
+                ));
+            }
+            parsed
+        });
+        let wrap_width = self.wrap_width.and_then(|width| {
+            let clamped = clamp_wrap_width(width);
+            if clamped.is_none() {
+                warnings.push(format!(
+                    "note {} has invalid wrap_width {width}; using the box width",
+                    self.id
+                ));
+            }
+            clamped
+        });
+        NoteContent {
+            text: self.text.clone().unwrap_or_default(),
+            format,
+            background,
+            wrap_width,
+        }
+    }
 }
 
 /// What an item shows.
@@ -303,6 +416,9 @@ pub struct LoadedScene {
     pub scene: Scene,
     /// Assets the document declares as linked but whose bytes were absent.
     pub missing: Vec<AssetId>,
+    /// Recoverable problems the load ignored, such as an invalid note
+    /// background; one human-readable line each.
+    pub warnings: Vec<String>,
 }
 
 impl SceneDocument {
@@ -334,19 +450,28 @@ impl SceneDocument {
             .iter()
             .map(|item| {
                 let transform = item.transform();
-                let (kind, asset, text) = match item.asset() {
-                    Some(asset) => (ItemKind::Image, Some(asset.to_hex()), None),
-                    None => (
-                        ItemKind::Note,
-                        None,
-                        Some(item.text().unwrap_or_default().to_owned()),
-                    ),
+                let note = item.note_content();
+                let kind = if note.is_some() {
+                    ItemKind::Note
+                } else {
+                    ItemKind::Image
                 };
                 ItemEntry {
                     id: item.id().raw(),
                     kind,
-                    asset,
-                    text,
+                    asset: item.asset().map(|asset| asset.to_hex()),
+                    text: note.as_ref().map(|note| note.text.clone()),
+                    // Plain notes omit the member so a v1 board resaved without
+                    // edits stays byte-identical in its note entries.
+                    text_format: note
+                        .as_ref()
+                        .filter(|note| note.format != NoteFormat::Plain)
+                        .map(|note| text_format_name(note.format).to_owned()),
+                    background: note
+                        .as_ref()
+                        .and_then(|note| note.background)
+                        .map(format_background),
+                    wrap_width: note.as_ref().and_then(|note| note.wrap_width),
                     position: [transform.center().x, transform.center().y],
                     size: [transform.size().x, transform.size().y],
                     rotation: transform.rotation(),
@@ -470,6 +595,31 @@ impl SceneDocument {
             .count()
     }
 
+    /// Number of markdown notes.
+    pub fn markdown_note_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| {
+                item.kind == ItemKind::Note && item.text_format.as_deref() == Some("markdown")
+            })
+            .count()
+    }
+
+    /// Number of notes with a valid background override.
+    pub fn styled_note_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| {
+                item.kind == ItemKind::Note
+                    && item
+                        .background
+                        .as_deref()
+                        .and_then(parse_background)
+                        .is_some()
+            })
+            .count()
+    }
+
     /// Rebuilds the core scene from the document, its blobs and its previews.
     ///
     /// `blobs` maps every embedded asset hash to its original bytes. `previews`
@@ -486,6 +636,7 @@ impl SceneDocument {
         let mut declared = BTreeSet::new();
         let mut available = BTreeSet::new();
         let mut missing = Vec::new();
+        let mut warnings = Vec::new();
 
         for entry in &self.assets {
             let id = AssetId::from_hex(&entry.hash).ok_or_else(|| FormatError::Document {
@@ -564,9 +715,9 @@ impl SceneDocument {
                     }
                     Item::image(id, asset, transform.center(), transform.size())
                 }
-                ItemKind::Note => Item::note(
+                ItemKind::Note => Item::note_with(
                     id,
-                    entry.text.clone().unwrap_or_default(),
+                    entry.note_content(&mut warnings),
                     transform.center(),
                     transform.size(),
                 ),
@@ -622,7 +773,11 @@ impl SceneDocument {
         // reattach. It exists to make the distinction explicit at the boundary.
         let _ = available;
 
-        Ok(LoadedScene { scene, missing })
+        Ok(LoadedScene {
+            scene,
+            missing,
+            warnings,
+        })
     }
 }
 
@@ -661,7 +816,9 @@ mod tests {
     };
     use glam::{DVec2, Vec2};
     use rizref_codecs::ImageBuffer;
-    use rizref_core::{Asset, AssetId, Camera, GroupChild, Scene, SceneId};
+    use rizref_core::{
+        Asset, AssetId, Camera, GroupChild, Item, NoteContent, NoteFormat, Scene, SceneId,
+    };
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -864,6 +1021,9 @@ mod tests {
             kind: ItemKind::Image,
             asset: Some("bb".repeat(32)),
             text: None,
+            text_format: None,
+            background: None,
+            wrap_width: None,
             position: [0.0, 0.0],
             size: [10.0, 10.0],
             rotation: 0.0,
@@ -940,5 +1100,159 @@ mod tests {
         assert!(rect[1] <= -25.0);
         assert!(rect[2] >= 240.0);
         assert!(rect[3] >= 30.0);
+    }
+
+    fn note_entry(extra_json: &str) -> ItemEntry {
+        let json = format!(
+            r#"{{"id":9,"kind":"note","text":"hi","position":[0,0],"size":[100,50]{extra_json}}}"#
+        );
+        serde_json::from_str(&json).expect("entry parses")
+    }
+
+    #[test]
+    fn note_fields_round_trip_through_a_document() {
+        let mut scene = Scene::new(scene_id());
+        let note = scene.insert_note("**bold**", Vec2::ZERO, Vec2::new(200.0, 100.0));
+        let content = NoteContent {
+            text: "**bold** <span style=\"color: red\">red</span>".into(),
+            format: NoteFormat::Markdown,
+            background: Some([0xfa, 0xf0, 0xe6]),
+            wrap_width: Some(172.5),
+        };
+        scene.item_mut(note).expect("note").set_note(&content);
+        let document = SceneDocument::from_scene(&scene, "n", &Camera::default(), Vec::new());
+
+        let json = String::from_utf8(document.to_json().expect("json")).expect("utf-8");
+        assert!(json.contains(r#""text_format":"markdown""#), "{json}");
+        assert!(json.contains(r##""background":"#faf0e6""##), "{json}");
+        assert!(json.contains(r#""wrap_width":172.5"#), "{json}");
+
+        let back = SceneDocument::from_json(json.as_bytes()).expect("parses");
+        let loaded = back
+            .build_scene(&BTreeMap::new(), &BTreeMap::new())
+            .expect("scene");
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(
+            loaded.scene.item(note).and_then(Item::note_content),
+            Some(content)
+        );
+        assert_eq!(back.markdown_note_count(), 1);
+        assert_eq!(back.styled_note_count(), 1);
+    }
+
+    #[test]
+    fn a_note_without_the_new_fields_omits_them_and_loads_as_plain() {
+        let entry = note_entry("");
+        let mut warnings = Vec::new();
+        let content = entry.note_content(&mut warnings);
+
+        assert!(warnings.is_empty());
+        assert_eq!(content.format, NoteFormat::Plain);
+        assert_eq!(content.background, None);
+        assert_eq!(content.wrap_width, None);
+
+        let mut scene = Scene::new(scene_id());
+        let id = scene.insert_note("plain", Vec2::ZERO, Vec2::splat(80.0));
+        let mut plain = scene.item(id).and_then(Item::note_content).expect("note");
+        plain.format = NoteFormat::Plain;
+        scene.item_mut(id).expect("note").set_note(&plain);
+        let document = SceneDocument::from_scene(&scene, "n", &Camera::default(), Vec::new());
+        let json = String::from_utf8(document.to_json().expect("json")).expect("utf-8");
+        for member in ["text_format", "background", "wrap_width"] {
+            assert!(!json.contains(member), "{member} must be omitted: {json}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_background_is_ignored_with_a_warning() {
+        for bad in [
+            r#""red""#,
+            r##""#12345""##,
+            r##""#gg0000""##,
+            "17",
+            "[1,2,3]",
+        ] {
+            let entry = note_entry(&format!(r#","background":{bad}"#));
+            let mut warnings = Vec::new();
+            let content = entry.note_content(&mut warnings);
+            assert_eq!(content.background, None, "{bad}");
+            assert_eq!(warnings.len(), 1, "{bad}: {warnings:?}");
+        }
+        let entry = note_entry(r#","background":null"#);
+        let mut warnings = Vec::new();
+        assert_eq!(entry.note_content(&mut warnings).background, None);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn short_and_upper_case_backgrounds_are_normalised() {
+        assert_eq!(super::parse_background("#FFF"), Some([255, 255, 255]));
+        assert_eq!(super::parse_background("#302C25"), Some([0x30, 0x2c, 0x25]));
+        assert_eq!(super::parse_background("302c25"), None);
+        assert_eq!(super::parse_background("#é0000"), None);
+        assert_eq!(super::format_background([0xab, 0x01, 0xff]), "#ab01ff");
+    }
+
+    #[test]
+    fn wrap_width_is_clamped_on_load_and_an_unknown_format_reads_as_plain() {
+        let mut warnings = Vec::new();
+        assert_eq!(
+            note_entry(r#","wrap_width":2"#)
+                .note_content(&mut warnings)
+                .wrap_width,
+            Some(16.0)
+        );
+        assert_eq!(
+            note_entry(r#","wrap_width":99999"#)
+                .note_content(&mut warnings)
+                .wrap_width,
+            Some(10_000.0)
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(
+            note_entry(r#","wrap_width":-3"#)
+                .note_content(&mut warnings)
+                .wrap_width,
+            None
+        );
+        let content = note_entry(r#","text_format":"asciidoc""#).note_content(&mut warnings);
+        assert_eq!(content.format, NoteFormat::Plain);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    #[test]
+    fn a_v1_reader_keeps_the_new_note_members_as_unknown_fields() {
+        // A v1 build's ItemEntry has no note members: simulate it by parsing
+        // into a struct that only knows the v1 fields plus the flattened map.
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct V1Entry {
+            id: u64,
+            kind: String,
+            text: Option<String>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, serde_json::Value>,
+        }
+        let json = r##"{"id":2,"kind":"note","text":"# hi","text_format":"markdown","background":"#ffffff","wrap_width":120.0,"position":[0,0],"size":[10,10]}"##;
+        let v1: V1Entry = serde_json::from_str(json).expect("v1 parses");
+        for member in ["text_format", "background", "wrap_width"] {
+            assert!(v1.extra.contains_key(member), "{member} lands in extra");
+        }
+        assert_eq!(v1.text.as_deref(), Some("# hi"));
+        assert_eq!(v1.kind, "note");
+        let resaved = serde_json::to_string(&v1).expect("resaves");
+        let back: ItemEntry = serde_json::from_str(&resaved).expect("06a parses the resave");
+        assert_eq!(back.text_format.as_deref(), Some("markdown"));
+        assert_eq!(back.background.as_deref(), Some("#ffffff"));
+        assert_eq!(back.wrap_width, Some(120.0));
+        assert_eq!(back.id, 2);
+    }
+
+    #[test]
+    fn unknown_note_members_still_round_trip_beside_the_new_ones() {
+        let entry = note_entry(r##","background":"#000000","future":{"a":1}"##);
+        assert!(entry.extra.contains_key("future"));
+        let json = serde_json::to_string(&entry).expect("serialises");
+        assert!(json.contains(r#""future":{"a":1}"#), "{json}");
+        assert!(json.contains(r##""background":"#000000""##), "{json}");
     }
 }

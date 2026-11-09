@@ -91,6 +91,8 @@ pub struct LoadedBoard {
     pub thumbnail: Option<Preview>,
     /// Linked assets whose bytes were absent; they load as placeholders.
     pub missing: Vec<AssetId>,
+    /// Recoverable document problems the load ignored, one line each.
+    pub warnings: Vec<String>,
     /// Whether the board was recovered from an interrupted save rather than a
     /// clean footer.
     pub recovered: bool,
@@ -342,7 +344,11 @@ impl<S: Read + Seek> BoardReader<S> {
             }
         }
 
-        let LoadedScene { scene, missing } = {
+        let LoadedScene {
+            scene,
+            missing,
+            warnings,
+        } = {
             let standard = self.header.scene_id.to_hex();
             if document.scene_id != standard {
                 return Err(FormatError::Document {
@@ -371,6 +377,7 @@ impl<S: Read + Seek> BoardReader<S> {
             name,
             thumbnail,
             missing,
+            warnings,
             recovered: self.recovered,
         })
     }

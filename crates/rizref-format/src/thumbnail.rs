@@ -11,7 +11,8 @@
 //! pixels just to draw a picture 512 px wide. The result is saved as JPEG when
 //! the board background is opaque, and PNG when a caller asks for transparency.
 //!
-//! Notes are drawn as translucent cards; their text is not rendered. A
+//! Notes are drawn as cards in their stored background colour (or the default
+//! thumbnail card when they have none); their text is not rendered. A
 //! thumbnail is a navigation aid, not a readable export.
 
 use glam::Vec2;
@@ -167,22 +168,48 @@ fn draw_item(pixmap: &mut Pixmap, scene: &Scene, item: &Item, origin: Vec2, scal
         else {
             return;
         };
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(
-            NOTE_COLOUR[0],
-            NOTE_COLOUR[1],
-            NOTE_COLOUR[2],
-            NOTE_COLOUR[3],
-        );
-        paint.shader = tiny_skia::Shader::SolidColor(Color::from_rgba8(
-            NOTE_COLOUR[0],
-            NOTE_COLOUR[1],
-            NOTE_COLOUR[2],
-            (f32::from(NOTE_COLOUR[3]) * opacity).round() as u8,
-        ));
+        let (fill, border) = note_card_colours(item);
         let transform = Transform::from_translate(center.x, center.y)
             .pre_concat(Transform::from_rotate(rotation_deg));
+        let mut paint = Paint {
+            shader: tiny_skia::Shader::SolidColor(Color::from_rgba8(
+                fill[0],
+                fill[1],
+                fill[2],
+                (f32::from(fill[3]) * opacity).round() as u8,
+            )),
+            ..Paint::default()
+        };
         pixmap.fill_rect(rect, &paint, transform, None);
+        if let Some(border) = border {
+            paint.shader = tiny_skia::Shader::SolidColor(Color::from_rgba8(
+                border[0],
+                border[1],
+                border[2],
+                (255.0 * opacity).round() as u8,
+            ));
+            let path = tiny_skia::PathBuilder::from_rect(rect);
+            let stroke = tiny_skia::Stroke {
+                width: 1.0,
+                ..tiny_skia::Stroke::default()
+            };
+            pixmap.stroke_path(&path, &paint, &stroke, transform, None);
+        }
+    }
+}
+
+/// The fill and border colours of a note card. A note with a stored
+/// background is painted in that opaque colour with a border nudged towards
+/// its contrasting ink; a note without one keeps the phase-06 card.
+fn note_card_colours(item: &Item) -> ([u8; 4], Option<[u8; 3]>) {
+    match item.note_content().and_then(|note| note.background) {
+        Some([r, g, b]) => {
+            let luminance = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+            let toward: f32 = if luminance < 128.0 { 255.0 } else { 0.0 };
+            let mix = |channel: u8| (f32::from(channel) * 0.75 + toward * 0.25).round() as u8;
+            ([r, g, b, 255], Some([mix(r), mix(g), mix(b)]))
+        }
+        None => (NOTE_COLOUR, None),
     }
 }
 
@@ -454,5 +481,30 @@ mod tests {
         let decoded = decode_preview(&opaque_bytes).expect("decode");
         assert_eq!((decoded.width(), decoded.height()), (4, 3));
         assert_eq!((decode_preview(&alpha_bytes).expect("decode").width()), 4);
+    }
+
+    #[test]
+    fn a_note_card_is_painted_in_its_stored_background() {
+        let mut scene = Scene::new(SceneId::from_bytes([2; 16]));
+        let id = scene.insert_note("n", Vec2::ZERO, Vec2::splat(100.0));
+        let mut content = scene
+            .item(id)
+            .and_then(rizref_core::Item::note_content)
+            .expect("note");
+        content.background = Some([20, 120, 220]);
+        scene.item_mut(id).expect("note").set_note(&content);
+
+        let image = composite(&scene, [0, 0, 0, 255], 100, None).expect("composite");
+        let centre = (50 * image.width() + 50) as usize * 4;
+        assert_eq!(&image.pixels()[centre..centre + 4], &[20, 120, 220, 255]);
+
+        content.background = None;
+        scene.item_mut(id).expect("note").set_note(&content);
+        let image = composite(&scene, [0, 0, 0, 255], 100, None).expect("composite");
+        assert_ne!(
+            &image.pixels()[centre..centre + 3],
+            &[20, 120, 220],
+            "a note without a background keeps the default card"
+        );
     }
 }

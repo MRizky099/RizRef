@@ -118,6 +118,22 @@ pub enum Action {
     SetTheme(CanvasTheme),
     /// Arm the colour picker.
     ColorPicker,
+    /// Open the full command menu under the title bar's ☰ button.
+    OpenMainMenu,
+    /// Enter edit mode on the selected note.
+    EditNote,
+    /// Open the selected note's background popover.
+    NoteBackground,
+    /// Set the selected note's wrap width to its box width.
+    ReflowNote,
+    /// Set the selected note's height to its content.
+    FitNote,
+    /// Delete the selected note.
+    DeleteNote,
+    /// Commit the note being edited (✓).
+    ConfirmNoteEdit,
+    /// Cancel the note being edited (✗).
+    CancelNoteEdit,
 }
 
 impl Action {
@@ -297,6 +313,40 @@ pub struct MenuContext<'a> {
     pub always_on_top: bool,
     /// The ordinary opacity percent.
     pub opacity_percent: u8,
+    /// Whether exactly one note is selected (enables the note commands).
+    pub note_selected: bool,
+}
+
+/// The note commands for one selected note, in menu order.
+pub fn note_actions() -> Vec<MenuEntry> {
+    vec![
+        MenuEntry::item("Edit note", Action::EditNote),
+        MenuEntry::item("Background colour…", Action::NoteBackground),
+        MenuEntry::item("Reflow to box width", Action::ReflowNote),
+        MenuEntry::item("Fit box to content", Action::FitNote),
+        MenuEntry::separator(),
+        MenuEntry::item("Delete note", Action::DeleteNote),
+    ]
+}
+
+/// The right-click menu: the note commands (or `New note`) as the top group,
+/// then the full command tree.
+pub fn build_context(context: &MenuContext) -> Vec<MenuEntry> {
+    let mut entries = if context.note_selected {
+        note_actions()
+    } else {
+        accelerate(
+            vec![MenuEntry::shortcut(
+                "New note",
+                ShortcutId::CreateNote,
+                Action::from_shortcut(ShortcutId::CreateNote),
+            )],
+            context.shortcuts,
+        )
+    };
+    entries.push(MenuEntry::separator());
+    entries.extend(build(context));
+    entries
 }
 
 /// Builds the full command menu for the current state.
@@ -464,11 +514,6 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
             S::UngroupSelection,
             Action::from_shortcut(S::UngroupSelection),
         ),
-        MenuEntry::shortcut(
-            "New note",
-            S::CreateNote,
-            Action::from_shortcut(S::CreateNote),
-        ),
         MenuEntry::separator(),
         MenuEntry::submenu("Align", align),
     ];
@@ -586,10 +631,21 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
         MenuEntry::item("About RizRef", Action::About),
     ];
 
+    let mut note = vec![MenuEntry::shortcut(
+        "New note",
+        S::CreateNote,
+        Action::from_shortcut(S::CreateNote),
+    )];
+    if context.note_selected {
+        note.push(MenuEntry::separator());
+        note.extend(note_actions());
+    }
+
     let root = vec![
         MenuEntry::submenu("File", file),
         MenuEntry::submenu("Edit", edit),
         MenuEntry::submenu("Image", image),
+        MenuEntry::submenu("Note", note),
         MenuEntry::submenu("View", view),
         MenuEntry::submenu("Canvas", canvas),
         MenuEntry::submenu("Tools", tools),
@@ -1050,7 +1106,7 @@ fn last_selectable(entries: &[MenuEntry]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, MenuContext, MenuEntry, MenuResult, MenuState, build};
+    use super::{Action, MenuContext, MenuEntry, MenuResult, MenuState, build, build_context};
     use crate::input::Command;
     use crate::recents::Recents;
     use crate::settings::Settings;
@@ -1071,7 +1127,73 @@ mod tests {
             click_through: false,
             always_on_top: false,
             opacity_percent: 100,
+            note_selected: false,
         }
+    }
+
+    fn labels(entries: &[MenuEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.label.as_str()).collect()
+    }
+
+    #[test]
+    fn the_note_menu_holds_new_note_and_the_note_commands_when_one_is_selected() {
+        let settings = Settings::default();
+        let shortcuts = Shortcuts::new();
+        let recents = Recents::default();
+        let mut ctx = context(&settings, &shortcuts, &recents);
+        let root = build(&ctx);
+        let note = root
+            .iter()
+            .find(|entry| entry.label == "Note")
+            .expect("Note menu");
+        assert_eq!(labels(&note.children), ["New note"]);
+        let image = root
+            .iter()
+            .find(|entry| entry.label == "Image")
+            .expect("Image");
+        assert!(
+            !labels(&image.children).contains(&"New note"),
+            "moved, not duplicated"
+        );
+
+        ctx.note_selected = true;
+        let root = build(&ctx);
+        let note = root
+            .iter()
+            .find(|entry| entry.label == "Note")
+            .expect("Note menu");
+        let names = labels(&note.children);
+        for wanted in [
+            "New note",
+            "Edit note",
+            "Background colour…",
+            "Reflow to box width",
+            "Fit box to content",
+            "Delete note",
+        ] {
+            assert!(names.contains(&wanted), "{wanted} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn the_context_menu_leads_with_new_note_or_the_note_commands() {
+        let settings = Settings::default();
+        let shortcuts = Shortcuts::new();
+        let recents = Recents::default();
+        let mut ctx = context(&settings, &shortcuts, &recents);
+        assert_eq!(build_context(&ctx)[0].label, "New note");
+        assert_eq!(
+            build_context(&ctx)[0].action,
+            Some(Action::Command(Command::CreateNote))
+        );
+        ctx.note_selected = true;
+        let menu = build_context(&ctx);
+        assert_eq!(menu[0].action, Some(Action::EditNote));
+        assert!(
+            menu.iter()
+                .any(|entry| entry.action == Some(Action::ReflowNote))
+        );
+        assert!(menu.iter().any(|entry| entry.label == "File"));
     }
 
     fn viewport() -> DVec2 {

@@ -2,6 +2,9 @@
 
 Status: **implemented** in `crates/rizref-format` (phase 06). This document is the
 normative description of the bytes; the crate is the reference implementation.
+The optional note fields in [Note payloads](#note-payloads-v11--phase-06a) are an
+additive revision implemented in phase 06a; the `source_url` provenance semantics are
+planned for phase 06b. The container and `schema_version` stay 1 in both.
 
 A `.rizref` file is one board: the scene (items, groups, notes, assets, view), the
 original image bytes, a thumbnail and the provenance hints needed to re-link an image
@@ -141,8 +144,15 @@ reading the final 80 bytes.
 * `assets[].embedded = false` declares a **linked** asset: no `BLOB` is required, the
   reader reports it as missing instead of failing the board, and `source_path` /
   `source_url` are hints for a relink flow. The v1 interface always embeds.
-* `origin` is `file`, `clipboard`, `generated` or `unknown`. All provenance is
-  advisory; a board always loads from its embedded bytes.
+* `origin` is `file`, `clipboard`, `generated` or `unknown`. `clipboard` also covers a
+  browser drag or a virtual file that arrived without a durable local path. All
+  provenance is advisory; a board always loads from its embedded bytes.
+* `source_path` is a durable local path when the image was imported from one.
+  `source_url` is populated for an image pasted or dragged from a browser when the
+  source exposes one (**planned, phase 06b**). It is the preferred *Open location*
+  target and only `http`/`https` URLs are ever launched. A browser drag that also
+  produces a temporary cache file stores the URL rather than the cache path; a
+  URL-only drag or clipboard link is never downloaded on paste.
 * `preview` describes the corresponding `PREV` chunk when there is one.
 * `scene_rect` is informational; the live rectangle is recomputed from the items.
 
@@ -152,6 +162,64 @@ may not change the meaning of an existing field without bumping `schema_version`
 reader refuses a document whose `schema_version` is above its own rather than guessing.
 The migration scaffold lives in `SceneDocument::from_value`: v1 parses directly, and a
 future revision inserts a rewrite arm.
+
+### Note payloads (v1.1 — phase 06a)
+
+The markdown-notes phase adds three optional members to note items. Nothing else in the
+document or the container changes, and `schema_version` remains **1**: the new members
+are additive, and a note without `text_format` still means exactly what it meant in v1
+(plain text). The full design is in the phase plan; this section is the on-disk contract.
+
+```jsonc
+{
+  "id": 2,
+  "kind": "note",
+  "text": "This is **bold** and <span style=\"color: #ff5733\">orange</span>.",
+  "text_format": "markdown",   // optional: "plain" | "markdown"; absent = "plain"
+  "background": "#302c25",     // optional: opaque #rrggbb; absent = the default card
+  "wrap_width": 332.0,         // optional: content wrap width in world units
+  "position": [x, y],
+  "size": [w, h],
+  "rotation": 0.0,
+  "opacity": 1.0,
+  "flip": [false, false]
+}
+```
+
+* `text` is the note's source. With `text_format = "markdown"` it is rendered as the
+  markdown subset documented in the phase plan; with `"plain"` (or no member) it is
+  rendered as plain UTF-8 with `\n` line breaks, exactly as in v1.
+* `background` is an opaque sRGB colour, serialised as lowercase `#rrggbb`. A reader also
+  accepts `#rgb` and normalises it. An invalid value is ignored with a warning and the
+  default card colour is used; **it must not fail the load**. The default is `#302c25`,
+  the phase-04/05 card colour. Text colour is derived from the background at render
+  time (light ink on dark backgrounds and vice versa); it is not stored.
+* `wrap_width` is the width, in world units, at which the note's content was last laid
+  out. Resizing the note changes `size` but never reflows the content; an explicit
+  “Reflow to box width” action updates `wrap_width`. Values are finite and clamped to
+  16–10,000. When absent, the renderer uses `size[0] - 2 × 14` (the note's inner width),
+  which is the v1 behaviour. It never affects hit-testing or `size`.
+* `rotation` is preserved for legacy boards. From phase 06a on, the editor never creates
+  a rotated note; notes are excluded from rotation gestures and commands.
+* Unknown members are still preserved. A v1 reader sees the three new members in its
+  per-item `extra` map, ignores them while rendering, and writes them back on resave.
+* An unknown `text_format` value reads as plain text and an out-of-range `wrap_width`
+  is clamped (or, when not a positive number, ignored); like an invalid `background`,
+  each is reported as a load warning and never fails the board. A plain note is written
+  without `text_format`, so a v1 board resaved without note edits keeps its v1 note
+  entries.
+* `rizref inspect` reports `notes: N (markdown M, styled S)`, where *styled* counts
+  notes with a valid `background`.
+
+**Why no `schema_version` bump?** Bumping it would make every v1 build refuse the entire
+board, including its images, even though the additions are optional. The format's own
+rule allows new optional members; the meaning of the existing `text` field is unchanged
+for a note without `text_format`. If a later revision needs to change an existing field's
+meaning, that is a `schema_version: 2` decision with a hard gate.
+
+**Index and thumbnail.** The `INDX` JSON is unchanged. `THMB` and PNG export paint a
+note card in its stored `background` colour when the field is present; note text remains
+unrendered in thumbnails, as in phase 06.
 
 ## Board index — `INDX` JSON
 
@@ -256,3 +324,11 @@ file; 2 means a bad command line.
 * JSON is the deliberate trade for the document: human-inspectable, tolerant of
   unknown fields, and a few tens of kilobytes for hundreds of items. The chunk
   framing leaves room for a binary `DOC2` later without breaking v1 readers.
+
+## Revision history
+
+| Revision | Phase | Change |
+|---|---|---|
+| 1 | 06 | Initial container, chunk stream, index/footer, scene document, blobs and previews. |
+| 1.1 | 06a | Additive note members `text_format`, `background`, `wrap_width`. No container change; `schema_version` stays 1. |
+| 1.2 (planned) | 06b | No new members. `source_url` is populated for browser pastes/drags; `origin`/`source_path` semantics clarified. |
