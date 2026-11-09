@@ -14,7 +14,7 @@ your painting app.
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
 [![Rust](https://img.shields.io/badge/rust-stable%20·%202024%20edition-orange?logo=rust)](rust-toolchain.toml)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-0078D6?logo=windows)](#requirements)
-[![Linux & macOS](https://img.shields.io/badge/Linux%20%26%20macOS-in%20progress-lightgrey)](#status)
+[![Linux & macOS](https://img.shields.io/badge/Linux-preview%20·%20macOS%20in%20progress-lightgrey)](#status)
 
 </div>
 
@@ -91,8 +91,10 @@ your notes and a thumbnail, all in one file you can copy anywhere.
 No runtime or redistributable is needed. The C runtime is linked in, and the exe only
 uses DLLs that ship with Windows.
 
-Linux and macOS 10.13+ builds are in progress (see [Status](#status)). v1.0.0 will be
-released for all three platforms together.
+Linux (x86_64, X11 or Wayland, glibc 2.35 / Ubuntu 22.04 or newer, a **Vulkan**
+driver) builds from source as a preview; packages arrive with phase 08c. macOS 10.13+
+is in progress (see [Status](#status)). v1.0.0 will be released for all three
+platforms together.
 
 ## Installation
 
@@ -172,6 +174,9 @@ Right-click anywhere (or click **☰** in the title bar) for every command.
 |---|---|
 | Settings, recent boards | `%APPDATA%\RizRef` |
 | Logs (14 days), crash dumps, autosave recovery copies | `%LOCALAPPDATA%\RizRef` (**Help → Open logs folder**) |
+| Linux: settings, recent boards | `$XDG_CONFIG_HOME/rizref` (default `~/.config/rizref`) |
+| Linux: logs, autosave recovery copies | `$XDG_STATE_HOME/rizref` (default `~/.local/state/rizref`) |
+| macOS: settings, autosave / logs | `~/Library/Application Support/RizRef` / `~/Library/Logs/RizRef` |
 
 Command line: `rizref --help`, `rizref --version`, `rizref <board.rizref>`,
 `rizref inspect <board.rizref> [--verify]`, and `-v` for debug logging.
@@ -183,7 +188,9 @@ needs DX12; on Vulkan it fades the whole window instead.
 | Phase | Scope | State |
 |---|---|---|
 | 00–07 | Windows app: canvas, import, editing, UI shell, `.rizref` format, notes, provenance, performance, packaging | ✅ merged |
-| 08 | Linux (X11 + Wayland) and macOS 10.13+ ports, installer + portable for every OS | 🚧 in progress |
+| 08a | Portability layer + Linux (X11 + Wayland): per-OS platform glue, XDG directories, `rizref register` / `thumbnail`, CI on Windows, Linux and macOS | ✅ done ([#26](https://github.com/MRizky099/RizRef/pull/26)) |
+| 08b | macOS 10.13+ (Metal, Finder integration, ⌘ shortcuts) | 🚧 next |
+| 08c | Installer + portable build for every OS, the three-platform release workflow | ⏳ after 08b |
 | **v1.0.0** | One release for Windows, Linux and macOS | ⏳ after phase 08 |
 
 Each phase is one GitHub issue and one PR, summarised in
@@ -276,10 +283,11 @@ Lints are workspace-wide (`[workspace.lints]`):
 - `unsafe_code` is denied in every crate.
 - Public items must be documented.
 - `todo!()` and `unimplemented!()` are denied.
-- Win32 calls are confined to `rizref::platform`.
+- OS calls are confined to `rizref::platform` (`windows/`, `unix/`, `linux/`, `macos/`).
 
-CI runs `fmt`, `clippy`, `test` and the dependency audit on `windows-latest`, plus the
-fuzz matrix.
+CI runs `fmt`, `clippy`, `test` and the dependency audit on `windows-latest`,
+`ubuntu-22.04` and `macos-14` (with an `x86_64-apple-darwin` cross-check), plus the fuzz
+matrix.
 
 Release builds use fat LTO at `opt-level = "s"` and link the C runtime statically
 (`.cargo/config.toml`), so `rizref.exe` imports operating-system DLLs only.
@@ -302,7 +310,7 @@ crates. These are the pinned versions:
 
 | Concern | Crate | Version | Notes |
 |---|---|---|---|
-| Windowing/input | `winit` | 0.30.13 | pure Rust; talks to `windows-sys` |
+| Windowing/input | `winit` | 0.30.13 | pure Rust; `windows-sys` on Windows, X11/Wayland through `dlopen` on Linux, `objc2` on macOS |
 | GPU rendering | `wgpu` | 30.0.1 | DX12 + Vulkan; Metal/WebGPU/GL off |
 | 2D raster fallback, HUD | `tiny-skia` | 0.12.0 | pure Rust |
 | Text shaping | `cosmic-text` | 0.19.0 | `fontconfig` off (it is a C library) |
@@ -317,16 +325,17 @@ crates. These are the pinned versions:
 | BMP, TGA, PNM, QOI | `image` | 0.25.10 | `default-features = false`; only those four backends |
 | ICO | `ico` | 0.6.0 | largest embedded image wins |
 | HEIF/HEIC | `heic-rs` | 0.1.4 | pure Rust, no `unsafe`, no build script; `parallel` off |
-| AVIF | none (OS bridge) | — | Windows codec; needs the AV1 Video Extension |
-| Clipboard | `arboard` | 3.7.0 | OS FFI only |
-| Native dialogs | `rfd` | 0.17.2 | COM `IFileDialog` FFI |
+| AVIF | none (OS bridge) | — | Windows codec; needs the AV1 Video Extension. Not supported on Linux/macOS yet (phase-08 decision) |
+| Clipboard | `arboard` | 3.7.0 | OS FFI only; `wayland-data-control` on Linux (`wl-clipboard-rs`, pure Rust) |
+| Native dialogs | `rfd` | 0.17.2 | COM `IFileDialog` FFI; xdg-desktop-portal over D-Bus on Linux (`ashpd`/`zbus`, not GTK) |
 | Import workers | `crossbeam-channel` | 0.5.17 | pure Rust, no async runtime |
 | Serialization | `serde` / `serde_json` | 1.0.229 / 1.0.154 | pure Rust |
 | Compression | `lz4_flex` | 0.14.0 | pure Rust |
 | Hashing | `blake3` | 1.8.7 | asset identity and container checksums; `features = ["pure"]` (see below) |
 | Logging | `tracing` / `tracing-subscriber` | 0.1.44 / 0.3.23 | pure Rust |
-| Platform FFI | `windows` | 0.62.2 | Win32/COM declarations: mutex, pipe, dialogs, OLE drop target, registry, shell |
-| COM support | `windows-core` | 0.62.2 | required by the `#[implement]` macro; pure Rust |
+| Platform FFI | `windows` | 0.62.2 | Windows only. Win32/COM declarations: mutex, pipe, dialogs, OLE drop target, registry, shell |
+| COM support | `windows-core` | 0.62.2 | Windows only. Required by the `#[implement]` macro; pure Rust |
+| Fallback UI font | `ratex-katex-fonts` | =0.1.15 | Linux/macOS: KaTeX_SansSerif (SIL OFL 1.1), already embedded for math, registered as the last-resort face |
 
 #### The pure-Rust rule, and how it is checked
 
@@ -348,6 +357,25 @@ Audit result for the current tree (`x86_64-pc-windows-msvc`, `normal,build`):
 Phase 06a's additions (`pulldown-cmark`, `csscolorparser`, the `ratex-*` crates) and
 phase 07 add **no** `-sys` crate. Phase 07 only grows the `windows` feature list (crash
 dumps through the OS's `dbghelp.dll`, registration, the thumbnail provider).
+
+Linux and macOS (phase 08a; `scripts/audit-native.sh <triple> [build-dir]`, run by CI
+for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-apple-darwin`). The
+accepted family grows by declaration-only and `dlopen` crates, as the phase-08 plan
+states:
+
+| Target | `-sys` crate | Why it is accepted |
+|---|---|---|
+| Linux | `wayland-sys` | libwayland reached through `dlopen` (feature checked by the script); never linked |
+| Linux | `linux-raw-sys` | `rustix`'s system-call declarations, pure Rust |
+| macOS | `core-foundation-sys` | CoreFoundation declarations; the framework ships with the OS |
+| macOS | `objc-sys` | Objective-C runtime declarations (`objc2` 0.5, via winit and AccessKit); `libobjc` ships with the OS |
+| all | `renderdoc-sys`, the `windows-sys` family | as above (Win32 crates appear only as host-side build-tool dependencies off Windows) |
+
+`wayland-backend` lists `cc` as a build dependency but compiles its C log shim only with
+its `log` feature, which nothing enables; the script fails if it ever is. Beyond names,
+the script fails if any build script left an object file or static library in its
+`OUT_DIR` (BLAKE3's empty flag probe excepted), which catches C compiled by a crate
+whose name does not end in `-sys`.
 
 Deliberate exclusions, recorded rather than hidden:
 
