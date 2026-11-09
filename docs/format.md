@@ -315,6 +315,15 @@ A reader that only needs the name and thumbnail (recents list, Explorer provider
 reads the header, footer, index, `NAME` and `THMB` — a handful of seeks regardless of
 board size.
 
+### Shell thumbnails (phase 07)
+
+`rizref_thumb.dll`, the Explorer thumbnail provider, links `rizref-format` and calls
+`BoardReader::thumbnail_image` on the stream Explorer hands it: the decoded `THMB`
+picture, or — for a file without one — a composite of the document and the `PREV`
+chunks, drawn by the same compositor that writes `THMB` (notes as cards in their
+`background` colour, else the default card). Originals are never read. Writers must
+therefore keep `THMB` representative of the board; every save in v1 regenerates it.
+
 ## Verification
 
 `rizref inspect --verify` walks every chunk, decodes it, checks the index and footer
@@ -346,3 +355,4 @@ file; 2 means a bad command line.
 | 1 | 06 | Initial container, chunk stream, index/footer, scene document, blobs and previews. |
 | 1.1 | 06a | Additive note members `text_format`, `background`, `wrap_width`. No container change; `schema_version` stays 1. |
 | 1.2 | 06b | No new members. `source_url` is populated for browser pastes/drags; `origin`/`source_path` semantics, untrusted-URL handling and the dedup merge are specified. `schema_version` stays 1. |
+| 1.2 | 07 | No format change. Documented the shell-thumbnail read path; saves retry a refused final rename briefly and refuse a read-only target before writing; autosave recovery copies are ordinary v1 boards. |

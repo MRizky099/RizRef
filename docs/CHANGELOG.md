@@ -2,6 +2,119 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Phase 07 — Polish & ship (done)
+
+Branch `feat/phase-07-polish-and-ship`, closes issue #8. Version **1.0.0**, licensed
+MIT OR Apache-2.0. No format change ([`format.md`](format.md) revision 1.2 gains a
+documentation-only phase-07 row). Measurements: README → "Performance budgets"
+(reference laptop: i7-4720HQ, GTX 950M, Windows 10 22H2).
+
+Performance — every phase-00 budget measured by a committed harness, and met:
+
+- Cold start: the first frame waited for the GPU (1,059 ms median, ~800 ms of it the
+  NVIDIA driver creating the instance and device). `renderer::GpuDevice` (instance,
+  adapter, device, pipelines) is now built on a thread started after the first frame,
+  and until it arrives frames are the CPU-painted shell layer blitted with
+  `SetDIBitsToDevice` (`platform::gdi`). First frame **130 ms** median, 226 ms worst;
+  first GPU frame ~1.04 s. Starting the thread earlier was measured to stall window
+  creation by up to ~500 ms in one launch out of five.
+- `perf.rs`: a startup waterfall (logging, event loop, window, first frame, GPU, GPU
+  frame) logged per launch; `--exit-after-first-frame` prints it as JSON for
+  `scripts/bench-startup.ps1`. **F3** swaps the readout for a developer overlay (last
+  frame, p95, worst, drawn/total items, textures and MB, decode queue).
+  `--bench-frames=N <board>` drives a deterministic pan/zoom path and prints frame work
+  (swapchain acquire and present excluded) and total p50/p95/max plus the open-to-first-
+  GPU-frame time. The benches skip the single-instance handshake and the session marker.
+- `rizref-core`: `Scene::visible_items`; the render loop instances and keeps warm only
+  the visible set (5.8 µs per frame for 500 items). Frame work **0.59 ms** median,
+  0.96 ms p95 on a 100-item board, 1.04 ms p95 on a 500-item 1.6 GB board.
+- `rizref-format`: `load` hashed every original twice (chunk digest and content hash);
+  blobs now verify by content hash only (which fixes every payload byte), and blob
+  verification and preview decoding run on scoped threads. `benches/board_io.rs`
+  (100 items, 210 MB): load 606 → **300 ms**, incremental save **96 ms** (item moved)
+  and **121 ms** (2 MiB image added), summary 0.4 ms. A 327 MB 100-item board reaches
+  its first preview frame in **905 ms**. `examples/make_soak_board.rs` writes the large
+  real-JPEG boards.
+- Binary size: thin LTO at opt 3 was 18.37 MB, over budget. Fat LTO at `opt-level = "s"`
+  plus the static CRT: **14.21 MB**. `examples/decode_bench.rs` records the cost (12 MP
+  JPEG 139 → 154 ms, PNG 116 → 154 ms); `opt-level = "z"` (12.52 MB) was rejected for a
+  3.5× slower JPEG decode.
+- The release exe imported `VCRUNTIME140.dll` and six `api-ms-win-crt-*` forwarders,
+  absent on a clean Windows without the VC++ Redistributable. `.cargo/config.toml`
+  links the CRT statically; `scripts/check-imports.ps1` reads the PE import table (no
+  dumpbin) and fails on any C/C++ runtime. Release builds are GUI-subsystem (no console
+  flash) and reattach to the parent console for `--help`/`--version`/`inspect`.
+
+Explorer and shell integration:
+
+- `rizref-thumb` (new crate, cdylib): an in-process COM thumbnail provider
+  (`IInitializeWithStream` + `IThumbnailProvider`, class factory, `DllGetClassObject`/
+  `DllCanUnloadNow`) reading through an `IStream` adapter with `rizref-format`.
+  `BoardReader::thumbnail_image` decodes `THMB` or, without one, composites the
+  document and `PREV` chunks (`preview_composite`); notes keep their 06a background
+  colour either way. Never reads originals. Box-filtered, premultiplied BGRA DIB.
+- `rizref register [--machine]` / `unregister`: `.rizref` → `RizRef.Board`, icon,
+  "Open with RizRef", `Applications\rizref.exe`, and the thumbnail CLSID when
+  `rizref_thumb.dll` sits beside the exe; `HKCU` by default, `HKLM` for an elevated
+  installer; `SHChangeNotify(SHCNE_ASSOCCHANGED)`. The registry layout is a pure,
+  tested plan.
+- Jump list: opened and saved boards go to `SHAddToRecentDocs`, which feeds the taskbar
+  jump list's Recent category once the type is registered (Windows keeps the list,
+  pinning and removal; no `ICustomDestinationList` needed).
+- The exe embeds a generated multi-size icon (`examples/make_icon.rs`, drawn in code —
+  there was no brand asset) and version info, through a `build.rs` that writes the
+  `.res` itself: no `rc.exe`, no C toolchain.
+
+Reliability:
+
+- Crash minidumps: an unhandled-exception filter writes a dump through the OS's
+  `dbghelp` `MiniDumpWriteDump` to `%LOCALAPPDATA%\RizRef\crashes` (ten kept);
+  `--crash-test` proves it (exit `0xC0000005`, a 127 KB dump). No new crate — the plan
+  named `minidump-writer` behind a vectored handler; a vectored handler also sees
+  handled first-chance exceptions.
+- Autosave: every 20 changes or 60 s to a recovery copy
+  (`%LOCALAPPDATA%\RizRef\autosave\<scene>.rizref` + sidecar), never the user's file;
+  incremental appends after the first write. Deleted on save, discard and clean exit.
+  A session marker detects an unclean exit; the next launch offers the newest copy
+  ("RizRef recovered", Yes restores it as an unsaved document named after its board,
+  No deletes it) or, with nothing to recover, reopens the last board. A test spawns a
+  child that autosaves in a loop and kills it six times mid-write: every copy left
+  behind loads.
+- Fix: the panic hook exited the process for every panic, so the `catch_unwind` guards
+  around decoders and math never ran — one hostile image closed RizRef.
+  `contain::contain` marks the boundary and the hook now lets it handle the panic.
+- Files: a read-only target is refused before anything is written
+  (`FormatError::Denied`), the final rename retries six times over ~1.2 s while another
+  program briefly holds the board, and a refused save offers Save As.
+- **Help → Open logs folder**; `-v`/`--verbose` and daily rotation already existed.
+
+Packaging and docs:
+
+- `packaging/package.ps1`: release build, import checks, optional signing (only when
+  `RIZREF_SIGN_PFX` is set), portable zip `RizRef-<v>-x64-portable.zip` (exe, DLL,
+  README.txt, licences), and the installer when Inno Setup is present.
+  `packaging/rizref.iss`: per-user install, runs `rizref register`/`unregister`.
+- `.github/workflows/release.yml`: on a `v*` tag matching the workspace version, test,
+  package, sign if the secrets exist, and create a **draft** release with notes from
+  conventional commits (`scripts/release-notes.sh`). It never publishes.
+- `docs/demo.rizref` (`examples/make_demo_board.rs`): four images drawn in code (CC0)
+  and three markdown notes. README: status, layout, measured budgets, install and
+  integration, releasing, licence. `LICENSE-MIT`, `LICENSE-APACHE`.
+- Tests: 664 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
+  clean; no new dependency crate and no new `-sys` crate (audit: `windows-sys`,
+  `renderdoc-sys`).
+- Not verified here, by design or by environment: `register`/`unregister` and Explorer
+  thumbnails on Win10 and Win11 (they change the user's file associations — part of
+  the manual test plan; the registry plan, the COM factory and the DLL's rendering are
+  unit-tested); the installer (no Inno Setup on this machine; the script is untested);
+  a clean Win10 22H2 VM run (substituted by the import-table check); the release
+  workflow (runs on the first tag); the "RizRef recovered" prompt by hand.
+- Deferred: code signing (no certificate; the hook is in place); README screenshots
+  (best captured during the manual test run); undo history across a crash (the format
+  stores no history, so recovery restores the board, not its undo tail); a CPU canvas
+  for images when no GPU exists at all (the CPU frames draw the shell only); the stretch
+  items (headless CLI scripting, link-vs-embed UI, slideshow/drawings/comments).
+
 ## Phase 06b — Image provenance (done)
 
 Merged 2026-11-09 in PR #22 (branch `feat/phase-06b-image-provenance`, merge commit
