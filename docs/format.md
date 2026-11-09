@@ -2,8 +2,8 @@
 
 Status: **implemented** in `crates/rizref-format` (phase 06). This document is the
 normative description of the bytes; the crate is the reference implementation.
-The optional note fields in [Note payloads](#note-payloads-v11--planned-phase-06a) are a
-planned additive revision for phase 06a; the `source_url` provenance semantics are
+The optional note fields in [Note payloads](#note-payloads-v11--phase-06a) are an
+additive revision implemented in phase 06a; the `source_url` provenance semantics are
 planned for phase 06b. The container and `schema_version` stay 1 in both.
 
 A `.rizref` file is one board: the scene (items, groups, notes, assets, view), the
@@ -163,7 +163,7 @@ reader refuses a document whose `schema_version` is above its own rather than gu
 The migration scaffold lives in `SceneDocument::from_value`: v1 parses directly, and a
 future revision inserts a rewrite arm.
 
-### Note payloads (v1.1 — planned, phase 06a)
+### Note payloads (v1.1 — phase 06a)
 
 The markdown-notes phase adds three optional members to note items. Nothing else in the
 document or the container changes, and `schema_version` remains **1**: the new members
@@ -203,6 +203,13 @@ are additive, and a note without `text_format` still means exactly what it meant
   a rotated note; notes are excluded from rotation gestures and commands.
 * Unknown members are still preserved. A v1 reader sees the three new members in its
   per-item `extra` map, ignores them while rendering, and writes them back on resave.
+* An unknown `text_format` value reads as plain text and an out-of-range `wrap_width`
+  is clamped (or, when not a positive number, ignored); like an invalid `background`,
+  each is reported as a load warning and never fails the board. A plain note is written
+  without `text_format`, so a v1 board resaved without note edits keeps its v1 note
+  entries.
+* `rizref inspect` reports `notes: N (markdown M, styled S)`, where *styled* counts
+  notes with a valid `background`.
 
 **Why no `schema_version` bump?** Bumping it would make every v1 build refuse the entire
 board, including its images, even though the additions are optional. The format's own
@@ -323,5 +330,5 @@ file; 2 means a bad command line.
 | Revision | Phase | Change |
 |---|---|---|
 | 1 | 06 | Initial container, chunk stream, index/footer, scene document, blobs and previews. |
-| 1.1 (planned) | 06a | Additive note members `text_format`, `background`, `wrap_width`. No container change; `schema_version` stays 1. |
+| 1.1 | 06a | Additive note members `text_format`, `background`, `wrap_width`. No container change; `schema_version` stays 1. |
 | 1.2 (planned) | 06b | No new members. `source_url` is populated for browser pastes/drags; `origin`/`source_path` semantics clarified. |

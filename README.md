@@ -29,10 +29,13 @@ opacity/click-through/borderless window modes, ghost mode, color picker, canvas 
 and a UIA accessibility tree) and phase 06 (the complete `.rizref` container: header,
 chunk stream, JSON scene document, content-addressed image blobs, asset previews,
 board thumbnails, atomic fresh saves, incremental appends, recovery and compaction,
-`rizref inspect --verify`, and Save/Open/Export wiring in the application) have
-landed. Phase 06a (markdown notes: rendered rich text, inline/display math, note
-chrome and additive `.rizref` note fields) and phase 06b (image provenance: open file
-location or image URL, image info dialog, browser source-URL capture) are planned next,
+`rizref inspect --verify`, and Save/Open/Export wiring in the application) and phase
+06a (markdown notes: a source editor with ✓/✗ chrome, rendered markdown with
+`<span style>` colours and sizes, inline/display math typeset by RaTeX, a hover
+toolbar with a background colour popover and auto-contrast ink, a fixed wrap width
+with explicit "Reflow to box width", no note rotation, a title-bar ☰ menu, and the
+additive `.rizref` note fields) have landed. Phase 06b (image provenance: open file
+location or image URL, image info dialog, browser source-URL capture) is planned next,
 before phase 07. The workspace builds, tests and lints clean.
 
 ## Design principles
@@ -80,6 +83,9 @@ between crates. These are the pinned versions:
 | GPU rendering | `wgpu` | 30.0.1 | Vulkan + DX12; Metal/WebGPU/GL off |
 | 2D raster fallback, HUD | `tiny-skia` | 0.12.0 | pure Rust |
 | Text shaping | `cosmic-text` | 0.19.0 | `fontconfig` off (it is a C library) |
+| Markdown (notes) | `pulldown-cmark` | 0.13.6 | `default-features = false`: no CLI, no HTML renderer |
+| CSS colours (notes) | `csscolorparser` | 0.9.0 | `std` + `named-colors` only; `<span style="color">` |
+| Math (notes) | `ratex-parser` / `ratex-layout` / `ratex-types` / `ratex-render` | =0.1.15 | KaTeX-compatible, pure Rust; `embed-fonts` (KaTeX fonts, SIL OFL 1.1) |
 | Maths/transforms | `glam` | 0.34.1 | pure Rust |
 | PNG | `png` | 0.18.1 | pure Rust |
 | JPEG | `zune-jpeg` / `jpeg-encoder` | 0.5.15 / 0.7.1 | decode / encode |
@@ -118,6 +124,13 @@ Audit result for the current tree (`x86_64-pc-windows-msvc`, `normal,build`):
   compiler flag on x86_64, which compiles nothing into our artifacts. If a build with
   zero C-toolchain involvement is ever required, swapping BLAKE3 for `sha2` or
   `xxhash-rust` is the way out.
+
+- Phase 06a's additions (`pulldown-cmark`, `csscolorparser`, the `ratex-*` crates and
+  their trees: `ab_glyph`, `ttf-parser`, `rust-embed`, `phf`) add **no** `-sys` crate;
+  the audit list above is unchanged. RaTeX brings its own `tiny-skia` 0.11 and `png`
+  0.17 alongside ours (duplicate versions, pure Rust); phase 07's binary-size pass
+  measures them with the embedded KaTeX fonts. The KaTeX fonts are licensed under the
+  SIL Open Font License 1.1 and are credited in the About notice.
 
 Two deliberate exclusions, both recorded rather than hidden:
 
