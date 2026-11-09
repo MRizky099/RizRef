@@ -4,7 +4,8 @@ Summary of what each delivery phase landed. One section per phase; newest at the
 
 ## Phase 06b — Image provenance (done)
 
-Delivered on branch `feat/phase-06b-image-provenance`; closes issue #20. On-disk
+Merged 2026-11-09 in PR #22 (branch `feat/phase-06b-image-provenance`, merge commit
+`ede7409`). Closes issue #20, which completes phase 06 (06, 06a and 06b). On-disk
 contract: [`format.md` → scene document](format.md) (`origin`, `source_path`,
 `source_url`; revision 1.2, no new members, `schema_version` stays 1).
 
