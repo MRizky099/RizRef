@@ -858,6 +858,21 @@ impl Board {
         (ids.next().is_none() && self.scene.item(id).is_some_and(Item::is_note)).then_some(id)
     }
 
+    /// The single selected image, when the selection is exactly one image.
+    ///
+    /// Notes, empty selections and multi-selections (including a group of
+    /// images) yield `None`: the provenance commands act on one image only.
+    pub fn selected_image(&self) -> Option<ItemId> {
+        let mut ids = self.selection.iter();
+        let id = ids.next()?;
+        (ids.next().is_none()
+            && self
+                .scene
+                .item(id)
+                .is_some_and(|item| item.asset().is_some()))
+        .then_some(id)
+    }
+
     /// Sets a note's wrap width to its current inner box width: one undo
     /// step, and the only way line breaks follow a resize.
     pub fn reflow_note(&mut self, id: ItemId) -> bool {
@@ -1962,6 +1977,24 @@ mod tests {
             board.scene().item(id).and_then(Item::note_content),
             Some(before)
         );
+    }
+
+    #[test]
+    fn the_selected_image_needs_exactly_one_image() {
+        let mut board = board(2);
+        let note = board
+            .scene_mut()
+            .insert_note("n", Vec2::new(500.0, 0.0), Vec2::splat(50.0));
+        assert_eq!(board.selected_image(), None, "nothing selected");
+        board.select_only(ItemId::from_raw(1));
+        assert_eq!(board.selected_image(), Some(ItemId::from_raw(1)));
+        assert_eq!(board.selected_note(), None);
+        board.select_all();
+        assert_eq!(board.selected_image(), None, "two images and a note");
+        board.select_only(note);
+        assert_eq!(board.selected_image(), None, "a note is not an image");
+        board.clear_selection();
+        assert_eq!(board.selected_image(), None);
     }
 
     #[test]

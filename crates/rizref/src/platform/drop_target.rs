@@ -54,6 +54,8 @@ use windows::core::{PCWSTR, Ref, Result as WinResult, implement, w};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
+use crate::provenance::{self, DropUrlPayloads};
+
 /// Largest `FileGroupDescriptorW` block accepted, bytes. The block is four
 /// bytes plus one 592-byte descriptor per file, so this holds thousands.
 const MAX_GROUP_BYTES: usize = 4 * 1024 * 1024;
@@ -72,6 +74,10 @@ const DESCRIPTOR_NAME_UNITS: usize = 260;
 /// `FD_FILESIZE`: the descriptor carries `nFileSizeHigh`/`nFileSizeLow`.
 const FD_FILESIZE: u32 = 0x40;
 
+/// Largest registered `PNG` payload accepted, bytes; read on the UI thread
+/// like a virtual file.
+const MAX_PNG_BYTES: usize = MAX_VIRTUAL_FILE_BYTES;
+
 /// One file delivered by a drag & drop, either as a path or as bytes.
 #[derive(Debug, Clone)]
 pub struct DropEvent {
@@ -85,6 +91,11 @@ pub struct DropEvent {
     pub paths: Vec<PathBuf>,
     /// Files that only exist inside the drag source.
     pub virtual_files: Vec<VirtualFile>,
+    /// The web address of the dragged image, when the source exposed one
+    /// and the drop carries exactly one image. A browser drag that also
+    /// produced a temporary cache file reports both; the importer records
+    /// the URL and not the cache path.
+    pub source_url: Option<String>,
 }
 
 /// A file whose contents arrived without a path, such as an Outlook attachment.
@@ -243,11 +254,22 @@ impl IDropTarget_Impl for OleDropTarget_Impl {
         };
 
         let paths = hdrop_paths(data);
-        let virtual_files = if paths.is_empty() {
+        let mut virtual_files = if paths.is_empty() {
             virtual_files(data)
         } else {
             Vec::new()
         };
+        let url = provenance::choose_drop_url(&url_payloads(data));
+        if paths.is_empty()
+            && virtual_files.is_empty()
+            && let Some(png) = png_payload(data)
+        {
+            virtual_files.push(VirtualFile {
+                name: provenance::png_name_from_url(url.as_deref()),
+                bytes: Arc::from(png),
+            });
+        }
+        let source_url = attach_url(paths.len() + virtual_files.len(), url);
 
         if paths.is_empty() && virtual_files.is_empty() {
             tracing::debug!("dropped data carried no files this build can import");
@@ -262,6 +284,7 @@ impl IDropTarget_Impl for OleDropTarget_Impl {
             client_physical: client_point(self.hwnd, pt),
             paths,
             virtual_files,
+            source_url,
         });
         Ok(())
     }
@@ -277,9 +300,49 @@ fn effect_for(accepts: bool) -> DROPEFFECT {
 }
 
 /// Whether the data object offers anything this build imports.
+///
+/// A URL-only drag (a link, or a page selection) is refused with "no drop":
+/// it would need a download, which this build never does on drop.
 fn accepts_drop(data: &IDataObject) -> bool {
     has_format(data, CF_HDROP.0)
         || file_group_format().is_some_and(|format| has_format(data, format))
+        || register_format(w!("PNG")).is_some_and(|format| has_format(data, format))
+}
+
+/// The URL to report for a drop of `images` importable entries: only an
+/// unambiguous single-image drop gets one.
+fn attach_url(images: usize, url: Option<String>) -> Option<String> {
+    if images == 1 { url } else { None }
+}
+
+/// The registered `PNG` payload, for a drag that offers encoded pixels but
+/// neither a file nor a virtual file.
+fn png_payload(data: &IDataObject) -> Option<Vec<u8>> {
+    let format = register_format(w!("PNG"))?;
+    let medium = MediumGuard(get_medium(data, format, TYMED_HGLOBAL, -1)?);
+    // SAFETY: a TYMED_HGLOBAL medium stores its payload in `u.hGlobal`.
+    global_bytes(unsafe { medium.0.u.hGlobal }, MAX_PNG_BYTES)
+}
+
+/// Reads every URL-bearing format the data object offers.
+fn url_payloads(data: &IDataObject) -> DropUrlPayloads {
+    let text = |name: PCWSTR, cap: usize| -> Option<Vec<u8>> {
+        let format = register_format(name)?;
+        let medium = MediumGuard(get_medium(data, format, TYMED_HGLOBAL, -1)?);
+        // SAFETY: a TYMED_HGLOBAL medium stores its payload in `u.hGlobal`.
+        global_bytes(unsafe { medium.0.u.hGlobal }, cap)
+    };
+    let small = provenance::MAX_URL_PAYLOAD_BYTES;
+    DropUrlPayloads {
+        locator_wide: text(w!("UniformResourceLocatorW"), small)
+            .map(|bytes| provenance::utf16_until_nul(&bytes)),
+        locator_ansi: text(w!("UniformResourceLocator"), small)
+            .map(|bytes| provenance::bytes_until_nul(&bytes)),
+        uri_list: text(w!("text/uri-list"), small).map(|bytes| provenance::text_payload(&bytes)),
+        moz_url: text(w!("text/x-moz-url"), small).map(|bytes| provenance::text_payload(&bytes)),
+        html: text(w!("HTML Format"), provenance::MAX_HTML_BYTES)
+            .or_else(|| text(w!("text/html"), provenance::MAX_HTML_BYTES)),
+    }
 }
 
 /// Whether `data` can render `format` as an HGLOBAL.
@@ -581,8 +644,22 @@ fn global_bytes(handle: HGLOBAL, cap: usize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DESCRIPTOR_LEN, DESCRIPTOR_NAME_OFFSET, FileDescriptor, parse_file_group, truncate_to_size,
+        DESCRIPTOR_LEN, DESCRIPTOR_NAME_OFFSET, FileDescriptor, attach_url, parse_file_group,
+        truncate_to_size,
     };
+
+    #[test]
+    fn a_url_is_attached_only_to_a_single_image_drop() {
+        let url = || Some("https://e.com/a.png".to_owned());
+        assert_eq!(attach_url(1, url()), url());
+        assert_eq!(attach_url(2, url()), None, "a multi-file drop is ambiguous");
+        assert_eq!(
+            attach_url(0, url()),
+            None,
+            "a URL-only drag imports nothing"
+        );
+        assert_eq!(attach_url(1, None), None);
+    }
 
     /// Builds one packed `FILEDESCRIPTORW` as the shell writes it.
     fn descriptor(name: &str, size: Option<u64>) -> Vec<u8> {

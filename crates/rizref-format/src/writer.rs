@@ -1409,6 +1409,98 @@ mod tests {
     }
 
     #[test]
+    fn provenance_survives_save_append_and_load_with_and_without_fields() {
+        use crate::{AssetOrigin, AssetProvenance};
+        use std::collections::BTreeMap;
+
+        let dir = temp_dir("provenance");
+        let path = dir.join("provenance.rizref");
+        let mut scene = Scene::new(SceneId::random());
+        let mut ids = Vec::new();
+        for seed in 1..=4u8 {
+            let (bytes, format) = encoded(seed, false);
+            let image = ImageBuffer::filled(4, 4, [seed, 0, 0, 255]);
+            let asset = Asset::from_decoded(bytes, format, &image, image.clone());
+            let (id, _) = scene.insert_asset(asset);
+            scene
+                .insert_image(
+                    id,
+                    Vec2::new(f32::from(seed) * 50.0, 0.0),
+                    Vec2::splat(40.0),
+                )
+                .expect("asset");
+            ids.push(id);
+        }
+        let local = AssetProvenance {
+            origin: AssetOrigin::File,
+            source_path: Some(r"D:\My Refs\a, b & c.png".to_owned()),
+            source_url: None,
+        };
+        let web = AssetProvenance {
+            origin: AssetOrigin::Clipboard,
+            source_path: None,
+            source_url: Some("https://example.com/img/cat.png?w=800&h=600".to_owned()),
+        };
+        // The format stores hints verbatim; launching validates them later.
+        let hostile = AssetProvenance {
+            origin: AssetOrigin::Clipboard,
+            source_path: None,
+            source_url: Some("javascript:alert(1)".to_owned()),
+        };
+        let provenance: BTreeMap<_, _> = [
+            (ids[0], local.clone()),
+            (ids[1], web.clone()),
+            (ids[2], hostile.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let camera = Camera::default();
+        let mut save_request = request(&scene, &camera, "Provenance");
+        save_request.provenance = &provenance;
+        save(&path, &save_request).expect("fresh save");
+
+        let entry_for = |loaded: &crate::LoadedBoard, id: rizref_core::AssetId| {
+            loaded
+                .document
+                .assets
+                .iter()
+                .find(|entry| entry.hash == id.to_hex())
+                .map(|entry| AssetProvenance {
+                    origin: entry.origin,
+                    source_path: entry.source_path.clone(),
+                    source_url: entry.source_url.clone(),
+                })
+                .expect("asset entry")
+        };
+        let check = |loaded: &crate::LoadedBoard| {
+            assert_eq!(loaded.document.schema_version, crate::SCHEMA_VERSION);
+            assert_eq!(entry_for(loaded, ids[0]), local);
+            assert_eq!(entry_for(loaded, ids[1]), web);
+            assert_eq!(entry_for(loaded, ids[2]), hostile);
+            assert_eq!(
+                entry_for(loaded, ids[3]),
+                AssetProvenance::default(),
+                "no record: unknown origin, no fields"
+            );
+        };
+        let loaded = crate::load(&path).expect("load");
+        check(&loaded);
+        let json = serde_json::to_string(&loaded.document).expect("json");
+        assert_eq!(
+            json.matches("\"source_url\"").count(),
+            2,
+            "absent URLs are not written, so older readers see the v1 shape"
+        );
+
+        // An appended save with no provenance map keeps the stored hints.
+        scene.insert_note("later", Vec2::new(0.0, 200.0), Vec2::splat(60.0));
+        let report = save(&path, &request(&scene, &camera, "Provenance")).expect("append");
+        assert_eq!(report.mode, SaveMode::Appended);
+        check(&crate::load(&path).expect("reload"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn note_payload_fields_survive_save_append_and_load() {
         let dir = temp_dir("note-fields");
         let path = dir.join("notes.rizref");

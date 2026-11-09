@@ -29,7 +29,7 @@ use glam::{DVec2, Vec2};
 use rizref_core::{
     Asset, AssetId, Camera, Item, ItemBody, ItemId, Rect, Scene, SceneId, Selection,
 };
-use rizref_format::{AssetOrigin, AssetProvenance, SaveMode, SaveRequest};
+use rizref_format::{AssetProvenance, SaveMode, SaveRequest};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -44,8 +44,9 @@ use crate::clipboard::{self, ClipboardContent};
 use crate::dialogs;
 use crate::document::Document;
 use crate::hud::HudSurface;
-use crate::import::{ImportOutcome, ImportPurpose, ImportRequest, Importer};
+use crate::import::{ImportOutcome, ImportPurpose, ImportRequest, ImportSource, Importer};
 use crate::input::{self, Button as InputButton, Command, Trigger};
+use crate::location::{self, LocationPlan};
 use crate::memory::DecodeCache;
 use crate::note::{self, NoteRenderer, NoteSession};
 use crate::note_chrome::{
@@ -53,16 +54,19 @@ use crate::note_chrome::{
 };
 use crate::overlay::{self, OverlayState, OverlayVertex};
 use crate::placement;
+use crate::platform::launch;
 use crate::platform::window_modes::WindowModes;
 use crate::platform::{
     self, DropEvent, DropRegistration, SingleInstance, forward_args_to_primary,
     serve_forwarded_args,
 };
+use crate::provenance;
 use crate::recents::{Recents, now_unix};
 use crate::renderer::{FrameError, FrameParams, GpuSurface};
 use crate::settings::Settings;
 use crate::shortcuts::{Key as ShortcutKey, KeyChord, ShortcutId, Shortcuts};
 use crate::text::TextEngine;
+use crate::ui::image_info::{ImageInfo, ImageInfoPanel, InfoButton, InfoResult};
 use crate::ui::menu::{self, Action, MenuContext, MenuEntry, MenuResult};
 use crate::ui::note_color::{NoteColorPopover, PopoverResult};
 use crate::ui::panels::{self, CloseChoice, PanelResult, SettingId};
@@ -1226,7 +1230,12 @@ impl App {
 
     /// Builds the command menu for the current state.
     fn menu_tree(&self) -> Vec<MenuEntry> {
-        menu::build(&MenuContext {
+        menu::build(&self.menu_context())
+    }
+
+    /// The state the menus are built from.
+    fn menu_context(&self) -> MenuContext<'_> {
+        MenuContext {
             settings: &self.settings,
             shortcuts: &self.shortcuts,
             recents: &self.recents,
@@ -1236,23 +1245,134 @@ impl App {
             always_on_top: self.window_modes.always_on_top,
             opacity_percent: self.window_modes.opacity_percent,
             note_selected: self.board.selected_note().is_some(),
-        })
+            selected_image: self
+                .selected_image()
+                .map(|(_, provenance)| provenance.and_then(location::location_kind)),
+        }
+    }
+
+    /// The one selected image and its provenance record, if any.
+    fn selected_image(&self) -> Option<(rizref_core::ItemId, Option<&AssetProvenance>)> {
+        let item = self.board.selected_image()?;
+        Some((item, self.image_provenance(item)))
+    }
+
+    /// The provenance of image `item`'s asset.
+    fn image_provenance(&self, item: rizref_core::ItemId) -> Option<&AssetProvenance> {
+        let asset = self.board.scene().item(item)?.asset()?;
+        self.provenance.get(&asset)
+    }
+
+    /// Opens the information dialog for the one selected image.
+    fn show_image_info(&mut self) {
+        let Some((item, provenance)) = self.selected_image() else {
+            return;
+        };
+        let scene = self.board.scene();
+        let Some(info) = ImageInfo::from_scene(scene, item, provenance) else {
+            return;
+        };
+        // The stored preview, never a fresh decode of the original.
+        let preview = scene
+            .item(item)
+            .and_then(|entry| entry.asset())
+            .and_then(|asset| scene.asset(asset))
+            .map(|asset| asset.preview().image())
+            .map(|image| (image.width(), image.height(), image.pixels()));
+        let panel = ImageInfoPanel::new(info, preview);
+        self.commit_note_edit();
+        self.shell.open_image_info(panel);
+        self.redraw();
+    }
+
+    /// Opens the location of the image in the info dialog, or of the one
+    /// selected image. Never mutates the board, its dirty flag or history.
+    fn open_image_location(&mut self) {
+        let item = self
+            .shell
+            .image_info
+            .as_ref()
+            .map(|panel| panel.info.item)
+            .or_else(|| self.board.selected_image());
+        let Some(item) = item else {
+            return;
+        };
+        let provenance = self.image_provenance(item).cloned().unwrap_or_default();
+        let board_dir = self
+            .document
+            .as_ref()
+            .and_then(Document::path)
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        let plan = location::plan(&provenance, board_dir.as_deref(), location::probe);
+        let result = match &plan {
+            LocationPlan::OpenUrl(url) => launch::open_url(url),
+            LocationPlan::SelectFile(path) => launch::select_in_explorer(path),
+            LocationPlan::OpenParent(path) => launch::open_folder(path),
+            LocationPlan::Gone | LocationPlan::Nothing => Ok(()),
+        };
+        let now = Instant::now();
+        match result {
+            Ok(()) => self.shell.toast(plan.message(), now),
+            Err(error) => {
+                tracing::warn!(?error, ?plan, "cannot open the image location");
+                let message = if matches!(plan, LocationPlan::OpenUrl(_)) {
+                    "Could not open the image URL"
+                } else {
+                    "Could not open Explorer"
+                };
+                self.shell.toast(message, now);
+            }
+        }
+        self.redraw();
+    }
+
+    /// Copies a value from the open info dialog to the clipboard.
+    fn copy_image_info(&mut self, what: InfoButton) {
+        let Some(info) = self.shell.image_info.as_ref().map(|panel| &panel.info) else {
+            return;
+        };
+        let (text, done) = match what {
+            InfoButton::CopyLocation => match &info.location {
+                Some(location) if info.location_is_url => (location.clone(), "URL copied"),
+                Some(location) => (location.clone(), "Path copied"),
+                None => return,
+            },
+            InfoButton::CopyId => (info.asset_id.clone(), "Asset ID copied"),
+            InfoButton::Open | InfoButton::Close => return,
+        };
+        let now = Instant::now();
+        match clipboard::write_text(&text) {
+            Ok(()) => self.shell.toast(done, now),
+            Err(error) => {
+                tracing::warn!(%error, "cannot copy from the image info dialog");
+                self.shell.toast("Could not write the clipboard", now);
+            }
+        }
+        self.redraw();
+    }
+
+    /// Carries out a choice made in the info dialog.
+    fn apply_image_info_result(&mut self, result: InfoResult) {
+        match result {
+            InfoResult::None => {}
+            InfoResult::Changed => {
+                self.shell.touch();
+                self.redraw();
+            }
+            InfoResult::Activate(InfoButton::Close) => {
+                self.shell.close_image_info();
+                self.redraw();
+            }
+            InfoResult::Activate(InfoButton::Open) => self.open_image_location(),
+            InfoResult::Activate(button) => self.copy_image_info(button),
+        }
     }
 
     /// Opens the right-click menu at a logical point: the note commands (or
     /// `New note`) first, then the full command tree.
     fn open_context_menu(&mut self, position: DVec2) {
-        let tree = menu::build_context(&MenuContext {
-            settings: &self.settings,
-            shortcuts: &self.shortcuts,
-            recents: &self.recents,
-            locked: self.shell.locked,
-            ghost: self.window_modes.ghost(),
-            click_through: self.window_modes.click_through,
-            always_on_top: self.window_modes.always_on_top,
-            opacity_percent: self.window_modes.opacity_percent,
-            note_selected: self.board.selected_note().is_some(),
-        });
+        let tree = menu::build_context(&self.menu_context());
         self.shell.tooltip = None;
         self.shell.open_menu(tree, position, self.viewport());
         self.redraw();
@@ -1306,9 +1426,26 @@ impl App {
             }
             return;
         }
+        if self.shell.image_info.is_some() {
+            match action {
+                Action::OpenImageLocation => self.open_image_location(),
+                Action::CopyImageLocation => self.copy_image_info(InfoButton::CopyLocation),
+                Action::CopyImageAssetId => self.copy_image_info(InfoButton::CopyId),
+                Action::CloseImageInfo => {
+                    self.shell.close_image_info();
+                    self.redraw();
+                }
+                // The info dialog is modal: nothing behind it runs.
+                _ => {}
+            }
+            return;
+        }
         let now = Instant::now();
         match action {
             Action::Command(command) => self.apply(command),
+            Action::ShowImageInfo => self.show_image_info(),
+            Action::OpenImageLocation => self.open_image_location(),
+            Action::CopyImageLocation | Action::CopyImageAssetId | Action::CloseImageInfo => {}
             Action::NewBoard => {
                 self.request_destructive(
                     PendingAction::NewBoard,
@@ -1778,6 +1915,7 @@ impl App {
                 &window,
                 &self.shell.title_bar,
                 self.shell.confirm_close.as_ref(),
+                self.shell.image_info.as_ref(),
                 &notes,
             );
         }
@@ -1956,9 +2094,19 @@ impl App {
         let drop_world = self.drop_world();
         match clipboard::read() {
             Ok(ClipboardContent::Files(paths)) => self.import_paths(paths, drop_world),
-            Ok(ClipboardContent::Image { name, png }) => {
+            Ok(ClipboardContent::Image {
+                name,
+                png,
+                source_url,
+            }) => {
                 self.shell.set_mode(Mode::Canvas);
-                self.submit_import(ImportRequest::bytes(name, png, drop_world));
+                let source = ImportSource::bytes(name, png).with_source_url(source_url);
+                self.submit_import(ImportRequest::new(source, drop_world));
+            }
+            Err(clipboard::PasteError::LinkOnly) => {
+                tracing::info!("the clipboard holds HTML without pixels; nothing downloaded");
+                self.shell
+                    .toast("The clipboard holds a link, not an image", Instant::now());
             }
             Err(reason) => {
                 tracing::warn!(%reason, "nothing pasteable on the clipboard");
@@ -2003,7 +2151,20 @@ impl App {
     /// Turns one OLE drop into import requests around the drop point.
     fn apply_drop(&mut self, event: DropEvent) {
         let drop_world = self.world_from_physical(event.client_physical);
-        if !event.paths.is_empty() {
+        // The drop target attaches a URL only to a single-image drop. A
+        // browser drag that also wrote a cache file arrives as one path plus
+        // the URL; the importer then records the URL, not the cache path.
+        let source_url = event.source_url;
+        if let (Some(url), [path]) = (&source_url, event.paths.as_slice()) {
+            if looks_like_image(path) {
+                tracing::info!(path = %path.display(), url = %url, "browser drag with a source URL");
+                self.shell.set_mode(Mode::Canvas);
+                let source = ImportSource::path(path.clone()).with_source_url(Some(url.clone()));
+                self.submit_import(ImportRequest::new(source, drop_world));
+            } else {
+                self.import_paths(event.paths, drop_world);
+            }
+        } else if !event.paths.is_empty() {
             self.import_paths(event.paths, drop_world);
         }
         for file in event.virtual_files {
@@ -2017,7 +2178,10 @@ impl App {
                 ?drop_world,
                 "virtual file dropped"
             );
-            self.submit_import(ImportRequest::bytes(file.name, file.bytes, drop_world));
+            self.shell.set_mode(Mode::Canvas);
+            let source =
+                ImportSource::bytes(file.name, file.bytes).with_source_url(source_url.clone());
+            self.submit_import(ImportRequest::new(source, drop_world));
         }
         self.redraw();
     }
@@ -2087,20 +2251,16 @@ impl App {
             asset = asset.with_animation(animation);
         }
         let encoded_len = asset.encoded().len();
-        let source_path = imported.source_path.clone();
+        let record = provenance::record_for(&provenance::ImportProvenance {
+            source_path: imported
+                .source_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            source_url: imported.source_url.clone(),
+        });
         let (asset_id, was_new) = self.board.scene_mut().insert_asset(asset);
-        self.provenance.insert(
-            asset_id,
-            AssetProvenance {
-                origin: if source_path.is_some() {
-                    AssetOrigin::File
-                } else {
-                    AssetOrigin::Clipboard
-                },
-                source_path: source_path.map(|path| path.display().to_string()),
-                source_url: None,
-            },
-        );
+        let merged = provenance::merge(self.provenance.get(&asset_id), record);
+        self.provenance.insert(asset_id, merged);
         if was_new {
             tracing::info!(
                 asset = %asset_id,
@@ -2990,6 +3150,12 @@ impl App {
             } else {
                 CursorIcon::Default
             }
+        } else if let Some(dialog) = &self.shell.image_info {
+            if dialog.hit_button(screen, viewport).is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
         } else if self.shell.picker {
             CursorIcon::Crosshair
         } else if let Some(layout) = title_bar.filter(|layout| layout.contains(screen)) {
@@ -3218,6 +3384,20 @@ impl ApplicationHandler<AppEvent> for App {
                 let logical = DVec2::new(position.x / scale, position.y / scale);
                 let previous = self.view.cursor_position();
                 self.view.set_cursor(logical);
+                if self.shell.image_info.is_some() {
+                    let viewport = self.viewport();
+                    let changed = self
+                        .shell
+                        .image_info
+                        .as_mut()
+                        .is_some_and(|dialog| dialog.pointer_move(logical, viewport));
+                    if changed {
+                        self.shell.touch();
+                        self.redraw();
+                    }
+                    self.update_cursor_icon(&window, logical);
+                    return;
+                }
                 if self.shell.confirm_close.is_some() {
                     let viewport = self.viewport();
                     let changed = self
@@ -3297,6 +3477,22 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 let position = self.view.cursor_position().unwrap_or(self.viewport() * 0.5);
+                if self.shell.image_info.is_some() {
+                    // A true modal: only a left press reaches the dialog,
+                    // and nothing reaches the board behind it.
+                    if pressed && button == MouseButton::Left {
+                        let viewport = self.viewport();
+                        let result = self
+                            .shell
+                            .image_info
+                            .as_mut()
+                            .map_or(InfoResult::None, |dialog| {
+                                dialog.pointer_click(position, viewport)
+                            });
+                        self.apply_image_info_result(result);
+                    }
+                    return;
+                }
                 if self.shell.confirm_close.is_some() {
                     if pressed && button == MouseButton::Left {
                         let viewport = self.viewport();
@@ -3430,13 +3626,19 @@ impl ApplicationHandler<AppEvent> for App {
                     MouseButton::Middle => InputButton::Middle,
                     _ => return,
                 };
-                if let Some(command) = input::resolve(&Trigger::Button {
+                let trigger = Trigger::Button {
                     button,
                     pressed,
                     space_held: self.view.space_held(),
-                }) {
+                };
+                if let Some(command) = input::resolve(&trigger) {
                     self.apply(command);
-                    return;
+                    // A left release ends a pan *and* the board gesture its
+                    // press began; returning here left items stuck to the
+                    // cursor.
+                    if !input::board_also_handles(&trigger) {
+                        return;
+                    }
                 }
                 if button == InputButton::Left {
                     if pressed {
@@ -3462,7 +3664,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.shell.confirm_close.is_some() {
+                if self.shell.confirm_close.is_some() || self.shell.image_info.is_some() {
                     return;
                 }
                 if self.shell.menu.is_some() || self.shell.mode() == Mode::Start {
@@ -3524,6 +3726,18 @@ impl ApplicationHandler<AppEvent> for App {
 
                 // Overlays own the keyboard completely.
                 let viewport = self.viewport();
+                if self.shell.image_info.is_some() && self.shell.confirm_close.is_none() {
+                    if pressed {
+                        let result = chord.map_or(InfoResult::None, |chord| {
+                            self.shell
+                                .image_info
+                                .as_mut()
+                                .map_or(InfoResult::None, |dialog| dialog.key(chord))
+                        });
+                        self.apply_image_info_result(result);
+                    }
+                    return;
+                }
                 if self.shell.confirm_close.is_some() {
                     if pressed {
                         let choice = chord.and_then(|chord| {
@@ -3772,6 +3986,8 @@ impl ApplicationHandler<AppEvent> for App {
                         hud,
                         ui,
                         flags: FrameFlags {
+                            grid: self.settings.grid_visible,
+                            scene_border: self.settings.scene_border,
                             checkerboard: self.settings.checkerboard,
                             grayscale: self.settings.grayscale,
                         },

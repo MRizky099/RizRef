@@ -213,6 +213,30 @@ impl<'a> Painter<'a> {
         self.engine.measure(text, size * self.scale) / self.scale
     }
 
+    /// Draws `image` letterboxed (aspect kept, centred) into `rect`.
+    ///
+    /// The pixmap is already premultiplied (see [`pixmap_from_rgba`]); it is
+    /// scaled with bilinear filtering, so a 512 px preview shrinks cleanly.
+    pub fn image(&mut self, image: &Pixmap, rect: UiRect) {
+        let (width, height) = (image.width() as f32, image.height() as f32);
+        if width <= 0.0 || height <= 0.0 || rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let fit = (rect.width / width).min(rect.height / height);
+        let (drawn_width, drawn_height) = (width * fit, height * fit);
+        let x = rect.x + (rect.width - drawn_width) * 0.5;
+        let y = rect.y + (rect.height - drawn_height) * 0.5;
+        let device = fit * self.scale;
+        let transform =
+            Transform::from_row(device, 0.0, 0.0, device, x * self.scale, y * self.scale);
+        let paint = tiny_skia::PixmapPaint {
+            quality: tiny_skia::FilterQuality::Bilinear,
+            ..tiny_skia::PixmapPaint::default()
+        };
+        self.pixmap
+            .draw_pixmap(0, 0, image.as_ref(), &paint, transform, None);
+    }
+
     /// Draws a thumbnail placeholder: a rounded box with a large monogram.
     pub fn thumbnail_placeholder(&mut self, rect: UiRect, monogram: &str) {
         self.fill_round_rect(rect, 6.0, [46, 49, 60, 255]);
@@ -227,6 +251,27 @@ impl<'a> Painter<'a> {
             [120, 128, 148, 255],
         );
     }
+}
+
+/// A premultiplied tiny-skia pixmap from straight-alpha RGBA pixels, for
+/// [`Painter::image`]. `None` for an empty image or mismatched data.
+pub fn pixmap_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<Pixmap> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    if rgba.len() != expected {
+        return None;
+    }
+    let mut data = rgba.to_vec();
+    for pixel in data.as_chunks_mut::<4>().0 {
+        let alpha = u16::from(pixel[3]);
+        if alpha < 255 {
+            for channel in pixel.iter_mut().take(3) {
+                *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+            }
+        }
+    }
+    Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(width, height)?)
 }
 
 /// A tiny-skia colour from straight-alpha bytes.
@@ -307,6 +352,28 @@ mod tests {
             0,
             "logical origin was scaled"
         );
+    }
+
+    #[test]
+    fn images_are_premultiplied_and_letterboxed() {
+        // A 2x1 image: opaque red, then half-transparent white.
+        let image = super::pixmap_from_rgba(2, 1, &[255, 0, 0, 255, 255, 255, 255, 128])
+            .expect("valid image");
+        let second = image.pixel(1, 0).expect("in bounds");
+        assert_eq!((second.red(), second.alpha()), (128, 128), "premultiplied");
+        assert!(super::pixmap_from_rgba(2, 2, &[0; 4]).is_none());
+        assert!(super::pixmap_from_rgba(0, 0, &[]).is_none());
+
+        let mut pixmap = Pixmap::new(100, 100).expect("allocates");
+        let mut engine = TextEngine::new();
+        {
+            let mut painter = Painter::new(&mut pixmap, &mut engine, 1.0);
+            painter.image(&image, UiRect::new(0.0, 0.0, 100.0, 100.0));
+        }
+        // 2:1 into a square: 100 x 50, centred vertically (rows 25..75).
+        assert_eq!(pixmap.pixel(10, 50).expect("in").red(), 255);
+        assert_eq!(pixmap.pixel(10, 10).expect("in").alpha(), 0, "letterbox");
+        assert_eq!(pixmap.pixel(10, 90).expect("in").alpha(), 0, "letterbox");
     }
 
     #[test]

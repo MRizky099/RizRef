@@ -118,7 +118,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             max_decode_bytes: crate::memory::DEFAULT_DECODE_CACHE_BYTES,
-            grid_visible: true,
+            // Off on first launch: a reference board reads cleaner without
+            // the grid and its origin axis; View → Grid turns both on.
+            grid_visible: false,
             snap_enabled: true,
             hud_visible: true,
             scene_border: true,
@@ -199,7 +201,7 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.canvas_theme, CanvasTheme::Charcoal);
         assert_eq!(settings.canvas_theme.rgba(), [24, 24, 28, 255]);
-        assert!(settings.grid_visible);
+        assert!(!settings.grid_visible, "grid and origin axis start hidden");
         assert!(settings.snap_enabled);
         assert!(settings.hud_visible);
         assert!(settings.scene_border);
@@ -233,7 +235,11 @@ mod tests {
         let settings: Settings =
             serde_json::from_str(r#"{"grayscale":true,"future_field":42}"#).expect("tolerated");
         assert!(settings.grayscale);
-        assert!(settings.grid_visible, "absent fields keep their default");
+        assert!(!settings.grid_visible, "absent fields keep their default");
+
+        // A saved choice still wins over the new default.
+        let saved: Settings = serde_json::from_str(r#"{"grid_visible":true}"#).expect("parses");
+        assert!(saved.grid_visible);
     }
 
     #[test]

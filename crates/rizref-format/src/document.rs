@@ -976,6 +976,46 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_asset_without_provenance_loads_and_resaves_unchanged() {
+        // An asset entry as phase 06 wrote it before any browser capture:
+        // no origin, no source members at all.
+        let hash = "ab".repeat(32);
+        let json = format!(
+            r#"{{
+                "schema_version": 1,
+                "scene_id": "0123456789abcdeffedcba9876543210",
+                "assets": [
+                    {{ "hash": "{hash}", "format": "png", "pixel_size": [2, 2], "byte_len": 9 }}
+                ]
+            }}"#
+        );
+        let document = SceneDocument::from_json(json.as_bytes()).expect("v1 document");
+        let asset = &document.assets[0];
+        assert_eq!(asset.origin, AssetOrigin::Unknown);
+        assert_eq!(asset.source_path, None);
+        assert_eq!(asset.source_url, None);
+        assert!(asset.embedded);
+
+        let written = String::from_utf8(document.to_json().expect("json")).expect("utf-8");
+        assert!(!written.contains("source_path"), "{written}");
+        assert!(!written.contains("source_url"), "{written}");
+        assert!(written.contains(r#""origin":"unknown""#), "{written}");
+
+        // And a 06b entry with a URL reads back exactly.
+        let with_url = json.replace(
+            r#""byte_len": 9"#,
+            r#""byte_len": 9, "origin": "clipboard", "source_url": "https://e.com/a.png""#,
+        );
+        let document = SceneDocument::from_json(with_url.as_bytes()).expect("06b document");
+        assert_eq!(document.schema_version, 1);
+        assert_eq!(document.assets[0].origin, AssetOrigin::Clipboard);
+        assert_eq!(
+            document.assets[0].source_url.as_deref(),
+            Some("https://e.com/a.png")
+        );
+    }
+
+    #[test]
     fn a_newer_schema_is_refused_with_its_revision() {
         let error = SceneDocument::from_json(
             br#"{ "schema_version": 2, "scene_id": "0123456789abcdeffedcba9876543210" }"#,

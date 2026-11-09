@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use glam::DVec2;
 
 use crate::input::Command;
+use crate::location::LocationKind;
 use crate::recents::Recents;
 use crate::settings::{CanvasTheme, Settings};
 use crate::shortcuts::{ShortcutId, Shortcuts};
@@ -134,6 +135,16 @@ pub enum Action {
     ConfirmNoteEdit,
     /// Cancel the note being edited (✗).
     CancelNoteEdit,
+    /// Open the information dialog for the one selected image.
+    ShowImageInfo,
+    /// Open the selected image's file location or URL.
+    OpenImageLocation,
+    /// Copy the open info dialog's full path or URL.
+    CopyImageLocation,
+    /// Copy the open info dialog's full asset id.
+    CopyImageAssetId,
+    /// Close the image information dialog.
+    CloseImageInfo,
 }
 
 impl Action {
@@ -315,6 +326,34 @@ pub struct MenuContext<'a> {
     pub opacity_percent: u8,
     /// Whether exactly one note is selected (enables the note commands).
     pub note_selected: bool,
+    /// The one selected image, when the selection is exactly one image:
+    /// `Some(None)` for an image without a launchable location.
+    pub selected_image: Option<Option<LocationKind>>,
+}
+
+/// The image provenance commands, in menu order: `Image info…` and the
+/// dynamic open-location entry. Both are disabled unless exactly one image
+/// is selected; the open entry also needs a launchable location. Menu
+/// entries only: no default chord.
+pub fn image_actions(selected_image: Option<Option<LocationKind>>) -> Vec<MenuEntry> {
+    let info = MenuEntry::item("Image info…", Action::ShowImageInfo);
+    let kind = selected_image.flatten();
+    let open = MenuEntry::item(
+        kind.map_or("Open file location", LocationKind::open_label),
+        Action::OpenImageLocation,
+    );
+    vec![
+        if selected_image.is_some() {
+            info
+        } else {
+            info.disabled()
+        },
+        if kind.is_some() {
+            open
+        } else {
+            open.disabled()
+        },
+    ]
 }
 
 /// The note commands for one selected note, in menu order.
@@ -334,6 +373,8 @@ pub fn note_actions() -> Vec<MenuEntry> {
 pub fn build_context(context: &MenuContext) -> Vec<MenuEntry> {
     let mut entries = if context.note_selected {
         note_actions()
+    } else if context.selected_image.is_some() {
+        image_actions(context.selected_image)
     } else {
         accelerate(
             vec![MenuEntry::shortcut(
@@ -497,7 +538,9 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
             Action::from_shortcut(S::DistributeVertical),
         ),
     ];
-    let image = vec![
+    let mut image = image_actions(context.selected_image);
+    image.push(MenuEntry::separator());
+    image.extend(vec![
         MenuEntry::shortcut("Load images…", S::OpenImages, Action::OpenImages),
         MenuEntry::separator(),
         MenuEntry::submenu("Arrange", arrange),
@@ -516,7 +559,7 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
         ),
         MenuEntry::separator(),
         MenuEntry::submenu("Align", align),
-    ];
+    ]);
 
     let zoom = vec![
         MenuEntry::shortcut(
@@ -1128,7 +1171,70 @@ mod tests {
             always_on_top: false,
             opacity_percent: 100,
             note_selected: false,
+            selected_image: None,
         }
+    }
+
+    fn image_menu(root: &[MenuEntry]) -> &[MenuEntry] {
+        &root
+            .iter()
+            .find(|entry| entry.label == "Image")
+            .expect("Image menu")
+            .children
+    }
+
+    #[test]
+    fn the_image_menu_leads_with_info_and_open_location() {
+        use crate::location::LocationKind;
+        let settings = Settings::default();
+        let shortcuts = Shortcuts::new();
+        let recents = Recents::default();
+        let mut ctx = context(&settings, &shortcuts, &recents);
+
+        // None, a note, or several images selected: both shown, both disabled.
+        let root = build(&ctx);
+        let image = image_menu(&root);
+        assert_eq!(image[0].label, "Image info…");
+        assert_eq!(image[1].label, "Open file location");
+        assert!(!image[0].enabled && !image[1].enabled);
+        assert!(image[2].separator);
+        assert_eq!(image[3].label, "Load images…");
+        assert!(
+            image[0].accel.is_none() && image[1].accel.is_none(),
+            "no chord"
+        );
+
+        // One image without a location: info opens, open stays disabled.
+        ctx.selected_image = Some(None);
+        let root = build(&ctx);
+        let image = image_menu(&root);
+        assert!(image[0].enabled);
+        assert!(!image[1].enabled);
+
+        // One local image, one web image: dynamic labels, both enabled.
+        ctx.selected_image = Some(Some(LocationKind::Local));
+        let root = build(&ctx);
+        let image = image_menu(&root);
+        assert_eq!(image[1].label, "Open file location");
+        assert!(image[1].enabled);
+        assert_eq!(image[1].action, Some(Action::OpenImageLocation));
+        ctx.selected_image = Some(Some(LocationKind::Web));
+        let root = build(&ctx);
+        assert_eq!(image_menu(&root)[1].label, "Open image URL");
+    }
+
+    #[test]
+    fn the_context_menu_leads_with_the_image_commands_for_one_image() {
+        use crate::location::LocationKind;
+        let settings = Settings::default();
+        let shortcuts = Shortcuts::new();
+        let recents = Recents::default();
+        let mut ctx = context(&settings, &shortcuts, &recents);
+        ctx.selected_image = Some(Some(LocationKind::Web));
+        let menu = build_context(&ctx);
+        assert_eq!(menu[0].action, Some(Action::ShowImageInfo));
+        assert_eq!(menu[1].label, "Open image URL");
+        assert!(menu.iter().any(|entry| entry.label == "Image"));
     }
 
     fn labels(entries: &[MenuEntry]) -> Vec<&str> {

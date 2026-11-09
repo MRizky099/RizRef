@@ -35,6 +35,9 @@ pub struct ImportSource {
     pub path: Option<PathBuf>,
     /// Bytes from the clipboard or another in-memory source.
     pub bytes: Option<Arc<[u8]>>,
+    /// The web address the image came from, when a browser drag or paste
+    /// exposed one. Carried through untouched; validated when recorded.
+    pub source_url: Option<String>,
 }
 
 impl ImportSource {
@@ -50,6 +53,7 @@ impl ImportSource {
             label,
             path: Some(path),
             bytes: None,
+            source_url: None,
         }
     }
 
@@ -59,7 +63,14 @@ impl ImportSource {
             label: label.into(),
             path: None,
             bytes: Some(bytes.into()),
+            source_url: None,
         }
+    }
+
+    /// Attaches the source URL a browser exposed for this image.
+    pub fn with_source_url(mut self, url: Option<String>) -> Self {
+        self.source_url = url;
+        self
     }
 }
 
@@ -102,6 +113,7 @@ impl ImportRequest {
     }
 
     /// A request for in-memory bytes.
+    #[cfg(test)]
     pub fn bytes(label: impl Into<String>, bytes: impl Into<Arc<[u8]>>, drop_world: Vec2) -> Self {
         Self::new(ImportSource::bytes(label, bytes), drop_world)
     }
@@ -140,6 +152,8 @@ pub struct ImportedImage {
     ///
     /// A provenance hint for the board file; never needed to decode or draw.
     pub source_path: Option<PathBuf>,
+    /// The source URL the request carried, when there was one.
+    pub source_url: Option<String>,
 }
 
 /// Why an import produced no image.
@@ -355,6 +369,7 @@ fn import(source: &ImportSource) -> Result<ImportedImage, ImportError> {
         animation,
         checksum,
         source_path: source.path.clone(),
+        source_url: source.source_url.clone(),
     })
 }
 
@@ -432,7 +447,7 @@ fn panic_message(payload: &dyn std::any::Any) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImportRequest, Importer};
+    use super::{ImportRequest, ImportSource, Importer};
     use glam::Vec2;
     use rizref_codecs::{ImageBuffer, ImageFormat};
     use std::sync::mpsc;
@@ -466,6 +481,28 @@ mod tests {
         assert!(image.display.is_none(), "small images need no display copy");
         assert_eq!(image.checksum, rizref_core::checksum(&image.encoded));
         assert_eq!(outcome.drop_world, Vec2::new(3.0, 4.0));
+    }
+
+    #[test]
+    fn the_source_url_rides_through_the_worker() {
+        let (notify, outcomes) = mpsc::channel();
+        let importer = Importer::with_workers(1, move |outcome| {
+            notify.send(outcome).expect("test receiver lives");
+        });
+
+        let source = ImportSource::bytes("cat.png", png())
+            .with_source_url(Some("https://example.com/cat.png".to_owned()));
+        assert!(importer.submit(ImportRequest::new(source, Vec2::ZERO)));
+
+        let outcome = outcomes
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the worker answers");
+        let image = outcome.result.expect("valid png");
+        assert_eq!(
+            image.source_url.as_deref(),
+            Some("https://example.com/cat.png")
+        );
+        assert_eq!(image.source_path, None);
     }
 
     #[test]
