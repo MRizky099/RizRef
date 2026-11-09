@@ -3626,13 +3626,19 @@ impl ApplicationHandler<AppEvent> for App {
                     MouseButton::Middle => InputButton::Middle,
                     _ => return,
                 };
-                if let Some(command) = input::resolve(&Trigger::Button {
+                let trigger = Trigger::Button {
                     button,
                     pressed,
                     space_held: self.view.space_held(),
-                }) {
+                };
+                if let Some(command) = input::resolve(&trigger) {
                     self.apply(command);
-                    return;
+                    // A left release ends a pan *and* the board gesture its
+                    // press began; returning here left items stuck to the
+                    // cursor.
+                    if !input::board_also_handles(&trigger) {
+                        return;
+                    }
                 }
                 if button == InputButton::Left {
                     if pressed {

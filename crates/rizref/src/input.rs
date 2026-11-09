@@ -199,9 +199,51 @@ pub fn resolve(trigger: &Trigger) -> Option<Command> {
         .map(|row| row.command)
 }
 
+/// Whether the board must also see `trigger` after its table command ran.
+///
+/// A left release resolves to [`Command::EndPan`] so a space-drag pan always
+/// ends, but the same release also ends whatever board gesture the press
+/// began (move, scale, rotate, marquee). Swallowing it there left an item
+/// stuck to the cursor after a plain click.
+pub fn board_also_handles(trigger: &Trigger) -> bool {
+    matches!(
+        trigger,
+        Trigger::Button {
+            button: Button::Left,
+            pressed: false,
+            ..
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Button, Command, Trigger, resolve};
+    use super::{Button, Command, Trigger, board_also_handles, resolve};
+
+    #[test]
+    fn a_left_release_ends_the_pan_and_the_board_gesture() {
+        for space_held in [false, true] {
+            let release = Trigger::Button {
+                button: Button::Left,
+                pressed: false,
+                space_held,
+            };
+            assert_eq!(resolve(&release), Some(Command::EndPan));
+            assert!(board_also_handles(&release), "space {space_held}");
+        }
+        for (button, pressed) in [
+            (Button::Left, true),
+            (Button::Middle, true),
+            (Button::Middle, false),
+        ] {
+            assert!(!board_also_handles(&Trigger::Button {
+                button,
+                pressed,
+                space_held: false,
+            }));
+        }
+        assert!(!board_also_handles(&Trigger::Wheel { alt: false }));
+    }
     use crate::view::PanKind;
 
     #[test]
