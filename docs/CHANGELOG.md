@@ -185,6 +185,33 @@ Reliability:
     users) run from the chosen folder; uninstall removes it. Silent installs take
     `/DIR="..."` and `/ALLUSERS` or `/CURRENTUSER`. Not compiled here (no Inno Setup
     on this machine).
+  - Title-bar buttons show a tooltip after 500 ms on the button, worded for the
+    state and with the live shortcut: "Main menu", "Pin on top (Ctrl+Shift+T)" /
+    "Unpin", "Minimize", "Maximize" / "Restore", "Close (Ctrl+Q)". It reuses the
+    note-toolbar tooltip (clamped inside the window); moving between buttons
+    restarts the delay, and the note hover never overwrites it.
+  - View → **Scene boundary** (Ctrl+B, checkable, persisted as `scene_border`) next
+    to Checkerboard and HUD readout; it was only in View → Grid as "Scene border".
+    Named the same in the F1 overlay and settings, and exposed in the UIA tree like
+    every menu item. On screen only: exports and thumbnails are composited by
+    `rizref-format`, which never draws it.
+  - Transparency is the canvas background only: the steps (100/80/60/40/20 %) and
+    Ctrl+Shift+O now fade the fill, checkerboard, grid and boundary, while images,
+    notes, selection chrome, the HUD, toasts and the title bar stay opaque, and the
+    transparent canvas still takes clicks (it is not a layered window). How: the
+    window is created transparent (DWM alpha composition), DX12 is tried before
+    Vulkan on Windows and presents through a DirectComposition visual with a
+    premultiplied-alpha swapchain, the clear and the background pass write the
+    canvas alpha (the background pass keeps the clear's alpha), and the later passes
+    already blend "over". Checked live on the reference laptop: DX12 composites per
+    pixel; Vulkan's Win32 surface offers opaque alpha only, so with
+    `RIZREF_GPU_BACKEND=vulkan` the setting falls back to whole-window opacity, with
+    a toast saying so. DX12 startup matches Vulkan (first frame 167 ms, GPU frame
+    ~1.1 s); presentation is pinned to vsync on both. Ghost mode is no longer in the
+    Transparency submenu; it keeps its own Canvas entry, Ctrl+Shift+G and its
+    whole-window 15 % (it is for tracing over another application, where the images
+    must fade too). The setting is stored as `canvas_opacity_percent`; an older
+    `opacity_percent` is read into it, the same value now meaning the canvas.
   - The colour picker: no path was found by which it drops the next key or the
     dirty mark (it changes neither selection nor history, and the dirty mark comes
     from the board's effects); not reproduced, left unchanged.
@@ -208,7 +235,7 @@ Packaging and docs:
 - `docs/demo.rizref` (`examples/make_demo_board.rs`): four images drawn in code (CC0)
   and three markdown notes. README: status, layout, measured budgets, install and
   integration, releasing, licence. `LICENSE-MIT`, `LICENSE-APACHE`.
-- Tests: 705 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
+- Tests: 712 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
   clean; no new dependency crate and no new `-sys` crate (audit: `windows-sys`,
   `renderdoc-sys`).
 - Not verified here, by design or by environment: `register`/`unregister` and Explorer

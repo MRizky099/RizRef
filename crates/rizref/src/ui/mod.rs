@@ -445,7 +445,7 @@ fn paint_mode_indicator(painter: &mut Painter, viewport: DVec2, modes: WindowMod
             "CLICK-THROUGH · Ctrl+Shift+X to restore",
             paint::GHOST_ACCENT,
         )
-    } else if modes.opacity_percent < 100 {
+    } else if modes.effective_opacity_percent() < 100 {
         (
             "TRANSPARENT WINDOW",
             [

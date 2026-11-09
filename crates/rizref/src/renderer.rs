@@ -18,8 +18,13 @@ use crate::textures::{MAX_TEXTURE_SIDE, TextureCache};
 
 /// Backends this build tries, in preference order.
 ///
-/// Vulkan first because it is the thinnest path on Windows, DX12 second
-/// because it is the one guaranteed to be present on Windows 10 and later.
+/// On Windows DX12 is tried first (phase 07): presented through a
+/// DirectComposition visual it is the one backend whose window surface
+/// composites per-pixel alpha, which canvas-only transparency needs, and it
+/// starts as fast as Vulkan on the reference laptop (first GPU frame 1,051 vs
+/// 1,089 ms median). Vulkan follows: its Win32 surfaces offer opaque alpha
+/// only, so on Vulkan the transparency setting falls back to whole-window
+/// opacity. Elsewhere the order stays Vulkan first.
 ///
 /// GL is deliberately absent, by decision rather than omission: enabling
 /// `wgpu/gles` pulls `glutin_wgl_sys`, a `-sys` crate outside the accepted
@@ -36,10 +41,17 @@ pub fn preferred_backends() -> wgpu::Backends {
 /// instance) to one backend: the escape hatch for a machine whose Vulkan
 /// driver misbehaves, and the switch the phase-07 startup measurements use.
 fn backend_priority() -> Vec<wgpu::Backends> {
-    backend_override(std::env::var("RIZREF_GPU_BACKEND").ok().as_deref()).map_or_else(
-        || vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12],
-        |only| vec![only],
-    )
+    backend_override(std::env::var("RIZREF_GPU_BACKEND").ok().as_deref())
+        .map_or_else(default_priority, |only| vec![only])
+}
+
+/// The adapter walk without an override.
+fn default_priority() -> Vec<wgpu::Backends> {
+    if cfg!(windows) {
+        vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN]
+    } else {
+        vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12]
+    }
 }
 
 /// Parses a `RIZREF_GPU_BACKEND` value; anything unknown keeps the default.
@@ -105,6 +117,18 @@ fn clear_color(background: [u8; 4]) -> wgpu::Color {
     }
 }
 
+/// `colour` at `alpha` opacity, premultiplied as a premultiplied-alpha
+/// swapchain composites it.
+fn premultiplied(colour: wgpu::Color, alpha: f32) -> wgpu::Color {
+    let alpha = f64::from(alpha.clamp(0.0, 1.0)) * colour.a;
+    wgpu::Color {
+        r: colour.r * alpha,
+        g: colour.g * alpha,
+        b: colour.b * alpha,
+        a: alpha,
+    }
+}
+
 /// Why a frame did not make it to the screen.
 #[derive(Debug)]
 pub enum FrameError {
@@ -130,6 +154,9 @@ pub struct GpuSurface {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// Whether the surface composites per-pixel (premultiplied) alpha, so the
+    /// canvas background can be see-through on its own.
+    canvas_alpha: bool,
     canvas: Canvas,
     textures: TextureCache,
     /// How long the last frame waited for a swapchain image. Under vsync this
@@ -208,6 +235,11 @@ impl GpuDevice {
     pub fn create() -> Option<Self> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = instance_backends();
+        // A swapchain on a DirectComposition visual rather than on the HWND:
+        // the only DX12 presentation that composites per-pixel alpha (an HWND
+        // swapchain is opaque by DXGI's rules). It only affects DX12.
+        descriptor.backend_options.dx12.presentation_system =
+            wgpu::Dx12SwapchainKind::DxgiFromVisual;
         let instance = wgpu::Instance::new(descriptor);
 
         let mut chosen: Option<wgpu::Adapter> = None;
@@ -269,11 +301,20 @@ impl GpuSurface {
             .inspect_err(|e| tracing::error!(%e, "cannot create the window surface"))
             .ok()?;
 
+        let alpha_modes = surface.get_capabilities(&adapter).alpha_modes;
+        let canvas_alpha = alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied);
         let config = match surface.get_default_config(&adapter, size.0.max(1), size.1.max(1)) {
             Some(mut config) => {
                 // The colour picker reads one pixel back from the presented
                 // surface; that requires COPY_SRC on the swapchain texture.
                 config.usage |= wgpu::TextureUsages::COPY_SRC;
+                if canvas_alpha {
+                    config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+                }
+                // Vsync on every backend: the DX12 composition swapchain
+                // otherwise defaults to mailbox, rendering animations and the
+                // frame bench unthrottled.
+                config.present_mode = wgpu::PresentMode::AutoVsync;
                 config
             }
             None => {
@@ -285,6 +326,8 @@ impl GpuSurface {
         tracing::info!(
             format = ?config.format,
             present = ?config.present_mode,
+            alpha = ?config.alpha_mode,
+            canvas_transparency = if canvas_alpha { "per-pixel" } else { "whole-window fallback" },
             width = config.width,
             height = config.height,
             "surface configured"
@@ -310,11 +353,18 @@ impl GpuSurface {
             device,
             queue,
             config,
+            canvas_alpha,
             canvas,
             textures,
             last_acquire: std::time::Duration::ZERO,
             last_present: std::time::Duration::ZERO,
         })
+    }
+
+    /// Whether canvas-only transparency works on this surface; when it does
+    /// not, the application falls back to whole-window opacity.
+    pub fn supports_canvas_alpha(&self) -> bool {
+        self.canvas_alpha
     }
 
     /// Reconfigures the swapchain after a window resize or DPI change.
@@ -472,7 +522,14 @@ impl GpuSurface {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color(frame.background)),
+                        load: wgpu::LoadOp::Clear(premultiplied(
+                            clear_color(frame.background),
+                            if self.canvas_alpha {
+                                frame.flags.canvas_alpha
+                            } else {
+                                1.0
+                            },
+                        )),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -564,7 +621,30 @@ impl GpuSurface {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_color, describe_backends, preferred_backends};
+    use super::{
+        clear_color, default_priority, describe_backends, preferred_backends, premultiplied,
+    };
+
+    #[test]
+    fn windows_tries_dx12_first_for_per_pixel_alpha() {
+        let order = default_priority();
+        if cfg!(windows) {
+            assert_eq!(order, [wgpu::Backends::DX12, wgpu::Backends::VULKAN]);
+        } else {
+            assert_eq!(order[0], wgpu::Backends::VULKAN);
+        }
+    }
+
+    #[test]
+    fn a_translucent_canvas_clears_premultiplied() {
+        let c = premultiplied(clear_color([232, 226, 214, 255]), 0.5);
+        assert!((c.a - 0.5).abs() < 1.0e-9);
+        assert!((c.r - 0.806_952 * 0.5).abs() < 1.0e-5);
+        assert_eq!(
+            premultiplied(clear_color([10, 20, 30, 255]), 1.0),
+            clear_color([10, 20, 30, 255])
+        );
+    }
     use crate::app::CANVAS_BACKGROUND;
 
     #[test]

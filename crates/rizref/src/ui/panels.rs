@@ -46,7 +46,7 @@ pub enum SettingId {
     Snap,
     /// HUD readout.
     Hud,
-    /// Scene border.
+    /// Scene boundary.
     Border,
     /// Checkerboard.
     Checkerboard,
@@ -83,11 +83,11 @@ impl SettingId {
             Self::Grid => "Canvas grid",
             Self::Snap => "Snap to items",
             Self::Hud => "HUD readout",
-            Self::Border => "Scene border",
+            Self::Border => "Scene boundary",
             Self::Checkerboard => "Checkerboard",
             Self::Grayscale => "Grayscale items",
             Self::AlwaysOnTop => "Always on top",
-            Self::Opacity => "Window opacity",
+            Self::Opacity => "Canvas opacity",
             Self::GhostOpacity => "Ghost opacity",
             Self::DecodeCap => "Decode cache limit",
         }

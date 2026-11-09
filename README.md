@@ -243,7 +243,10 @@ Settings and recents live in `%APPDATA%\RizRef`; logs, crash minidumps
 (`crashes\`) and autosave recovery copies (`autosave\`) in `%LOCALAPPDATA%\RizRef`
 (**Help → Open logs folder**). `-v`/`--verbose` logs at debug level; logs rotate daily
 and 14 are kept. `RIZREF_GPU_BACKEND=dx12` (or `vulkan`) restricts the GPU walk to one
-backend, for a machine whose Vulkan driver misbehaves.
+backend, for a machine whose driver misbehaves. On Windows DX12 is tried first, presented
+through a DirectComposition visual: it is what lets **Canvas → Transparency** make the
+canvas background alone see-through. On Vulkan (no per-pixel alpha on Win32 surfaces)
+the same setting fades the whole window instead.
 
 ### Releasing
 

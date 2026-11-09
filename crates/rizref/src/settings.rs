@@ -79,6 +79,12 @@ pub struct Settings {
     /// Whether the window starts always-on-top.
     pub always_on_top: bool,
     /// Window opacity for the ordinary transparency mode, 20–100 %.
+    ///
+    /// Stored as `canvas_opacity_percent` since phase 07, when transparency
+    /// became the canvas background only. Older files wrote the
+    /// whole-window `opacity_percent`; it is read into this field (the same
+    /// steps, now meaning the canvas), and the next save writes the new name.
+    #[serde(rename = "canvas_opacity_percent", alias = "opacity_percent")]
     pub opacity_percent: u8,
     /// Window opacity while ghost mode is active, 10–40 %.
     pub ghost_opacity_percent: u8,
@@ -279,5 +285,20 @@ mod tests {
                 assert_ne!(theme.rgba(), other.rgba());
             }
         }
+    }
+
+    #[test]
+    fn the_old_window_opacity_setting_becomes_the_canvas_opacity() {
+        let old: Settings = serde_json::from_str(r#"{"opacity_percent": 60}"#).expect("parses");
+        assert_eq!(old.opacity_percent, 60);
+
+        let written = serde_json::to_string(&old).expect("serialises");
+        assert!(
+            written.contains(r#""canvas_opacity_percent":60"#),
+            "{written}"
+        );
+        assert!(!written.contains(r#""opacity_percent""#));
+        let back: Settings = serde_json::from_str(&written).expect("parses");
+        assert_eq!(back.opacity_percent, 60);
     }
 }

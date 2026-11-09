@@ -95,6 +95,15 @@ pub fn present(window: &Window, bgra: &[u8], width: u32, height: u32) -> bool {
     }
 }
 
+/// Clears the window surface to fully transparent: once the GPU presents
+/// through a composition visual above it, the last CPU frame would otherwise
+/// show through a see-through canvas. Returns whether GDI accepted it.
+pub fn clear(window: &Window, width: u32, height: u32) -> bool {
+    let (width, height) = (width.max(1), height.max(1));
+    let zeros = vec![0_u8; (width * height * 4) as usize];
+    present(window, &zeros, width, height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::compose_bgra;

@@ -111,7 +111,7 @@ pub enum Action {
     ToggleSnap,
     /// Toggle the HUD.
     ToggleHud,
-    /// Toggle the scene border.
+    /// Toggle the scene boundary.
     ToggleBorder,
     /// Toggle the checkerboard backdrop.
     ToggleCheckerboard,
@@ -593,8 +593,6 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
             .check(settings.grid_visible),
         MenuEntry::shortcut("Snap to items", S::ToggleSnap, Action::ToggleSnap)
             .check(settings.snap_enabled),
-        MenuEntry::shortcut("Scene border", S::ToggleBorder, Action::ToggleBorder)
-            .check(settings.scene_border),
     ];
     let view = vec![
         MenuEntry::submenu("Zoom", zoom),
@@ -610,6 +608,10 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
         .check(settings.checkerboard),
         MenuEntry::shortcut("HUD readout", S::ToggleHud, Action::ToggleHud)
             .check(settings.hud_visible),
+        // The dashed rectangle around all content; on screen only — exports
+        // and thumbnails are composited without it.
+        MenuEntry::shortcut("Scene boundary", S::ToggleBorder, Action::ToggleBorder)
+            .check(settings.scene_border),
     ];
 
     let mut themes = Vec::new();
@@ -626,11 +628,8 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
                 .check(context.opacity_percent == percent),
         );
     }
-    transparency.push(MenuEntry::separator());
-    transparency.push(
-        MenuEntry::shortcut("Ghost mode", S::ToggleGhostMode, Action::ToggleGhostMode)
-            .check(context.ghost),
-    );
+    // Ghost mode is its own Canvas entry: since phase 07 transparency is the
+    // canvas background, while ghost mode still fades the whole window.
 
     let canvas = vec![
         MenuEntry::submenu("Background", themes),
@@ -1373,6 +1372,30 @@ mod tests {
         for id in crate::shortcuts::ShortcutId::ALL {
             let _ = Action::from_shortcut(id);
         }
+    }
+
+    #[test]
+    fn the_view_menu_toggles_the_scene_boundary_with_its_live_state() {
+        let mut settings = Settings::default();
+        let shortcuts = Shortcuts::new();
+        let recents = Recents::default();
+        let find = |menu: &[MenuEntry]| {
+            menu.iter()
+                .find(|entry| entry.label == "View")
+                .and_then(|view| view.children.iter().find(|e| e.label == "Scene boundary"))
+                .cloned()
+                .expect("View has Scene boundary")
+        };
+
+        settings.scene_border = true;
+        let on = find(&build(&context(&settings, &shortcuts, &recents)));
+        assert!(on.toggles && on.checked);
+        assert_eq!(on.accel.as_deref(), Some("Ctrl+B"));
+        assert_eq!(on.action, Some(Action::ToggleBorder));
+
+        settings.scene_border = false;
+        let off = find(&build(&context(&settings, &shortcuts, &recents)));
+        assert!(off.toggles && !off.checked);
     }
 
     #[test]

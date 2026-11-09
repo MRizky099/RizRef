@@ -62,6 +62,9 @@ pub struct Globals {
     pub grayscale: f32,
     /// HUD texture size in device pixels.
     pub hud_size: [f32; 2],
+    /// Canvas background opacity (the WGSL `canvas_alpha`, in what was
+    /// padding).
+    pub canvas_alpha: f32,
 }
 
 impl Globals {
@@ -83,6 +86,7 @@ impl Globals {
             self.border_visible = 0.0;
         }
         self.checkerboard = if flags.checkerboard { 1.0 } else { 0.0 };
+        self.canvas_alpha = flags.canvas_alpha.clamp(0.0, 1.0);
         self.grayscale = if flags.grayscale { 1.0 } else { 0.0 };
     }
 
@@ -115,6 +119,7 @@ impl Globals {
             checkerboard: 0.0,
             grayscale: 0.0,
             hud_size: [0.0, 0.0],
+            canvas_alpha: 1.0,
         }
     }
 
@@ -139,7 +144,7 @@ impl Globals {
             self.grayscale,
             self.hud_size[0],
             self.hud_size[1],
-            0.0,
+            self.canvas_alpha,
             0.0,
         ];
         pack_floats(&floats)
@@ -429,7 +434,21 @@ impl Canvas {
             "fs_background",
             None,
             &[],
-            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            // Premultiplied colour over the clear, but the clear's alpha —
+            // the canvas opacity — is kept: the grid and checkerboard are
+            // part of the canvas, not drawn over it.
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
             wgpu::PrimitiveTopology::TriangleList,
         );
         let item_pipeline = make_pipeline(
@@ -840,7 +859,7 @@ impl Canvas {
 }
 
 /// Per-frame display-effect flags.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameFlags {
     /// Draw the grid and its origin axis (still hidden outside the zoom
     /// range the grid is legible in).
@@ -851,6 +870,23 @@ pub struct FrameFlags {
     pub checkerboard: bool,
     /// Draw items in grayscale.
     pub grayscale: bool,
+    /// Opacity of the canvas background — fill, checkerboard, grid and
+    /// boundary — on a surface that composites per-pixel alpha (phase 07:
+    /// transparency is the canvas only; items, chrome and the UI stay
+    /// opaque). 1.0 is opaque.
+    pub canvas_alpha: f32,
+}
+
+impl Default for FrameFlags {
+    fn default() -> Self {
+        Self {
+            grid: false,
+            scene_border: false,
+            checkerboard: false,
+            grayscale: false,
+            canvas_alpha: 1.0,
+        }
+    }
 }
 
 /// One frame's HUD layer, or its absence.
@@ -923,6 +959,7 @@ mod tests {
             scene_border: true,
             checkerboard: true,
             grayscale: true,
+            ..super::FrameFlags::default()
         });
         assert_eq!(on.grid_visible, 1.0);
         assert_eq!(on.border_visible, 1.0);
@@ -1076,6 +1113,7 @@ mod tests {
                 scene_border: true,
                 checkerboard: true,
                 grayscale: true,
+                ..super::FrameFlags::default()
             },
         );
 

@@ -529,6 +529,8 @@ struct App {
     pick_for_note: Option<ItemId>,
     /// Resident note textures.
     note_textures: HashMap<ItemId, NoteTexture>,
+    /// The title-bar button whose tooltip is showing.
+    title_hint: Option<titlebar::TitleBarButton>,
     /// Renders every note except the one being edited, off the UI thread.
     note_worker: Option<NoteWorker>,
     /// The texture each note's in-flight worker render will produce.
@@ -700,6 +702,7 @@ impl App {
             note_hover: None,
             pick_for_note: None,
             note_textures: HashMap::new(),
+            title_hint: None,
             note_worker: Some(note_worker),
             pending_notes: HashMap::new(),
             note_frame: 0,
@@ -1344,6 +1347,18 @@ impl App {
         }
     }
 
+    /// The toast after a transparency change: the canvas, or — on a GPU
+    /// surface without per-pixel alpha — the whole window.
+    fn opacity_toast(&self) -> String {
+        let percent = self.window_modes.opacity_percent;
+        if self.window_modes.canvas_alpha_supported || self.renderer.is_none() {
+            format!("Canvas opacity {percent}%")
+        } else {
+            // Vulkan's Win32 surfaces have no per-pixel alpha.
+            format!("Window opacity {percent}% (no per-pixel alpha on this GPU)")
+        }
+    }
+
     /// Whether the title bar may appear in the current window mode.
     fn title_bar_allowed(&self) -> bool {
         !self.window_modes.effective_click_through()
@@ -1367,14 +1382,50 @@ impl App {
     fn update_title_bar_pointer(&mut self, cursor: Option<DVec2>) {
         let allowed = self.title_bar_allowed();
         let viewport = self.viewport();
-        if self
+        let moved = self
             .shell
             .title_bar
-            .pointer_moved(cursor, viewport, allowed)
-        {
+            .pointer_moved(cursor, viewport, allowed);
+        let hinted = self.refresh_title_hint(Instant::now());
+        if moved || hinted {
             self.shell.touch();
             self.redraw();
         }
+    }
+
+    /// Shows, rewords or hides the title-bar button tooltip: after
+    /// [`titlebar::TOOLTIP_DELAY`] on a button, with the live shortcut. The
+    /// bar cannot auto-hide under it — it only hides when the pointer leaves
+    /// the bar, which also leaves the button. Returns whether it changed.
+    fn refresh_title_hint(&mut self, now: Instant) -> bool {
+        let button = self.shell.title_bar.hint(now);
+        let wanted = button.map(|button| {
+            let shortcut = button
+                .shortcut()
+                .and_then(|id| self.shortcuts.chord_for(id))
+                .map(|chord| chord.to_string());
+            let text = button.tooltip(
+                self.shell.title_bar.pinned(),
+                self.shell.title_bar.maximized(),
+                shortcut.as_deref(),
+            );
+            let rect = titlebar::TitleBarLayout::new(self.viewport()).rect(button);
+            (
+                text,
+                DVec2::new(f64::from(rect.x), f64::from(rect.y + rect.height)),
+            )
+        });
+        let changed = match (&wanted, self.title_hint) {
+            (Some(_), _) => self.shell.tooltip != wanted,
+            (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        if changed {
+            self.shell.tooltip = wanted;
+            self.title_hint = button;
+            self.shell.touch();
+        }
+        changed
     }
 
     /// Handles a left press on the title bar.
@@ -1937,10 +1988,7 @@ impl App {
                 self.settings.opacity_percent = self.window_modes.opacity_percent;
                 self.apply_window_modes();
                 self.save_settings();
-                self.shell.toast(
-                    format!("Window opacity {}%", self.window_modes.opacity_percent),
-                    now,
-                );
+                self.shell.toast(self.opacity_toast(), now);
                 self.redraw();
             }
             Action::CycleOpacity => {
@@ -1948,10 +1996,7 @@ impl App {
                 self.settings.opacity_percent = self.window_modes.opacity_percent;
                 self.apply_window_modes();
                 self.save_settings();
-                self.shell.toast(
-                    format!("Window opacity {}%", self.window_modes.opacity_percent),
-                    now,
-                );
+                self.shell.toast(self.opacity_toast(), now);
                 self.redraw();
             }
             Action::ToggleClickThrough => {
@@ -3610,7 +3655,9 @@ impl App {
             }),
             _ => None,
         };
-        if tooltip != self.shell.tooltip {
+        // The title bar's own tooltip wins while a bar button is hovered.
+        let title_bar_hovered = self.shell.title_bar.hovered().is_some();
+        if !title_bar_hovered && self.title_hint.is_none() && tooltip != self.shell.tooltip {
             self.shell.tooltip = tooltip;
             self.shell.touch();
             changed = true;
@@ -3924,7 +3971,18 @@ impl App {
         }) {
             Some(renderer) => {
                 self.startup.mark(Milestone::Gpu);
+                let canvas_alpha = renderer.supports_canvas_alpha();
                 self.renderer = Some(renderer);
+                self.window_modes.canvas_alpha_supported = canvas_alpha;
+                if canvas_alpha {
+                    // The composition visual draws over the window surface,
+                    // which still holds the last (opaque) CPU frame: clear
+                    // it, or it would show through a see-through canvas.
+                    let size = window.inner_size();
+                    platform::gdi::clear(&window, size.width, size.height);
+                }
+                // Transparency moves from the window to the canvas.
+                self.window_modes.apply(&window);
                 // The CPU frames consumed the UI layer; the GPU's first frame
                 // must upload it, not `Keep` a texture it never had.
                 self.ui_layer.invalidate();
@@ -4094,6 +4152,10 @@ impl ApplicationHandler<AppEvent> for App {
             // would sit above the board permanently.
             .with_decorations(false)
             .with_resizable(true)
+            // Per-pixel alpha for canvas-only transparency: winit enables
+            // DWM's alpha composition of the window surface; the renderer
+            // decides whether its swapchain can use it.
+            .with_transparent(true)
             // AccessKit must attach before the window is first shown.
             .with_visible(false);
         let window = match event_loop.create_window(attributes) {
@@ -4800,6 +4862,7 @@ impl ApplicationHandler<AppEvent> for App {
                             scene_border: self.settings.scene_border,
                             checkerboard: self.settings.checkerboard,
                             grayscale: self.settings.grayscale,
+                            canvas_alpha: self.window_modes.canvas_alpha(),
                         },
                         background: self.settings.canvas_theme.rgba(),
                         pick: physical_pick,
@@ -4902,6 +4965,14 @@ impl ApplicationHandler<AppEvent> for App {
         if self.shell.expire_toast(now) {
             self.redraw();
         }
+        if self.refresh_title_hint(now) {
+            self.redraw();
+        }
+        let hint_deadline = self
+            .shell
+            .title_bar
+            .hint_due()
+            .filter(|_| self.title_hint.is_none());
 
         let mut poll_deadline = None;
         if self.window_modes.ghost() {
@@ -4934,6 +5005,7 @@ impl ApplicationHandler<AppEvent> for App {
             self.shell.next_wake(),
             poll_deadline,
             autosave_deadline,
+            hint_deadline,
         ]
         .into_iter()
         .flatten()
