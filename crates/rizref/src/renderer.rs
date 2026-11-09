@@ -135,6 +135,8 @@ pub struct GpuSurface {
     /// How long the last frame waited for a swapchain image. Under vsync this
     /// is display pacing, not work, so the frame statistics subtract it.
     last_acquire: std::time::Duration,
+    /// How long the last frame's `present` blocked.
+    last_present: std::time::Duration,
 }
 
 /// Everything one frame needs, gathered by the caller and consumed by
@@ -311,6 +313,7 @@ impl GpuSurface {
             canvas,
             textures,
             last_acquire: std::time::Duration::ZERO,
+            last_present: std::time::Duration::ZERO,
         })
     }
 
@@ -370,9 +373,11 @@ impl GpuSurface {
         self.textures.used_bytes()
     }
 
-    /// How long the last [`Self::render`] waited for a swapchain image.
-    pub fn last_acquire(&self) -> std::time::Duration {
-        self.last_acquire
+    /// How long the last [`Self::render`] waited on the swapchain: acquiring
+    /// the image plus blocking in `present`. Under vsync this is display
+    /// pacing, not work, and the frame statistics subtract it.
+    pub fn last_swapchain_wait(&self) -> std::time::Duration {
+        self.last_acquire + self.last_present
     }
 
     /// Renders one frame: acquire, draw the canvas, present.
@@ -510,7 +515,11 @@ impl GpuSurface {
         {
             let _present_span = tracing::debug_span!("present").entered();
             self.queue.submit(Some(encoder.finish()));
+            // Under Fifo the driver may block here until the display is ready
+            // for the frame: pacing, not work, so it is reported separately.
+            let present_start = std::time::Instant::now();
             self.queue.present(frame_texture);
+            self.last_present = present_start.elapsed();
         }
 
         let Some(buffer) = readback else {

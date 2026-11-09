@@ -3610,6 +3610,9 @@ impl App {
                 self.renderer = Some(renderer);
                 // Anything opened during the CPU frames gets its previews now.
                 self.upload_asset_previews();
+                if self.bench_frames.is_some() {
+                    self.open_pending_paths();
+                }
                 window.request_redraw();
             }
             None => {
@@ -3688,6 +3691,16 @@ impl App {
         }
     }
 
+    /// Opens or imports the paths held since launch.
+    fn open_pending_paths(&mut self) {
+        let pending = std::mem::take(&mut self.pending_paths);
+        if !pending.is_empty() {
+            let drop_world = self.drop_world();
+            let paths = pending.into_iter().map(PathBuf::from).collect();
+            self.import_paths(paths, drop_world);
+        }
+    }
+
     /// Book-keeping after a presented frame: frame statistics, the startup
     /// and board-load milestones, and the scripted soak.
     fn after_present(
@@ -3712,7 +3725,11 @@ impl App {
                 return;
             }
         }
-        if let Some(started) = self.board_open_started.take() {
+        // A board is interactive at its first GPU frame: that is when its
+        // previews draw.
+        if self.renderer.is_some()
+            && let Some(started) = self.board_open_started.take()
+        {
             let load = now.saturating_duration_since(started);
             self.last_board_load = Some(load);
             tracing::info!(ms = perf::ms(load), "board interactive");
@@ -3792,12 +3809,11 @@ impl ApplicationHandler<AppEvent> for App {
         self.offer_recovery();
 
         // Command-line and forwarded paths were held until the window
-        // (and therefore the camera and viewport) existed.
-        let pending = std::mem::take(&mut self.pending_paths);
-        if !pending.is_empty() {
-            let drop_world = self.drop_world();
-            let paths = pending.into_iter().map(PathBuf::from).collect();
-            self.import_paths(paths, drop_world);
+        // (and therefore the camera and viewport) existed. The frame bench
+        // holds them until the GPU is attached, so its board-load time is an
+        // open on a running GPU, as a user's open is.
+        if self.bench_frames.is_none() {
+            self.open_pending_paths();
         }
     }
 
@@ -4473,7 +4489,7 @@ impl ApplicationHandler<AppEvent> for App {
                         pick: physical_pick,
                     };
                     let result = renderer.render(&params);
-                    acquire_wait = renderer.last_acquire();
+                    acquire_wait = renderer.last_swapchain_wait();
                     match result {
                         Ok(pixel) => {
                             presented = true;
