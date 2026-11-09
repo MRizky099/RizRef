@@ -248,9 +248,16 @@ pub fn prompt_text(recovery: &Recovery, now_unix: u64) -> (String, String) {
         3600..=86_399 => format!("{} h ago", age / 3600),
         _ => format!("{} days ago", age / 86_400),
     };
+    // The note stays one short line (the dialog does not wrap): the board's
+    // file name, not its full path, which the restored title shows anyway.
     let target = recovery.info.original.as_ref().map_or_else(
         || "a board that was never saved".to_owned(),
-        |p| p.display().to_string(),
+        |p| {
+            p.file_name().map_or_else(
+                || p.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        },
     );
     (
         format!(
@@ -506,5 +513,16 @@ mod tests {
             "{message}"
         );
         assert!(note.contains("never saved"), "{note}");
+
+        // A saved board is named by its file name only, so the line fits.
+        let saved = Recovery {
+            info: RecoveryInfo {
+                original: Some(PathBuf::from("F:/work/deep/folder/board1.rizref")),
+                ..recovery.info.clone()
+            },
+            ..recovery
+        };
+        let (_, note) = prompt_text(&saved, 1_000);
+        assert!(note.ends_with("It belongs to board1.rizref."), "{note}");
     }
 }
