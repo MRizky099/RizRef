@@ -397,14 +397,24 @@ impl ImageInfoPanel {
             y += ROW_HEIGHT;
         }
 
-        // Footer.
-        painter.text(
-            "Esc closes · Tab moves · Enter activates",
-            panel.x + PADDING,
-            panel.bottom() - PADDING - BUTTON_HEIGHT + 8.0,
-            10.5,
-            DIM_TEXT,
-        );
+        // Footer: the keyboard hint takes the room left of the buttons, in
+        // its longest form that fits (none at all in a narrow window).
+        let hint_room = layout
+            .buttons
+            .first()
+            .map_or(panel.width, |(rect, _)| rect.x - panel.x - PADDING - 10.0);
+        if let Some(hint) = ["Esc closes · Tab moves · Enter activates", "Esc closes"]
+            .into_iter()
+            .find(|hint| painter.measure(hint, 10.5) <= hint_room)
+        {
+            painter.text(
+                hint,
+                panel.x + PADDING,
+                panel.bottom() - PADDING - BUTTON_HEIGHT + 8.0,
+                10.5,
+                DIM_TEXT,
+            );
+        }
         for (index, (rect, button)) in layout.buttons.iter().enumerate() {
             let focused = index == self.focused;
             if focused {
