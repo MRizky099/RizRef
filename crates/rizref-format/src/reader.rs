@@ -278,6 +278,53 @@ impl<S: Read + Seek> BoardReader<S> {
         Ok(Some(Preview::new(width, height, bytes[8..].to_vec())))
     }
 
+    /// The board's picture, decoded: the embedded thumbnail when there is one,
+    /// otherwise [`Self::preview_composite`].
+    ///
+    /// This is the whole job of the Explorer thumbnail provider
+    /// (`rizref-thumb`), which links this crate so the shell and the
+    /// application can never disagree about the format. It never reads an
+    /// original image: a 2 GB board costs its index, its thumbnail chunk and,
+    /// at worst, its document and the small per-asset previews.
+    pub fn thumbnail_image(&mut self, background: [u8; 4]) -> Result<ImageBuffer, FormatError> {
+        if let Some(thumbnail) = self.thumbnail()? {
+            return decode_preview(&thumbnail.bytes);
+        }
+        self.preview_composite(background)
+    }
+
+    /// Composites a thumbnail from the document and the stored previews, the
+    /// fallback for a board without a `THMB` chunk. Notes are painted as cards
+    /// in their stored background colours, exactly as a saved thumbnail is.
+    pub fn preview_composite(&mut self, background: [u8; 4]) -> Result<ImageBuffer, FormatError> {
+        let document = self.document()?;
+        let mut blobs: BTreeMap<AssetId, Arc<[u8]>> = BTreeMap::new();
+        let mut previews: BTreeMap<AssetId, ImageBuffer> = BTreeMap::new();
+        let empty: Arc<[u8]> = Arc::from(Vec::<u8>::new());
+        for entry in &document.assets {
+            let Some(id) = AssetId::from_hex(&entry.hash) else {
+                continue;
+            };
+            // Originals are never read: an empty stand-in satisfies the
+            // scene builder, and only the previews are drawn.
+            if entry.embedded {
+                blobs.insert(id, Arc::clone(&empty));
+            }
+            if let Ok(Some(bytes)) = self.asset_preview(id)
+                && let Ok(image) = decode_preview(&bytes)
+            {
+                previews.insert(id, image);
+            }
+        }
+        let loaded = document.build_scene(&blobs, &previews)?;
+        crate::thumbnail::composite(
+            &loaded.scene,
+            background,
+            crate::thumbnail::MAX_THUMBNAIL_SIDE,
+            None,
+        )
+    }
+
     /// The original bytes of asset `id`, checked against its content hash.
     pub fn blob(&mut self, id: AssetId) -> Result<Vec<u8>, FormatError> {
         let hash = id.to_hex();

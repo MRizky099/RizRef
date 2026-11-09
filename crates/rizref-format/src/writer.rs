@@ -929,6 +929,47 @@ mod tests {
         (scene, Camera::new(DVec2::new(10.0, 20.0), 1.25, 0.1))
     }
 
+    #[test]
+    fn the_shell_thumbnail_reads_the_embedded_picture_or_composites_previews() {
+        let dir = temp_dir("shell-thumb");
+        let path = dir.join("board.rizref");
+        let (mut scene, camera) = board(b"original bytes", 8);
+        let note = scene.insert_note("coloured", Vec2::new(-300.0, -200.0), Vec2::splat(90.0));
+        let mut content = scene
+            .item(note)
+            .and_then(rizref_core::Item::note_content)
+            .expect("note");
+        content.background = Some([10, 200, 30]);
+        scene.item_mut(note).expect("note").set_note(&content);
+        save(&path, &request(&scene, &camera, "shell")).expect("save");
+
+        let mut reader = crate::BoardReader::open_path(&path).expect("open");
+        let embedded = reader
+            .thumbnail_image([24, 24, 28, 255])
+            .expect("thumbnail");
+        let composite = reader
+            .preview_composite([24, 24, 28, 255])
+            .expect("composite");
+
+        assert_eq!(
+            (embedded.width(), embedded.height()),
+            (composite.width(), composite.height()),
+            "the fallback draws the same picture size the save embedded"
+        );
+        // The coloured note sits in the top-left corner of the board's box;
+        // both pictures paint it green, from the 06a `background` field.
+        let corner = |image: &ImageBuffer| {
+            let [r, g, b, _] = image.pixel(4, 4).expect("in bounds");
+            g > 150 && r < 80 && b < 80
+        };
+        assert!(
+            corner(&composite),
+            "composite paints the stored note colour"
+        );
+        assert!(corner(&embedded), "the embedded thumbnail does too");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn request<'a>(scene: &'a Scene, camera: &'a Camera, name: &'a str) -> SaveRequest<'a> {
         SaveRequest::new(scene, *camera, name)
     }
