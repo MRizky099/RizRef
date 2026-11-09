@@ -1407,4 +1407,50 @@ mod tests {
         crate::load(&path).expect("load");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn note_payload_fields_survive_save_append_and_load() {
+        let dir = temp_dir("note-fields");
+        let path = dir.join("notes.rizref");
+        let (mut scene, camera) = board(&[1_u8; 256], 2);
+        let note = scene
+            .items()
+            .iter()
+            .find(|item| item.is_note())
+            .expect("note")
+            .id();
+        let styled = rizref_core::NoteContent {
+            text: "# Study\n\nThis is <span style=\"color: red;\">red</span>".into(),
+            format: rizref_core::NoteFormat::Markdown,
+            background: Some([0xf5, 0xf0, 0xe1]),
+            wrap_width: Some(240.0),
+        };
+        scene.item_mut(note).expect("note").set_note(&styled);
+        save(&path, &request(&scene, &camera, "Notes")).expect("fresh save");
+        let loaded = crate::load(&path).expect("load");
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(
+            loaded
+                .scene
+                .item(note)
+                .and_then(rizref_core::Item::note_content),
+            Some(styled.clone())
+        );
+
+        // An appended save that changes only the background keeps the rest.
+        let mut recoloured = styled;
+        recoloured.background = Some([0x10, 0x20, 0x30]);
+        scene.item_mut(note).expect("note").set_note(&recoloured);
+        let report = save(&path, &request(&scene, &camera, "Notes")).expect("append");
+        assert_eq!(report.mode, SaveMode::Appended);
+        let loaded = crate::load(&path).expect("reload");
+        assert_eq!(
+            loaded
+                .scene
+                .item(note)
+                .and_then(rizref_core::Item::note_content),
+            Some(recoloured)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
