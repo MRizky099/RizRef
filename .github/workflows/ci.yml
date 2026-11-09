@@ -21,9 +21,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Phase 08: every check runs on the three release platforms. Ubuntu 22.04
+  # is the glibc baseline the Linux build documents (2.35); macOS 15 is an
+  # Apple Silicon runner (GitHub retired the macOS 14 image), and the Intel
+  # half of the universal build is tested on macos-15-intel and
+  # cross-checked from the arm64 runner (see the test job).
   fmt:
-    name: rustfmt
-    runs-on: windows-latest
+    name: rustfmt (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -33,8 +42,12 @@ jobs:
         run: cargo fmt --all --check
 
   clippy:
-    name: clippy
-    runs-on: windows-latest
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -42,16 +55,34 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # Workspace lints live in the root Cargo.toml, so a lint failure here is a
-      # policy failure, not a matter of taste.
+      # policy failure, not a matter of taste. Each OS lints its own platform
+      # half (`crates/rizref/src/platform/{windows,unix,linux,macos}`).
       - name: Lint every target
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    name: test
-    runs-on: windows-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+          - os: macos-15
+            triple: aarch64-apple-darwin
+            # The Intel half of the universal macOS build (10.13+), also
+            # checked by cross-compilation from the arm64 runner.
+            cross: x86_64-apple-darwin
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cross || matrix.triple }}
       - uses: Swatinem/rust-cache@v2
       - name: Build the workspace
         run: cargo build --workspace
@@ -59,24 +90,19 @@ jobs:
         run: cargo test --workspace
       # The pure-Rust rule is the one constraint that is easy to break by adding
       # a feature flag, and impossible to notice in review. Catching it here is
-      # cheaper than catching it in a released binary.
-      - name: Audit the dependency tree for native bindings
+      # cheaper than catching it in a released binary. The script checks the
+      # `-sys` crates per target, the features that keep C out, and that no
+      # build script left an object file behind.
+      - name: Audit the dependency tree for native code
         shell: bash
-        run: |
-          set -euo pipefail
-          cargo tree --workspace --target x86_64-pc-windows-msvc -e normal,build > dependency-tree.txt
-          # Crates whose name marks them as native bindings, with the version cut off.
-          bindings=$(grep -oE '[a-z0-9_]+(-[a-z0-9_]+)*[-_]sys v[0-9][^ ]*' dependency-tree.txt \
-            | sed -E 's/ v[0-9].*$//' | sort -u)
-          # Accepted: the Win32/COM FFI family, plus bindings that declare an API
-          # without linking anything (see the README audit note).
-          accepted='^(windows-sys|windows-targets|windows_[a-z0-9_]+|renderdoc-sys)$'
-          unexpected=$(printf '%s\n' "$bindings" | grep -Ev "$accepted" || true)
-          printf 'native-binding crates found:\n%s\n' "$bindings"
-          if [ -n "$unexpected" ]; then
-            printf '::error::dependency tree contains native bindings that are not accepted: %s\n' "$unexpected"
-            exit 1
-          fi
+        run: scripts/audit-native.sh ${{ matrix.triple }} target/debug/build
+      - name: Cross-check ${{ matrix.cross }}
+        if: matrix.cross
+        run: cargo check --workspace --all-targets --target ${{ matrix.cross }}
+      - name: Audit ${{ matrix.cross }}
+        if: matrix.cross
+        shell: bash
+        run: scripts/audit-native.sh ${{ matrix.cross }} target/${{ matrix.cross }}/debug/build
 
   fuzz:
     name: fuzz (${{ matrix.target }})

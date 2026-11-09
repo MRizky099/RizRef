@@ -2,6 +2,61 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Phase 08a — Portability layer + Linux (in review)
+
+Branch `claude/phase-08a-portability-linux-6315f5`, part of issue #24 (phase 08:
+v1.0 on Windows, Linux and macOS together). No format change. Windows behaviour is
+unchanged: the Win32 code moved, it was not rewritten.
+
+- **Platform facade.** `platform/` is now free functions and plain types with one body
+  per `#[cfg]`; the OS halves live in `platform/windows/` (the phase 01–07 code),
+  `platform/unix/` (shared by Linux and macOS), `platform/linux/` and `platform/macos/`.
+  Wire formats, mode policy, launch validation and dump naming stay in the facade, so
+  their tests run on every OS. `platform::capabilities` says which window modes a
+  backend offers (Win32, X11, Wayland, AppKit); the menu greys out what is missing
+  (always on top on Wayland) and the command explains itself in a toast.
+- **App directories** per OS (`paths::resolve`, tested for all three on any host):
+  Windows keeps `%APPDATA%\RizRef` / `%LOCALAPPDATA%\RizRef` exactly, so nothing
+  migrates; Linux uses `$XDG_CONFIG_HOME/rizref` and `$XDG_STATE_HOME/rizref` (logs,
+  autosave, crash dir), ignoring relative XDG values; macOS uses
+  `~/Library/Application Support/RizRef` and `~/Library/Logs/RizRef`. Path comparison
+  folds case on Windows and macOS only.
+- **Single instance on Unix:** an `flock`ed `rizref.lock` plus a Unix-domain socket in
+  `$XDG_RUNTIME_DIR` (or a `0700` per-user directory; the per-user `$TMPDIR` on
+  macOS), speaking the same framed protocol as the Windows pipe. A secondary retries
+  for 1 s while the primary binds; a stale socket is replaced by the lock holder.
+- **Linux integration:** `rizref register [--machine]` writes a desktop entry, the
+  `application/x-rizref` MIME type (glob + container magic), hicolor icons taken from
+  the committed `.ico` files, and a freedesktop thumbnailer entry; `unregister`
+  removes exactly those files. New `rizref thumbnail -s SIZE IN OUT` (Linux/macOS)
+  writes the same picture the Explorer provider shows, as PNG. Launching uses
+  `xdg-open` and the `FileManager1.ShowItems` D-Bus call (falling back to the folder);
+  the window gets its icon and `WM_CLASS`/`app_id` `rizref`; error boxes go through
+  `rfd`; clipboard HTML through `arboard` (an absolute `<img src>` is the source URL).
+  File drops use winit's `DroppedFile` (X11 and macOS).
+- **GPU on macOS:** wgpu's `metal` feature is enabled for `target_os = "macos"` only
+  (Windows stays DX12 + Vulkan, Linux Vulkan); `RIZREF_GPU_BACKEND=metal` is accepted.
+  `renderer::has_usable_backend` guards every `wgpu::Instance::new`, so a build without
+  a backend for its OS logs an error and shows the "no GPU surface" alert, naming the
+  API that OS needs, instead of panicking. The offscreen pipeline test skips, saying
+  so, only when no adapter exists.
+- **Fonts:** with `fontconfig` still off, `cosmic-text` scans system font directories;
+  on Linux and macOS KaTeX_SansSerif (already embedded for math, SIL OFL 1.1) is added
+  as the last-resort face so a system without fonts still renders text.
+- **CI:** `fmt`, `clippy` and `test` on `windows-latest`, `ubuntu-22.04` and
+  `macos-15` (Apple Silicon) and `macos-15-intel`, plus an `x86_64-apple-darwin`
+  cross-check from arm64. `scripts/audit-native.sh`
+  replaces the inline Windows audit: per-target `-sys` allow-lists (README), the
+  `wayland-sys`/`wayland-backend` features that keep C out, and a scan for object files
+  left by build scripts.
+
+Not in 08a, and stubbed with the gap documented in the module: CPU presentation before
+the GPU is up (the window waits for its first GPU frame), crash minidumps on
+Linux/macOS (`minidump-writer`), whole-window opacity and the global ghost chord
+(XGrabKey / portal GlobalShortcuts), Wayland drag-and-drop and browser source URLs on
+drops, the GLES fallback, `recently-used.xbel`, and AVIF outside Windows (open
+decision). Everything macOS-specific is 08b; packaging is 08c.
+
 ## Phase 07 — Polish & ship (done)
 
 Branch `feat/phase-07-polish-and-ship`, closes issue #8. Version **1.0.0**, licensed

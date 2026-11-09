@@ -1,6 +1,6 @@
 [package]
 name = "rizref"
-description = "The RizRef application: window, renderer, input and Windows platform glue."
+description = "The RizRef application: window, renderer, input and platform glue."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -40,8 +40,25 @@ rfd.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+
+# The Win32/COM glue (`src/platform/windows/`).
+[target.'cfg(windows)'.dependencies]
 windows.workspace = true
 windows-core.workspace = true
+
+# Linux and macOS (`src/platform/unix/`): the thumbnail pipeline behind
+# `rizref thumbnail` (the freedesktop thumbnailer) and the icon PNGs inside the
+# committed `.ico` assets, plus the fallback UI font. On Windows the exe never
+# links `rizref-thumb`, whose COM exports belong to the DLL.
+# macOS renders through Metal, and only macOS compiles wgpu's Metal backend
+# (`objc2-metal` / `objc2-quartz-core` declarations; the framework ships with
+# the OS). Windows stays DX12 + Vulkan, Linux Vulkan.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { workspace = true, features = ["metal"] }
+
+[target.'cfg(unix)'.dependencies]
+rizref-thumb = { path = "../rizref-thumb" }
+ratex-katex-fonts.workspace = true
 
 [dev-dependencies]
 # The thumbnail DLL's crate, for one test: the registry plan repeats its class

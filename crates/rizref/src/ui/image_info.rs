@@ -10,7 +10,6 @@
 //! handling that returns an [`InfoResult`] for the application to act on,
 //! and painting through the shared [`Painter`].
 
-use std::path::Path;
 use std::time::Duration;
 
 use glam::DVec2;
@@ -613,9 +612,14 @@ fn display_name(location: &str, is_url: bool) -> Option<String> {
             .or(Some(rest))
             .map(str::to_owned)
     } else {
-        Path::new(location)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
+        // Both separators: a board saved on Windows records `D:\refs\a.png`,
+        // and on Linux or macOS that is still the file `a.png`, not a name
+        // with backslashes in it.
+        location
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .map(str::to_owned)
     };
     name.filter(|name| !name.is_empty())
 }
@@ -820,6 +824,10 @@ mod tests {
     #[test]
     fn display_names_come_from_the_last_segment() {
         assert_eq!(display_name(r"C:\a\b.png", false).as_deref(), Some("b.png"));
+        assert_eq!(
+            display_name("/home/u/b.png", false).as_deref(),
+            Some("b.png")
+        );
         assert_eq!(
             display_name("https://e.com/a/b.webp?x#y", true).as_deref(),
             Some("b.webp")

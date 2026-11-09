@@ -69,8 +69,7 @@ fn value(key: impl Into<String>, name: Option<&str>, data: impl Into<String>) ->
     }
 }
 
-/// The `.rizref` file icon's index among the exe's icon groups.
-pub const DOCUMENT_ICON_INDEX: u32 = 1;
+use crate::platform::register::{DOCUMENT_ICON_INDEX, MIME_TYPE};
 
 /// Every value `register` writes for an exe at `exe`, plus the thumbnail
 /// provider when `thumb_dll` is given.
@@ -79,7 +78,7 @@ pub fn plan(exe: &Path, thumb_dll: Option<&Path>) -> Vec<Value> {
     let open = format!("\"{exe}\" \"%1\"");
     let mut values = vec![
         value(EXTENSION, None, PROG_ID),
-        value(EXTENSION, Some("Content Type"), "application/x-rizref"),
+        value(EXTENSION, Some("Content Type"), MIME_TYPE),
         value(EXTENSION, Some("PerceivedType"), "document"),
         value(format!("{EXTENSION}\\OpenWithProgids"), Some(PROG_ID), ""),
         value(PROG_ID, None, "RizRef board"),

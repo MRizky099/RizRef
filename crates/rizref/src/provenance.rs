@@ -13,6 +13,12 @@
 //! plumbing that reads the raw bytes lives in `clipboard` and
 //! `platform::drop_target`.
 
+// The drop and `CF_HTML` parsers serve the Windows OLE and clipboard paths
+// today; the Linux and macOS drag payloads (`text/uri-list`, `text/x-moz-url`,
+// `public.url`) are the phase-08 input work that reuses them. Their tests run
+// on every OS.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use rizref_format::{AssetOrigin, AssetProvenance};
 
 /// Longest URL accepted, in bytes. Longer values are refused rather than
@@ -289,6 +295,17 @@ pub fn url_from_cf_html(bytes: &[u8]) -> Option<String> {
     first_tag_attribute(&html.fragment, "img", "src")
         .and_then(|src| resolve_url(base.as_deref(), &src))
         .or_else(|| html.source_url.as_deref().and_then(normalize_url))
+}
+
+/// The image URL plain clipboard HTML names (`text/html` on Linux,
+/// `public.html` on macOS), if any.
+///
+/// Unlike `CF_HTML` there is no `SourceURL` header to resolve a relative
+/// `src` against, so only an absolute `http`/`https` `<img src>` counts.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn url_from_plain_html(html: &str) -> Option<String> {
+    let base = first_tag_attribute(html, "base", "href").and_then(|href| normalize_url(&href));
+    first_tag_attribute(html, "img", "src").and_then(|src| resolve_url(base.as_deref(), &src))
 }
 
 /// The `attribute` of the first `<tag …>` in `html`, entity-decoded.
@@ -1139,5 +1156,25 @@ EndFragment:{end_fragment:010}
                 .as_deref(),
             Some("javascript:alert(1)")
         );
+    }
+
+    #[test]
+    fn plain_clipboard_html_yields_only_absolute_web_image_urls() {
+        use super::url_from_plain_html;
+        assert_eq!(
+            url_from_plain_html(r#"<meta charset="utf-8"><img src="https://e.com/a.png" alt="">"#)
+                .as_deref(),
+            Some("https://e.com/a.png")
+        );
+        assert_eq!(
+            url_from_plain_html(r#"<base href="https://e.com/dir/"><img src="b.jpg">"#).as_deref(),
+            Some("https://e.com/dir/b.jpg")
+        );
+        assert_eq!(url_from_plain_html(r#"<img src="relative.png">"#), None);
+        assert_eq!(
+            url_from_plain_html(r#"<img src="file:///etc/passwd">"#),
+            None
+        );
+        assert_eq!(url_from_plain_html("<p>no image</p>"), None);
     }
 }

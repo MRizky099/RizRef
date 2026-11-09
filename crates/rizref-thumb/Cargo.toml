@@ -1,6 +1,6 @@
 [package]
 name = "rizref-thumb"
-description = "Windows Explorer thumbnail provider (IThumbnailProvider) for `.rizref` boards."
+description = "Board thumbnails for `.rizref`: the Windows Explorer provider DLL (IThumbnailProvider) and the picture pipeline the Linux thumbnailer reuses."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -19,6 +19,10 @@ crate-type = ["cdylib", "rlib"]
 # that writes them.
 rizref-format = { path = "../rizref-format" }
 rizref-codecs = { path = "../rizref-codecs" }
+
+# The COM server (`src/com.rs`) is Windows-only; elsewhere the crate is the
+# pure picture pipeline.
+[target.'cfg(windows)'.dependencies]
 windows.workspace = true
 windows-core.workspace = true
 

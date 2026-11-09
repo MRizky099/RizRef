@@ -414,13 +414,18 @@ mod tests {
     #[test]
     fn recent_actions_carry_the_exact_path() {
         let mut recents = Recents::default();
-        recents.record("C:/boards/a.rizref", 1, None, 0);
+        // An absolute path on this OS, so recording does not resolve it
+        // against the working directory.
+        let board = if cfg!(windows) {
+            "C:/boards/a.rizref"
+        } else {
+            "/boards/a.rizref"
+        };
+        recents.record(board, 1, None, 0);
         let action = super::action_for(StartControl::Recent(0), &recents);
         assert_eq!(
             action,
-            Some(crate::ui::menu::Action::OpenRecent(
-                "C:/boards/a.rizref".into()
-            ))
+            Some(crate::ui::menu::Action::OpenRecent(board.into()))
         );
     }
 }

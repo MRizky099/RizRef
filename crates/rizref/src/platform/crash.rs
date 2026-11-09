@@ -1,50 +1,32 @@
-//! Crash minidumps: Crashpad parity without Crashpad.
+//! Crash reports: where they go, what they are called, how many are kept.
 //!
-//! A Rust panic is reported by the panic hook in `app`. What the hook cannot
-//! see is a *structured exception*: an access violation inside a GPU driver, a
-//! stack overflow in a decoder, a fault in a COM callee. For those Windows
-//! calls the process's unhandled-exception filter, and this module installs
-//! one that writes a minidump with `MiniDumpWriteDump` (dbghelp, part of every
-//! Windows install) to `%LOCALAPPDATA%\RizRef\crashes`, then lets the process
-//! die. The session marker left behind is what makes the next launch say
-//! "RizRef recovered" and offer the autosave.
+//! A Rust panic is reported by the panic hook in `app` on every OS. What the
+//! hook cannot see is a fault below Rust — an access violation inside a GPU
+//! driver, a stack overflow in a decoder:
 //!
-//! The plan named the `minidump-writer` crate behind a vectored handler. An
-//! unhandled-exception filter is the better hook — a vectored handler also
-//! sees first-chance exceptions that a driver or the OS handles itself — and
-//! dbghelp is an OS library reached through the `windows` declarations we
-//! already depend on, so no dependency is added.
+//! * **Windows** writes a minidump from the unhandled-exception filter
+//!   (`platform/windows/crash.rs`, dbghelp — part of every install);
+//! * **Linux and macOS** do not write a dump yet (`platform/unix/crash.rs`):
+//!   a signal-safe writer is the `minidump-writer` work the phase-08 plan
+//!   lists. The session marker left behind by a fault still makes the next
+//!   launch say "RizRef recovered" and offer the autosave.
 //!
-//! The filter runs on a damaged process, so it allocates nothing: the dump
-//! path is built at install time.
+//! Dumps go to the `crashes` folder of the per-OS state directory
+//! ([`crashes_dir`]), the newest [`DUMPS_KEPT`] are kept.
 
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
-use windows::Win32::Storage::FileSystem::{
-    CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE,
-};
-use windows::Win32::System::Diagnostics::Debug::{
-    EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION, MiniDumpWithIndirectlyReferencedMemory,
-    MiniDumpWithThreadInfo, MiniDumpWriteDump, SetUnhandledExceptionFilter,
-};
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
-};
-use windows::core::PCWSTR;
+#[cfg(windows)]
+pub use super::windows::crash::{install, raise_access_violation};
+
+#[cfg(unix)]
+pub use super::unix::crash::{install, raise_access_violation};
 
 /// How many dumps to keep; older ones are pruned at install time.
 pub const DUMPS_KEPT: usize = 10;
 
-/// `EXCEPTION_EXECUTE_HANDLER`: the process ends after the filter returns.
-const EXECUTE_HANDLER: i32 = 1;
-
-/// The NUL-terminated dump path, fixed at install time.
-static DUMP_PATH: OnceLock<Vec<u16>> = OnceLock::new();
-
-/// `%LOCALAPPDATA%\RizRef\crashes`.
+/// The `crashes` folder of the state directory (`%LOCALAPPDATA%\RizRef\crashes`
+/// on Windows).
 pub fn crashes_dir() -> PathBuf {
     crate::paths::local_dir().join("crashes")
 }
@@ -66,28 +48,8 @@ pub fn stale_dumps(names: &[String], keep: usize) -> Vec<String> {
     dumps.into_iter().skip(keep).cloned().collect()
 }
 
-/// Installs the unhandled-exception filter, writing dumps into `dir`.
-/// Returns the path a dump would be written to. Calling it twice keeps the
-/// first path.
-// SAFETY: `SetUnhandledExceptionFilter` only stores the function pointer; the
-// filter itself is `unsafe extern "system"` with the documented signature.
-#[allow(unsafe_code)]
-pub fn install(dir: &Path) -> PathBuf {
-    let _ = std::fs::create_dir_all(dir);
-    prune(dir);
-    let unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let path = dir.join(dump_file_name(unix, std::process::id()));
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let _ = DUMP_PATH.set(wide);
-    unsafe {
-        SetUnhandledExceptionFilter(Some(write_dump));
-    }
-    path
-}
-
-fn prune(dir: &Path) {
+/// Deletes all but the newest [`DUMPS_KEPT`] dumps in `dir`.
+pub(crate) fn prune(dir: &Path) {
     let names: Vec<String> = std::fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -99,59 +61,6 @@ fn prune(dir: &Path) {
     for name in stale_dumps(&names, DUMPS_KEPT) {
         let _ = std::fs::remove_file(dir.join(name));
     }
-}
-
-/// The filter: write the dump, then let Windows end the process.
-// SAFETY: called by the OS with a valid `EXCEPTION_POINTERS` for the faulting
-// thread. The path buffer is a NUL-terminated `'static` allocation made at
-// install time; the file handle is closed before returning.
-#[allow(unsafe_code)]
-unsafe extern "system" fn write_dump(info: *const EXCEPTION_POINTERS) -> i32 {
-    let Some(path) = DUMP_PATH.get() else {
-        return EXECUTE_HANDLER;
-    };
-    unsafe {
-        let Ok(file) = CreateFileW(
-            PCWSTR(path.as_ptr()),
-            GENERIC_WRITE.0,
-            FILE_SHARE_NONE,
-            None,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            None,
-        ) else {
-            return EXECUTE_HANDLER;
-        };
-        let exception = MINIDUMP_EXCEPTION_INFORMATION {
-            ThreadId: GetCurrentThreadId(),
-            ExceptionPointers: info.cast_mut(),
-            ClientPointers: false.into(),
-        };
-        let _ = MiniDumpWriteDump(
-            GetCurrentProcess(),
-            GetCurrentProcessId(),
-            file,
-            MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory,
-            Some(&exception),
-            None,
-            None,
-        );
-        let _ = CloseHandle(file);
-    }
-    EXECUTE_HANDLER
-}
-
-/// Raises an access violation, for `rizref --crash-test` (the by-hand and
-/// integration check that a dump is written).
-// SAFETY: deliberately undefined at the language level and well defined at
-// the OS level: a volatile write to address 0 faults with
-// EXCEPTION_ACCESS_VIOLATION, which is the point.
-#[allow(unsafe_code)]
-pub fn raise_access_violation() -> ! {
-    unsafe {
-        std::ptr::null_mut::<u8>().write_volatile(1);
-    }
-    std::process::abort()
 }
 
 #[cfg(test)]

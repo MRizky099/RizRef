@@ -531,6 +531,7 @@ mod tests {
             ghost: false,
             click_through: false,
             always_on_top: false,
+            capabilities: crate::platform::capabilities::Capabilities::WIN32,
             opacity_percent: 100,
             note_selected: false,
             selected_image: None,

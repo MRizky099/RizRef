@@ -90,7 +90,7 @@ fn the_exe_resources_hold_the_app_icon_then_the_document_icon() {
         [1, 2]
     );
     assert_eq!(
-        crate::platform::registry::DOCUMENT_ICON_INDEX,
+        crate::platform::register::DOCUMENT_ICON_INDEX,
         1,
         "the file icon names the second group"
     );

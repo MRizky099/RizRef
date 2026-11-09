@@ -6,6 +6,10 @@
 *.toml text
 *.md text
 
+# Shell scripts run under bash on every CI runner, Windows included: a CRLF
+# checkout would make bash read a carriage return as part of every command.
+*.sh text eol=lf
+
 # Binary assets
 *.rizref binary
 *.png binary
