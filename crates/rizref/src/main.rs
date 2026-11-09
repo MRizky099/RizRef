@@ -19,6 +19,11 @@
 //! directly.
 
 #![deny(unsafe_code)]
+// Release builds are GUI-subsystem binaries: launching from Explorer or a jump
+// list never flashes a console. `platform::console::attach_parent` restores
+// terminal output for `--help`, `--version` and `inspect`. Debug builds (and
+// so `cargo test`) keep the console subsystem.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod accessibility;
 mod app;
@@ -57,5 +62,6 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     perf::mark_process_start();
+    platform::console::attach_parent();
     app::run(std::env::args().skip(1).collect())
 }

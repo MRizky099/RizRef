@@ -143,6 +143,9 @@ struct ParsedArgs {
     check_dialogs: bool,
     /// Print the build summary instead of opening the window.
     build_info: bool,
+    /// Raise an access violation after the crash handler is installed (the
+    /// minidump check).
+    crash_test: bool,
     /// Print the startup waterfall as JSON once the first frame is presented,
     /// then exit (the cold-start bench, `scripts/bench-startup.ps1`).
     exit_after_first_frame: bool,
@@ -161,6 +164,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
             "--verbose" | "-v" => parsed.verbose = true,
             "--check-dialogs" => parsed.check_dialogs = true,
             "--build-info" => parsed.build_info = true,
+            "--crash-test" => parsed.crash_test = true,
             "--exit-after-first-frame" => parsed.exit_after_first_frame = true,
             flag if flag.starts_with("--bench-frames=") => {
                 let count = &flag["--bench-frames=".len()..];
@@ -209,6 +213,11 @@ pub fn run(args: Vec<String>) -> ExitCode {
     let mut startup = StartupClock::new(perf::process_start());
     startup.mark(Milestone::Logging);
     install_panic_hook(log_dir);
+    let dump = platform::crash::install(&platform::crash::crashes_dir());
+    if parsed.crash_test {
+        tracing::warn!(dump = %dump.display(), "--crash-test: raising an access violation");
+        platform::crash::raise_access_violation();
+    }
     tracing::info!(version = env!("CARGO_PKG_VERSION"), ?parsed, "starting");
 
     if parsed.check_dialogs {
