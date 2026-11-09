@@ -196,6 +196,8 @@ mod tests {
         assert_eq!(LocationKind::Local.open_label(), "Open file location");
     }
 
+    // Windows paths; the Unix spelling is `unix_paths_plan_the_same_way`.
+    #[cfg(windows)]
     #[test]
     fn a_non_web_url_is_never_a_location() {
         for hostile in [
@@ -216,6 +218,8 @@ mod tests {
         }
     }
 
+    // Windows paths; the Unix spelling is `unix_paths_plan_the_same_way`.
+    #[cfg(windows)]
     #[test]
     fn an_existing_file_is_selected() {
         let local = record(Some(r"D:\My Refs\a, b & c.png"), None);
@@ -225,6 +229,8 @@ mod tests {
         );
     }
 
+    // Windows paths; the Unix spelling is `unix_paths_plan_the_same_way`.
+    #[cfg(windows)]
     #[test]
     fn a_moved_file_opens_its_folder_and_a_vanished_one_reports_it() {
         let local = record(Some(r"D:\refs\gone.png"), None);
@@ -235,6 +241,8 @@ mod tests {
         assert_eq!(plan(&local, None, fs(&[], &[])), LocationPlan::Gone);
     }
 
+    // Windows paths; the Unix spelling is `unix_paths_plan_the_same_way`.
+    #[cfg(windows)]
     #[test]
     fn relative_paths_resolve_against_the_board_folder() {
         let relative = record(Some(r"refs\hero.png"), None);
@@ -267,5 +275,37 @@ mod tests {
             LocationPlan::Nothing.message(),
             "Pasted or dropped without a source location"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_paths_plan_the_same_way() {
+        let local = record(Some("/home/u/My Refs/a, b & c.png"), None);
+        assert_eq!(
+            plan(&local, None, fs(&["/home/u/My Refs/a, b & c.png"], &[])),
+            LocationPlan::SelectFile(PathBuf::from("/home/u/My Refs/a, b & c.png"))
+        );
+        assert_eq!(
+            plan(&local, None, fs(&[], &["/home/u/My Refs"])),
+            LocationPlan::OpenParent(PathBuf::from("/home/u/My Refs"))
+        );
+        let relative = record(Some("refs/hero.png"), None);
+        assert_eq!(
+            plan(
+                &relative,
+                Some(Path::new("/home/u/boards")),
+                fs(&["/home/u/boards/refs/hero.png"], &[])
+            ),
+            LocationPlan::SelectFile(PathBuf::from("/home/u/boards/refs/hero.png"))
+        );
+        assert_eq!(plan(&relative, None, fs(&[], &[])), LocationPlan::Gone);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_windows_path_from_another_machine_is_gone_not_launched() {
+        let foreign = record(Some(r"D:\refs\a.png"), None);
+        assert_eq!(location_kind(&foreign), Some(LocationKind::Local));
+        assert_eq!(plan(&foreign, None, fs(&[], &[])), LocationPlan::Gone);
     }
 }

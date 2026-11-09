@@ -274,7 +274,9 @@ pub fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{RECENT_LIMIT, Recents, relative_time};
+    #[cfg(windows)]
+    use super::RECENT_LIMIT;
+    use super::{Recents, relative_time};
 
     #[test]
     fn relative_time_reads_like_a_person_wrote_it() {
@@ -287,6 +289,8 @@ mod tests {
         assert_eq!(relative_time(100, 100 + 4 * 86_400), "4 days ago");
     }
 
+    // Windows spellings; see `unix_paths_dedupe_by_their_spelling`.
+    #[cfg(windows)]
     #[test]
     fn a_recorded_board_moves_to_the_front_and_deduplicates_by_path() {
         let mut recents = Recents::default();
@@ -301,6 +305,8 @@ mod tests {
         assert_eq!(recents.entries[1].path, r"C:\boards\b.rizref");
     }
 
+    // Windows spellings; see `unix_paths_dedupe_by_their_spelling`.
+    #[cfg(windows)]
     #[test]
     fn the_list_is_capped() {
         let mut recents = Recents::default();
@@ -314,6 +320,8 @@ mod tests {
         );
     }
 
+    // Windows spellings; see `unix_paths_dedupe_by_their_spelling`.
+    #[cfg(windows)]
     #[test]
     fn removal_is_case_insensitive_and_reports_presence() {
         let mut recents = Recents::default();
@@ -348,6 +356,8 @@ mod tests {
         );
     }
 
+    // Windows spellings; see `unix_paths_dedupe_by_their_spelling`.
+    #[cfg(windows)]
     #[test]
     fn one_board_in_two_spellings_is_one_card() {
         let mut recents = Recents::default();
@@ -372,6 +382,8 @@ mod tests {
         assert_eq!(recents.entries[0].item_count, 4, "the newer record wins");
     }
 
+    // Windows spellings; see `unix_paths_dedupe_by_their_spelling`.
+    #[cfg(windows)]
     #[test]
     fn loading_merges_duplicates_and_drops_unresolvable_relative_paths() {
         let body = r#"{"entries":[
@@ -411,5 +423,25 @@ mod tests {
         let body = r#"{"entries":[{"path":"C:/b.rizref","edited_at":5,"item_count":2,"preview":[255,216,255,224]}]}"#;
         let recents: Recents = serde_json::from_str(body).expect("old form parses");
         assert_eq!(recents.entries[0].preview, Some(vec![255, 216, 255, 224]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_paths_dedupe_by_their_spelling() {
+        let mut recents = Recents::default();
+        recents.record("/home/u/boards/a.rizref", 3, None, 10);
+        recents.record("/home/u/boards/./a.rizref", 4, None, 20);
+        recents.record("/home/u/boards/b.rizref", 1, None, 30);
+        assert_eq!(recents.entries.len(), 2);
+        assert_eq!(recents.entries[0].path, "/home/u/boards/b.rizref");
+        assert_eq!(recents.entries[1].path, "/home/u/boards/a.rizref");
+        assert_eq!(recents.entries[1].item_count, 4, "the newer record wins");
+
+        // Linux file systems keep case; macOS's default one folds it.
+        recents.record("/home/u/boards/A.rizref", 1, None, 40);
+        let expected = if cfg!(target_os = "macos") { 2 } else { 3 };
+        assert_eq!(recents.entries.len(), expected);
+        assert!(recents.remove("/home/u/boards/b.rizref"));
+        assert!(!recents.remove("/home/u/boards/b.rizref"));
     }
 }
