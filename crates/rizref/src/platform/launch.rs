@@ -15,8 +15,11 @@
 //! touch the OS.
 #![allow(unsafe_code)]
 
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use windows::Win32::Storage::FileSystem::GetLongPathNameW;
 
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -58,14 +61,36 @@ fn quoted_path(path: &Path) -> Option<String> {
 
 /// Opens Explorer with `path` selected.
 pub fn select_in_explorer(path: &Path) -> Result<(), LaunchError> {
-    let argument = select_argument(path).ok_or(LaunchError::Refused)?;
+    let argument = select_argument(&long_path(path)).ok_or(LaunchError::Refused)?;
     spawn_explorer(&argument)
 }
 
 /// Opens Explorer at the folder `path`.
 pub fn open_folder(path: &Path) -> Result<(), LaunchError> {
-    let argument = folder_argument(path).ok_or(LaunchError::Refused)?;
+    let argument = folder_argument(&long_path(path)).ok_or(LaunchError::Refused)?;
     spawn_explorer(&argument)
+}
+
+/// Expands 8.3 short names (`MRIZKY~1`) to the long path.
+///
+/// Explorer opens the folder of a short `/select` path but does not select
+/// the file, and short names reach a board through command-line arguments.
+/// Falls back to the path as given when it does not exist or cannot expand.
+fn long_path(path: &Path) -> PathBuf {
+    let wide = HSTRING::from(path.as_os_str());
+    // SAFETY: a size query with no buffer; the string is NUL-terminated.
+    let needed = unsafe { GetLongPathNameW(&wide, None) } as usize;
+    if needed == 0 {
+        return path.to_path_buf();
+    }
+    let mut buffer = vec![0u16; needed];
+    // SAFETY: the buffer holds `needed` units, which the call asked for.
+    let written = unsafe { GetLongPathNameW(&wide, Some(&mut buffer)) } as usize;
+    if written == 0 || written >= buffer.len() {
+        return path.to_path_buf();
+    }
+    buffer.truncate(written);
+    PathBuf::from(std::ffi::OsString::from_wide(&buffer))
 }
 
 /// Runs `explorer.exe <argument>` with the argument passed verbatim.
@@ -132,6 +157,24 @@ mod tests {
             assert_eq!(select_argument(Path::new(hostile)), None, "{hostile:?}");
             assert_eq!(folder_argument(Path::new(hostile)), None, "{hostile:?}");
         }
+    }
+
+    #[test]
+    fn short_names_expand_and_missing_paths_pass_through() {
+        let dir = std::env::temp_dir().join(format!("rizref long name {}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("a long file name.png");
+        std::fs::write(&file, b"x").expect("file");
+        let long = super::long_path(&file);
+        assert!(
+            long.to_string_lossy().ends_with("a long file name.png"),
+            "{}",
+            long.display()
+        );
+        assert!(!long.to_string_lossy().contains('~'), "{}", long.display());
+        let missing = Path::new(r"C:\definitely\absent\here.png");
+        assert_eq!(super::long_path(missing), missing);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
