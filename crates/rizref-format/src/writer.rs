@@ -140,6 +140,15 @@ pub struct SaveReport {
 pub fn save(path: impl AsRef<Path>, request: &SaveRequest<'_>) -> Result<SaveReport, FormatError> {
     let path = path.as_ref();
     let existed = path.is_file();
+    // A read-only target would only fail at the final rename, after the whole
+    // board was written to a temporary file; say so up front instead.
+    if existed && std::fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly()) {
+        return Err(FormatError::Denied {
+            operation: "save",
+            path: path.display().to_string(),
+            reason: "the file is read-only".to_owned(),
+        });
+    }
     let existing = if request.save_as {
         None
     } else {
@@ -878,9 +887,37 @@ fn write_temporary(
     file.sync_all()
         .map_err(|error| FormatError::io("flush", temporary.display().to_string(), error))?;
     drop(file);
-    std::fs::rename(temporary, target)
+    replace(temporary, target)
         .map_err(|error| FormatError::io("replace", target.display().to_string(), error))?;
     Ok(len)
+}
+
+/// How often a refused rename is retried, and the first pause between tries.
+const REPLACE_ATTEMPTS: u32 = 6;
+const REPLACE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Renames `temporary` over `target`, retrying briefly when the target is
+/// held open. On Windows a search indexer, an antivirus scan, a sync client or
+/// Explorer's own thumbnail provider can hold a board for a few milliseconds,
+/// and a rename over it fails with "access denied" in that window. Six tries
+/// with doubling pauses wait at most about 1.2 s before the error surfaces.
+fn replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    let mut pause = REPLACE_BACKOFF;
+    let mut attempt = 1;
+    loop {
+        match std::fs::rename(temporary, target) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < REPLACE_ATTEMPTS
+                    && error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                std::thread::sleep(pause);
+                pause *= 2;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -927,6 +964,62 @@ mod tests {
             .expect("asset");
         scene.insert_note("a note", Vec2::new(-100.0, 50.0), Vec2::splat(80.0));
         (scene, Camera::new(DVec2::new(10.0, 20.0), 1.25, 0.1))
+    }
+
+    #[test]
+    fn a_read_only_target_is_refused_before_anything_is_written() {
+        let dir = temp_dir("read-only");
+        let path = dir.join("locked.rizref");
+        let (scene, camera) = board(b"bytes", 8);
+        save(&path, &request(&scene, &camera, "locked")).expect("first save");
+        let mut permissions = std::fs::metadata(&path).expect("meta").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions.clone()).expect("read-only");
+        let before = std::fs::read(&path).expect("read");
+
+        let mut changed = scene.clone();
+        changed.insert_note("more", Vec2::ZERO, Vec2::splat(40.0));
+        let mut fresh = request(&changed, &camera, "locked");
+        fresh.save_as = true;
+        let error = save(&path, &fresh).expect_err("read-only");
+
+        assert!(error.is_denied(), "{error}");
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert_eq!(std::fs::read(&path).expect("read"), before, "untouched");
+        assert!(!dir.join("locked.rizref.tmp").exists(), "no temporary left");
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&path, permissions);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_over_a_briefly_locked_target_is_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp_dir("locked");
+        let path = dir.join("busy.rizref");
+        let (scene, camera) = board(b"bytes", 8);
+        save(&path, &request(&scene, &camera, "busy")).expect("first save");
+        // Hold the board open without FILE_SHARE_DELETE, as an indexer can,
+        // and let go after ~100 ms.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1) // FILE_SHARE_READ only
+            .open(&path)
+            .expect("hold");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(holder);
+        });
+
+        let mut fresh = request(&scene, &camera, "busy");
+        fresh.save_as = true;
+        let report = save(&path, &fresh).expect("the retry outlasts the lock");
+
+        release.join().expect("holder thread");
+        assert_eq!(report.mode, SaveMode::Fresh);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
