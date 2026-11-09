@@ -15,9 +15,11 @@ use crate::scene::ItemId;
 /// How to lay a selection out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrangeMode {
-    /// A grid; `columns` of `None` picks the near-square default.
+    /// Rows packed left to right in selection order, each as tall as its
+    /// tallest item, with even gaps; `columns` of `None` wraps rows at a
+    /// width that makes the block near-square.
     Grid {
-        /// Fixed column count, or `None` for `ceil(sqrt(n))`.
+        /// Fixed items per row, or `None` for the near-square wrap.
         columns: Option<usize>,
     },
     /// The largest item centred, the others packed around it.
@@ -85,36 +87,82 @@ pub fn arrange(rects: &[(ItemId, Rect)], mode: ArrangeMode, gap: f32) -> Vec<(It
     }
 }
 
-/// A near-square grid with fixed-size cells.
+/// Row-packed grid: items keep their order and flow left to right, a row
+/// is as tall as its tallest item (the others centred on it), and every gap —
+/// between items and between rows — is `gap`.
+///
+/// Fixed-size cells (phase 04 to 07) sized every cell to the largest item, so
+/// one 8000 px photo among 300 px sketches spread the sketches thousands of
+/// pixels apart. Packing keeps the block tight whatever the mix of sizes.
 fn grid(rects: &[(ItemId, Rect)], columns: Option<usize>, gap: f32) -> Vec<(ItemId, Vec2)> {
-    let count = rects.len();
-    let columns = columns
-        .unwrap_or_else(|| (count as f64).sqrt().ceil() as usize)
-        .clamp(1, count);
-    let rows = count.div_ceil(columns);
-    let cell = rects.iter().fold(Vec2::ZERO, |acc, (_, rect)| {
-        acc.max(Vec2::new(rect.width(), rect.height()))
-    });
-    let step = cell + Vec2::splat(gap);
-    let block = Vec2::new(columns as f32 * step.x - gap, rows as f32 * step.y - gap);
+    let sizes: Vec<Vec2> = rects
+        .iter()
+        .map(|(_, rect)| Vec2::new(rect.width(), rect.height()))
+        .collect();
+    let rows = grid_rows(&sizes, columns, gap);
+
+    // Lay the rows out from the origin, then centre the block on the
+    // selection.
+    let mut centers = vec![Vec2::ZERO; sizes.len()];
+    let mut block = Vec2::ZERO;
+    let mut y = 0.0;
+    for row in &rows {
+        let height = row.iter().map(|&i| sizes[i].y).fold(0.0, f32::max);
+        let mut x = 0.0;
+        for &index in row {
+            centers[index] = Vec2::new(x + sizes[index].x * 0.5, y + height * 0.5);
+            x += sizes[index].x + gap;
+        }
+        block.x = block.x.max(x - gap);
+        y += height + gap;
+    }
+    block.y = (y - gap).max(0.0);
     let origin = bounds(rects)
         .map(|rect| rect.center() - block * 0.5)
         .unwrap_or(-block * 0.5);
 
     rects
         .iter()
-        .enumerate()
-        .map(|(index, (id, _))| {
-            let column = index % columns;
-            let row = index / columns;
-            let center = origin
-                + Vec2::new(
-                    column as f32 * step.x + cell.x * 0.5,
-                    row as f32 * step.y + cell.y * 0.5,
-                );
-            (*id, center)
-        })
+        .zip(centers)
+        .map(|((id, _), center)| (*id, origin + center))
         .collect()
+}
+
+/// Splits item indices into rows: `columns` items each, or — without a
+/// count — greedily wrapped at a target width chosen so the packed block is
+/// roughly square (never narrower than the widest item).
+fn grid_rows(sizes: &[Vec2], columns: Option<usize>, gap: f32) -> Vec<Vec<usize>> {
+    if let Some(columns) = columns {
+        let columns = columns.max(1);
+        return (0..sizes.len())
+            .collect::<Vec<_>>()
+            .chunks(columns)
+            .map(<[usize]>::to_vec)
+            .collect();
+    }
+    let area: f32 = sizes
+        .iter()
+        .map(|size| (size.x + gap) * (size.y + gap))
+        .sum();
+    let widest = sizes.iter().map(|size| size.x).fold(0.0, f32::max);
+    let target = area.sqrt().max(widest);
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut row: Vec<usize> = Vec::new();
+    let mut width = 0.0;
+    for (index, size) in sizes.iter().enumerate() {
+        let added = if row.is_empty() { size.x } else { gap + size.x };
+        if !row.is_empty() && width + added > target {
+            rows.push(std::mem::take(&mut row));
+            width = size.x;
+        } else {
+            width += added;
+        }
+        row.push(index);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
 }
 
 /// The largest item in the middle, the rest on growing rings around it.
@@ -341,42 +389,85 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_grid_of_twelve_mixed_items_is_tight_and_non_overlapping() {
-        let rects = mixed();
-        let centers = arrange(&rects, ArrangeMode::Grid { columns: None }, 0.0);
-
-        assert_eq!(centers.len(), 12);
-        let placed: Vec<Rect> = centers
+    /// Places each rect at its arranged centre.
+    fn placed(rects: &[(ItemId, Rect)], centers: &[(ItemId, Vec2)]) -> Vec<Rect> {
+        centers
             .iter()
-            .zip(&rects)
+            .zip(rects)
             .map(|((_, center), (_, rect))| Rect::from_center_size(*center, rect.size))
-            .collect();
+            .collect()
+    }
+
+    fn assert_no_overlap(placed: &[Rect]) {
         for (index, rect) in placed.iter().enumerate() {
             for other in &placed[index + 1..] {
                 assert!(!rect.intersects(other), "{rect:?} overlaps {other:?}");
             }
         }
+    }
 
-        // ceil(sqrt(12)) = 4 columns by 3 rows, and every cell is exactly one
-        // cell wide, so neighbouring centres share the same x or y spacing.
-        let cell = rects.iter().fold(Vec2::ZERO, |acc, (_, rect)| {
-            acc.max(Vec2::new(rect.width(), rect.height()))
-        });
-        let mut xs: Vec<f32> = centers.iter().map(|(_, center)| center.x).collect();
-        xs.sort_by(f32::total_cmp);
-        xs.dedup_by(|a, b| (*a - *b).abs() < 1.0e-3);
-        assert_eq!(xs.len(), 4, "four columns");
-        for pair in xs.windows(2) {
-            assert!((pair[1] - pair[0] - cell.x).abs() < 1.0e-3);
+    #[test]
+    fn a_grid_of_twelve_mixed_items_is_tight_and_non_overlapping() {
+        let rects = mixed();
+        let gap = 8.0;
+        let centers = arrange(&rects, ArrangeMode::Grid { columns: None }, gap);
+
+        assert_eq!(centers.len(), 12);
+        let placed = placed(&rects, &centers);
+        assert_no_overlap(&placed);
+
+        // Neighbours in a row sit exactly one gap apart, in selection order.
+        for pair in placed.windows(2) {
+            let (left, right) = (pair[0], pair[1]);
+            let same_row = (left.center().y - right.center().y).abs() < 1.0e-3;
+            if same_row {
+                assert!((right.min.x - left.max().x - gap).abs() < 1.0e-3);
+            }
         }
+        // Tight: the block wastes at most the row-height slack, so its area
+        // stays within a small multiple of the items' own.
+        let block = placed
+            .iter()
+            .copied()
+            .reduce(|a, b| a.union(&b))
+            .expect("non-empty");
+        let items: f32 = placed.iter().map(Rect::area).sum();
+        assert!(block.area() < items * 2.0, "{} vs {items}", block.area());
+    }
 
-        let mut ys: Vec<f32> = centers.iter().map(|(_, center)| center.y).collect();
-        ys.sort_by(f32::total_cmp);
-        ys.dedup_by(|a, b| (*a - *b).abs() < 1.0e-3);
-        assert_eq!(ys.len(), 3, "three rows");
-        for pair in ys.windows(2) {
-            assert!((pair[1] - pair[0] - cell.y).abs() < 1.0e-3);
+    #[test]
+    fn one_huge_item_does_not_spread_the_small_ones() {
+        // The manual-test case: an 8000 px photo among 300-2400 px images.
+        let mut rects = vec![(
+            ItemId::from_raw(1),
+            Rect::from_min_size(Vec2::ZERO, Vec2::new(8000.0, 6000.0)),
+        )];
+        for index in 0..9 {
+            let side = 300.0 + index as f32 * 260.0;
+            rects.push((
+                ItemId::from_raw(index + 2),
+                Rect::from_min_size(Vec2::new(index as f32 * 9000.0, 0.0), Vec2::splat(side)),
+            ));
+        }
+        let gap = 16.0;
+        let centers = arrange(&rects, ArrangeMode::Grid { columns: None }, gap);
+        let placed = placed(&rects, &centers);
+        assert_no_overlap(&placed);
+
+        // Every small item has a neighbour within one gap (plus the row-height
+        // slack of centring in its row): nothing is stranded in a huge cell.
+        for (index, rect) in placed.iter().enumerate().skip(1) {
+            let nearest = placed
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, other)| {
+                    let dx = (other.min.x - rect.max().x).max(rect.min.x - other.max().x);
+                    let dy = (other.min.y - rect.max().y).max(rect.min.y - other.max().y);
+                    dx.max(dy).max(0.0)
+                })
+                .fold(f32::INFINITY, f32::min);
+            assert!(nearest <= gap + 1.0e-3, "item {index} is {nearest} away");
         }
     }
 
@@ -390,12 +481,13 @@ mod tests {
             .expect("non-empty")
             .center();
         let centers = arrange(&rects, ArrangeMode::Grid { columns: Some(3) }, 8.0);
-        let mean = centers
-            .iter()
-            .fold(Vec2::ZERO, |acc, (_, center)| acc + *center)
-            / centers.len() as f32;
+        let after = placed(&rects, &centers)
+            .into_iter()
+            .reduce(|a, b| a.union(&b))
+            .expect("non-empty")
+            .center();
 
-        assert!((mean - before).length() < 1.0e-3);
+        assert!((after - before).length() < 1.0e-3);
     }
 
     #[test]
