@@ -17,6 +17,15 @@ pub fn roaming_dir() -> PathBuf {
         .join("RizRef")
 }
 
+/// The local (non-roaming) application directory, `%LOCALAPPDATA%\RizRef`:
+/// logs, crash dumps, autosave copies and the session marker.
+pub fn local_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("rizref"))
+        .join("RizRef")
+}
+
 /// `%APPDATA%\RizRef\settings.json`.
 pub fn settings_file() -> PathBuf {
     roaming_dir().join("settings.json")

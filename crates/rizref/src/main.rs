@@ -22,9 +22,11 @@
 
 mod accessibility;
 mod app;
+mod autosave;
 mod board;
 mod canvas;
 mod clipboard;
+mod contain;
 mod dialogs;
 mod document;
 mod hud;
@@ -38,6 +40,7 @@ mod note;
 mod note_chrome;
 mod overlay;
 mod paths;
+mod perf;
 mod placement;
 mod platform;
 mod provenance;
@@ -53,5 +56,6 @@ mod view;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    perf::mark_process_start();
     app::run(std::env::args().skip(1).collect())
 }

@@ -38,6 +38,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 use crate::accessibility::Accessibility;
+use crate::autosave::{self, AutosavePolicy, AutosaveTracker, PreviousSession, Recovery};
 use crate::board::{Board, CursorHint, Modifiers, ViewInfo};
 use crate::canvas::{FrameFlags, HudUpload, ItemQuad, QuadInstance, UiUpload};
 use crate::clipboard::{self, ClipboardContent};
@@ -53,6 +54,7 @@ use crate::note_chrome::{
     NoteChrome, PillButton, PillLayout, ScreenRect, ToolbarButton, ToolbarLayout,
 };
 use crate::overlay::{self, OverlayState, OverlayVertex};
+use crate::perf::{self, FrameBench, FrameStats, Milestone, StartupClock};
 use crate::placement;
 use crate::platform::launch;
 use crate::platform::window_modes::WindowModes;
@@ -141,6 +143,12 @@ struct ParsedArgs {
     check_dialogs: bool,
     /// Print the build summary instead of opening the window.
     build_info: bool,
+    /// Print the startup waterfall as JSON once the first frame is presented,
+    /// then exit (the cold-start bench, `scripts/bench-startup.ps1`).
+    exit_after_first_frame: bool,
+    /// Drive the scripted pan/zoom soak for this many frames once the board is
+    /// on screen, print the frame-time report as JSON, then exit.
+    bench_frames: Option<u32>,
     /// Positional paths — boards to open (consumed by later phases).
     paths: Vec<String>,
 }
@@ -153,6 +161,14 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
             "--verbose" | "-v" => parsed.verbose = true,
             "--check-dialogs" => parsed.check_dialogs = true,
             "--build-info" => parsed.build_info = true,
+            "--exit-after-first-frame" => parsed.exit_after_first_frame = true,
+            flag if flag.starts_with("--bench-frames=") => {
+                let count = &flag["--bench-frames=".len()..];
+                match count.parse::<u32>() {
+                    Ok(frames) if frames > 0 => parsed.bench_frames = Some(frames),
+                    _ => return Err(flag.to_owned()),
+                }
+            }
             flag if flag.starts_with('-') && flag != "-" => return Err(flag.to_owned()),
             path => parsed.paths.push(path.to_owned()),
         }
@@ -190,6 +206,8 @@ pub fn run(args: Vec<String>) -> ExitCode {
     };
 
     let log_dir = init_logging(parsed.verbose);
+    let mut startup = StartupClock::new(perf::process_start());
+    startup.mark(Milestone::Logging);
     install_panic_hook(log_dir);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), ?parsed, "starting");
 
@@ -203,7 +221,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
     }
 
     match SingleInstance::acquire() {
-        Ok(guard) => run_window(Some(guard), parsed),
+        Ok(guard) => run_window(Some(guard), parsed, startup),
         Err(()) => {
             // Either another instance owns the mutex, or the mutex could not
             // be created. Handing the arguments over is correct in both
@@ -213,7 +231,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
                 ExitCode::SUCCESS
             } else {
                 tracing::warn!("no running instance answered; continuing as the instance");
-                run_window(None, parsed)
+                run_window(None, parsed, startup)
             }
         }
     }
@@ -234,6 +252,13 @@ fn print_help() {
     println!("    -v, --verbose         log at debug level");
     println!("    --build-info          print what this build contains and exit");
     println!("    --check-dialogs       open the native file dialog and print the chosen paths");
+    println!("    --exit-after-first-frame");
+    println!(
+        "                          print the startup timings as JSON after the first frame and exit"
+    );
+    println!(
+        "    --bench-frames=N      pan/zoom the opened board for N frames, print frame times, exit"
+    );
     println!();
     println!("SUBCOMMANDS:");
     println!("    inspect <FILE>        print a board's header, chunks and document summary");
@@ -346,6 +371,13 @@ fn init_logging(verbose: bool) -> PathBuf {
 /// hook, which is why no test in this crate can pop a message box.
 fn install_panic_hook(log_dir: PathBuf) {
     std::panic::set_hook(Box::new(move |info| {
+        // A panic inside a containment boundary (a decoder, the math
+        // backend) is reported by the boundary as an ordinary error; exiting
+        // here would defeat it, which is what happened before phase 07.
+        if crate::contain::is_contained() {
+            tracing::warn!(%info, "contained panic");
+            return;
+        }
         let backtrace = std::backtrace::Backtrace::force_capture();
         let body = format!(
             "rizref {}\npanicked:\n{info}\n\n{backtrace}\n",
@@ -488,6 +520,34 @@ struct App {
     ghost_hotkey_was_down: bool,
     /// Latch for the polled click-through hotkey.
     click_through_hotkey_was_down: bool,
+    /// Launch milestones, reported once the first frame is presented.
+    startup: StartupClock,
+    /// Rolling frame times for the `F3` developer overlay.
+    frame_stats: FrameStats,
+    /// Whether the `F3` developer overlay replaces the readout.
+    dev_overlay: bool,
+    /// Items instanced by the last frame, for the developer overlay.
+    last_drawn: usize,
+    /// Exit after the first presented frame, printing the startup JSON.
+    exit_after_first_frame: bool,
+    /// Frames the scripted soak should run once a board is on screen.
+    bench_frames: Option<u32>,
+    /// The running scripted soak.
+    bench: Option<FrameBench>,
+    /// When the last board open started, until its first frame is presented.
+    board_open_started: Option<Instant>,
+    /// Open-to-first-frame time of the last opened board.
+    last_board_load: Option<Duration>,
+    /// Changes since the last autosave.
+    autosave: AutosaveTracker,
+    /// When autosaves are due.
+    autosave_policy: AutosavePolicy,
+    /// Where recovery copies live.
+    autosave_dir: PathBuf,
+    /// Recovery copies found at launch, offered once the window is up.
+    pending_recoveries: Vec<Recovery>,
+    /// Whether the previous session ended without a clean exit.
+    previous_session: PreviousSession,
 }
 
 /// One asset's place in its animation.
@@ -589,6 +649,20 @@ impl App {
             pending_pick: None,
             ghost_hotkey_was_down: false,
             click_through_hotkey_was_down: false,
+            startup: StartupClock::new(perf::process_start()),
+            frame_stats: FrameStats::default(),
+            dev_overlay: false,
+            last_drawn: 0,
+            exit_after_first_frame: false,
+            bench_frames: None,
+            bench: None,
+            board_open_started: None,
+            last_board_load: None,
+            autosave: AutosaveTracker::default(),
+            autosave_policy: AutosavePolicy::default(),
+            autosave_dir: autosave::autosave_dir(),
+            pending_recoveries: Vec::new(),
+            previous_session: PreviousSession::Clean,
         }
     }
 
@@ -621,7 +695,165 @@ impl App {
     /// guard or confirmed that there is nothing to lose.
     fn exit(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("closing the window");
+        // Exit is reached only after a save or an explicit discard, so the
+        // recovery copy has nothing left to protect.
+        self.discard_autosave();
         event_loop.exit();
+    }
+
+    /// Deletes the current board's recovery copy and forgets pending changes.
+    fn discard_autosave(&mut self) {
+        autosave::discard(&self.autosave_dir, self.board.scene().id);
+        self.autosave.reset();
+    }
+
+    /// Writes the recovery copy now, if the document has unsaved changes.
+    ///
+    /// The copy is an ordinary board in the autosave folder: the first write
+    /// is a fresh save, every later one an incremental append, so a periodic
+    /// autosave costs the changed chunks plus a new index. The user's own
+    /// file is never touched.
+    fn autosave_now(&mut self) {
+        self.autosave.reset();
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        if !document.is_dirty() {
+            return;
+        }
+        let started = Instant::now();
+        let scene_id = self.board.scene().id;
+        let path = autosave::board_path(&self.autosave_dir, scene_id);
+        if let Err(error) = std::fs::create_dir_all(&self.autosave_dir) {
+            tracing::warn!(%error, "cannot create the autosave folder");
+            return;
+        }
+        let name = document.stem().to_owned();
+        let info = autosave::RecoveryInfo {
+            name: document.name().to_owned(),
+            original: document.path().map(Path::to_path_buf),
+            saved_unix: now_unix(),
+            items: self.board.scene().items().len(),
+        };
+        let result = {
+            let mut request = SaveRequest::new(self.board.scene(), self.view.camera, &name);
+            request.provenance = &self.provenance;
+            request.background = self.settings.canvas_theme.rgba();
+            request.old_document = self.loaded_document.as_ref();
+            rizref_format::save(&path, &request)
+        };
+        match result {
+            Ok(report) => {
+                if let Err(error) = autosave::write_sidecar(&self.autosave_dir, scene_id, &info) {
+                    tracing::warn!(%error, "cannot write the autosave sidecar");
+                }
+                tracing::info!(
+                    path = %path.display(),
+                    mode = ?report.mode,
+                    bytes = report.bytes_written,
+                    ms = perf::ms(started.elapsed()),
+                    "autosaved"
+                );
+            }
+            Err(error) => tracing::warn!(path = %path.display(), %error, "autosave failed"),
+        }
+    }
+
+    /// Offers the newest recovery copy found at launch, then reports an
+    /// unclean previous exit that left nothing to recover.
+    fn offer_recovery(&mut self) {
+        let recoveries = std::mem::take(&mut self.pending_recoveries);
+        if let Some(recovery) = recoveries.first() {
+            let text = autosave::prompt_text(recovery, now_unix());
+            if platform::confirm("RizRef recovered", &text) {
+                self.restore_recovery(recovery);
+            } else {
+                tracing::info!(board = %recovery.board.display(), "recovery declined");
+                let _ = std::fs::remove_file(&recovery.board);
+                let _ = std::fs::remove_file(&recovery.sidecar);
+            }
+            return;
+        }
+        if self.previous_session == PreviousSession::Crashed {
+            // Nothing unsaved survived (the board was clean or never edited),
+            // so put the user back where they were: the last board, if any.
+            let last = self
+                .recents
+                .entries
+                .first()
+                .map(|entry| PathBuf::from(&entry.path));
+            let message = match last {
+                Some(path) if self.pending_paths.is_empty() => {
+                    self.open_board_now(&path);
+                    "RizRef recovered from an unexpected exit; your last board was reopened"
+                }
+                _ => "RizRef recovered from an unexpected exit",
+            };
+            self.shell.toast(message, Instant::now());
+            self.redraw();
+        }
+    }
+
+    /// Loads a recovery copy as the open document: named after the board it
+    /// belongs to, marked unsaved, and still autosaving to the same copy.
+    fn restore_recovery(&mut self, recovery: &Recovery) {
+        match rizref_format::load(&recovery.board) {
+            Ok(loaded) => {
+                let item_count = loaded.scene.items().len();
+                let provenance: BTreeMap<AssetId, AssetProvenance> = loaded
+                    .document
+                    .assets
+                    .iter()
+                    .filter_map(|entry| {
+                        AssetId::from_hex(&entry.hash).map(|id| {
+                            (
+                                id,
+                                AssetProvenance {
+                                    origin: entry.origin,
+                                    source_path: entry.source_path.clone(),
+                                    source_url: entry.source_url.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                self.reset_board(loaded.scene);
+                self.provenance = provenance;
+                // Unknown-field preservation follows the user's own file when
+                // it still exists; the copy's document is the fallback.
+                self.loaded_document = recovery
+                    .info
+                    .original
+                    .as_ref()
+                    .and_then(|path| rizref_format::BoardReader::open_path(path).ok())
+                    .and_then(|mut reader| reader.document().ok())
+                    .or(Some(loaded.document));
+                self.view.camera = loaded.camera;
+                let mut document = match &recovery.info.original {
+                    Some(path) => Document::from_path(path),
+                    None => self.new_document(),
+                };
+                document.mark_dirty();
+                self.document = Some(document);
+                self.shell.set_mode(Mode::Canvas);
+                self.refresh_window_title();
+                self.upload_asset_previews();
+                self.shell.toast(
+                    format!("Restored unsaved work ({item_count} items) — save to keep it"),
+                    Instant::now(),
+                );
+                tracing::info!(board = %recovery.board.display(), items = item_count, "recovery restored");
+                self.redraw();
+            }
+            Err(error) => {
+                tracing::warn!(board = %recovery.board.display(), %error, "cannot restore the recovery copy");
+                self.shell.toast(
+                    format!("Could not restore unsaved work: {error}"),
+                    Instant::now(),
+                );
+                self.redraw();
+            }
+        }
     }
 
     /// Confirms the unsaved-changes guard and runs the pending action.
@@ -667,6 +899,9 @@ impl App {
 
     /// Drops the old board's GPU textures and resets per-board caches.
     fn reset_board(&mut self, scene: Scene) {
+        // Replacing the board happens only after a save or an explicit
+        // discard (the close guard), so its recovery copy goes with it.
+        self.discard_autosave();
         let old_assets: Vec<AssetId> = self
             .board
             .scene()
@@ -705,6 +940,7 @@ impl App {
 
     /// Opens `path`, replacing the board. Errors become a toast, never a panic.
     fn open_board_now(&mut self, path: &Path) {
+        let open_started = Instant::now();
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -763,9 +999,11 @@ impl App {
                     format!("{message} · {} linked image(s) missing", missing.len())
                 };
                 self.shell.toast(message, Instant::now());
+                self.board_open_started = Some(open_started);
                 tracing::info!(
                     path = %path.display(),
                     items = item_count,
+                    read_ms = perf::ms(open_started.elapsed()),
                     missing = missing.len(),
                     recovered,
                     "board opened"
@@ -862,6 +1100,7 @@ impl App {
                     document.set_path(&path);
                     document.mark_saved();
                 }
+                self.discard_autosave();
                 self.refresh_window_title();
                 let thumbnail = rizref_format::read_summary(&path)
                     .ok()
@@ -947,6 +1186,9 @@ impl App {
 
     /// Marks the open document dirty. Returns whether the asterisk changed.
     fn mark_document_dirty(&mut self) -> bool {
+        if self.document.is_some() {
+            self.autosave.note_change(Instant::now());
+        }
         self.document.as_mut().is_some_and(Document::mark_dirty)
     }
 
@@ -1971,6 +2213,20 @@ impl App {
 
     /// The HUD readout line: zoom, rotation, cursor, selection size.
     fn readout_text(&self) -> String {
+        if self.dev_overlay {
+            let (textures, texture_bytes) = self
+                .renderer
+                .as_ref()
+                .map_or((0, 0), |r| (r.texture_count(), r.texture_bytes()));
+            return perf::dev_overlay_line(
+                &self.frame_stats,
+                self.last_drawn,
+                self.board.scene().items().len(),
+                textures,
+                texture_bytes,
+                self.pending_textures.len(),
+            );
+        }
         let zoom = self.view.camera.zoom * 100.0;
         let zoom = if (zoom - zoom.round()).abs() < 0.05 {
             format!("{}", zoom.round() as i64)
@@ -2471,11 +2727,15 @@ impl App {
     }
 
     /// Builds this frame's drawable items in scene z-order.
+    ///
+    /// Only the visible set is instanced (phase 07): items whose world bounds
+    /// miss the viewport are culled here, so neither their quads nor their
+    /// textures cost anything while they are off screen.
     fn build_items(&self) -> Vec<ItemQuad> {
+        let visible = self.view.camera.visible_world_rect(self.view.viewport());
         self.board
             .scene()
-            .items()
-            .iter()
+            .visible_items(&visible)
             .filter_map(|item| {
                 let asset = match item.body() {
                     ItemBody::Image { asset } => *asset,
@@ -3274,6 +3534,51 @@ impl App {
         self.update_cursor_icon(window, screen);
         self.redraw();
     }
+    /// Book-keeping after a presented frame: frame statistics, the startup
+    /// and board-load milestones, and the scripted soak.
+    fn after_present(
+        &mut self,
+        frame_started: Instant,
+        acquire_wait: Duration,
+        canvas_mode: bool,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let now = Instant::now();
+        let total = now.saturating_duration_since(frame_started);
+        self.frame_stats.record(total.saturating_sub(acquire_wait));
+
+        if self.startup.mark_at(Milestone::FirstFrame, now) {
+            tracing::info!("{}", self.startup.summary());
+            if self.exit_after_first_frame {
+                println!("{}", self.startup.to_json());
+                event_loop.exit();
+                return;
+            }
+        }
+        if let Some(started) = self.board_open_started.take() {
+            let load = now.saturating_duration_since(started);
+            self.last_board_load = Some(load);
+            tracing::info!(ms = perf::ms(load), "board interactive");
+        }
+
+        if let Some(bench) = self.bench.as_mut() {
+            if bench.record(total, acquire_wait, self.last_drawn) {
+                let report = bench.to_json(self.board.scene().items().len(), self.last_board_load);
+                tracing::info!(%report, "frame bench finished");
+                println!("{report}");
+                self.bench = None;
+                event_loop.exit();
+            }
+        } else if let Some(frames) = self.bench_frames
+            && canvas_mode
+            && self.pending_paths.is_empty()
+            && !self.board.scene().items().is_empty()
+        {
+            self.bench_frames = None;
+            tracing::info!(frames, "frame bench starting");
+            self.bench = Some(FrameBench::new(frames, self.view.camera));
+        }
+    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -3294,7 +3599,10 @@ impl ApplicationHandler<AppEvent> for App {
             // AccessKit must attach before the window is first shown.
             .with_visible(false);
         let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
+            Ok(window) => {
+                self.startup.mark(Milestone::Window);
+                Arc::new(window)
+            }
             Err(error) => {
                 tracing::error!(%error, "cannot create the window");
                 platform::alert("RizRef", "RizRef could not open its window and must close.");
@@ -3316,12 +3624,15 @@ impl ApplicationHandler<AppEvent> for App {
         self.rebuild_hud(scale);
         match GpuSurface::new(window.clone(), (size.width, size.height)) {
             Some(renderer) => {
+                self.startup.mark(Milestone::Gpu);
                 tracing::info!(?size, scale, "window ready");
                 self.renderer = Some(renderer);
                 self.window = Some(window);
                 self.refresh_window_title();
                 self.install_drop_target();
                 self.window.as_ref().expect("just set").request_redraw();
+
+                self.offer_recovery();
 
                 // Command-line and forwarded paths were held until the window
                 // (and therefore the camera and viewport) existed.
@@ -3717,6 +4028,14 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
+                // F3 is the developer overlay: outside the rebindable table on
+                // purpose, so it works in every mode and can never be lost.
+                if pressed && !event.repeat && event.logical_key == Key::Named(NamedKey::F3) {
+                    self.dev_overlay = !self.dev_overlay;
+                    tracing::info!(on = self.dev_overlay, "developer overlay");
+                    self.redraw();
+                    return;
+                }
                 let chord = shortcut_key(&event.logical_key).map(|key| KeyChord {
                     key,
                     ctrl: self.modifiers.control_key(),
@@ -3879,6 +4198,11 @@ impl ApplicationHandler<AppEvent> for App {
                 self.import_paths(vec![path], drop_world);
             }
             WindowEvent::RedrawRequested => {
+                let frame_started = Instant::now();
+                if let Some(bench) = &self.bench {
+                    let index = bench.work.len() as u32;
+                    self.view.camera = bench.camera(index, self.view.viewport());
+                }
                 self.sync_title_bar_state();
                 // Advance the zoom animation first: this frame shows the new
                 // state, and if it is still running the next frame is queued.
@@ -3964,6 +4288,9 @@ impl ApplicationHandler<AppEvent> for App {
                         (position.y * scale).round().max(0.0) as u32,
                     )
                 });
+                self.last_drawn = items.len();
+                let acquire_wait;
+                let mut presented = false;
                 let picked = {
                     let Some(renderer) = self.renderer.as_mut() else {
                         return;
@@ -3994,8 +4321,13 @@ impl ApplicationHandler<AppEvent> for App {
                         background: self.settings.canvas_theme.rgba(),
                         pick: physical_pick,
                     };
-                    match renderer.render(&params) {
-                        Ok(pixel) => pixel,
+                    let result = renderer.render(&params);
+                    acquire_wait = renderer.last_acquire();
+                    match result {
+                        Ok(pixel) => {
+                            presented = true;
+                            pixel
+                        }
                         Err(FrameError::NeedsReconfigure) => None,
                         Err(FrameError::Fatal(why)) => {
                             // Log and stop: retrying into a lost surface would
@@ -4009,7 +4341,10 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(pixel) = picked {
                     self.finish_pick(pixel);
                 }
-                if animating {
+                if presented {
+                    self.after_present(frame_started, acquire_wait, canvas_mode, event_loop);
+                }
+                if animating || self.bench.is_some() || self.dev_overlay {
                     window.request_redraw();
                 }
                 if self.published_accessibility != self.shell.revision() {
@@ -4093,10 +4428,20 @@ impl ApplicationHandler<AppEvent> for App {
             poll_deadline = Some(now + Duration::from_millis(50));
         }
 
-        let deadline = [self.next_frame_at, self.shell.next_wake(), poll_deadline]
-            .into_iter()
-            .flatten()
-            .min();
+        if self.autosave.is_due(self.autosave_policy, now) {
+            self.autosave_now();
+        }
+        let autosave_deadline = self.autosave.deadline(self.autosave_policy);
+
+        let deadline = [
+            self.next_frame_at,
+            self.shell.next_wake(),
+            poll_deadline,
+            autosave_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         match deadline {
             Some(deadline) if deadline <= now => {
                 self.redraw();
@@ -4272,7 +4617,11 @@ fn tick_animations(
 /// `guard` is `Some` when the single-instance mutex is held; it lives in the
 /// frame of this function, so the mutex is released exactly when the loop
 /// ends — before `run` returns and the process exits.
-fn run_window(guard: Option<SingleInstance>, parsed: ParsedArgs) -> ExitCode {
+fn run_window(
+    guard: Option<SingleInstance>,
+    parsed: ParsedArgs,
+    mut startup: StartupClock,
+) -> ExitCode {
     let event_loop = match EventLoop::<AppEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(error) => {
@@ -4293,11 +4642,29 @@ fn run_window(guard: Option<SingleInstance>, parsed: ParsedArgs) -> ExitCode {
         let _ = proxy.send_event(AppEvent::ForwardedArgs(args));
     });
 
+    startup.mark(Milestone::EventLoop);
+    let marker = autosave::session_marker();
+    let previous_session = autosave::claim_session(&marker);
     let mut app = App::new(WindowPlan::default(), app_proxy, parsed.paths.is_empty());
+    app.previous_session = previous_session;
+    // The benches measure a launch, not a recovery prompt.
+    if !parsed.exit_after_first_frame && parsed.bench_frames.is_none() {
+        app.pending_recoveries = autosave::pending_recoveries(&app.autosave_dir);
+    }
+    if previous_session == PreviousSession::Crashed {
+        tracing::warn!(
+            recoveries = app.pending_recoveries.len(),
+            "the previous session did not exit cleanly"
+        );
+    }
+    app.startup = startup;
+    app.exit_after_first_frame = parsed.exit_after_first_frame;
+    app.bench_frames = parsed.bench_frames;
     app.pending_paths = parsed.paths;
     match event_loop.run_app(&mut app) {
         Ok(()) => {
             tracing::info!("exited cleanly");
+            autosave::release_session(&marker);
             drop(guard);
             ExitCode::SUCCESS
         }

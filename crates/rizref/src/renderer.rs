@@ -109,6 +109,9 @@ pub struct GpuSurface {
     config: wgpu::SurfaceConfiguration,
     canvas: Canvas,
     textures: TextureCache,
+    /// How long the last frame waited for a swapchain image. Under vsync this
+    /// is display pacing, not work, so the frame statistics subtract it.
+    last_acquire: std::time::Duration,
 }
 
 /// Everything one frame needs, gathered by the caller and consumed by
@@ -238,6 +241,7 @@ impl GpuSurface {
             config,
             canvas,
             textures,
+            last_acquire: std::time::Duration::ZERO,
         })
     }
 
@@ -297,6 +301,11 @@ impl GpuSurface {
         self.textures.used_bytes()
     }
 
+    /// How long the last [`Self::render`] waited for a swapchain image.
+    pub fn last_acquire(&self) -> std::time::Duration {
+        self.last_acquire
+    }
+
     /// Renders one frame: acquire, draw the canvas, present.
     ///
     /// The frame span and the present span carry the timings the acceptance
@@ -310,7 +319,9 @@ impl GpuSurface {
     /// is the colour picker, reading exactly what the user sees.
     pub fn render(&mut self, frame: &FrameParams) -> Result<Option<[u8; 4]>, FrameError> {
         let _frame_span = tracing::debug_span!("frame").entered();
+        let acquire_start = std::time::Instant::now();
         let acquired = self.surface.get_current_texture();
+        self.last_acquire = acquire_start.elapsed();
         let frame_texture = match acquired {
             wgpu::CurrentSurfaceTexture::Success(texture) => texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
