@@ -30,7 +30,7 @@ for ($i = 0; $i -lt $Runs; $i++) {
     $results += ($json | ConvertFrom-Json)
 }
 
-$milestones = 'logging_ms', 'event_loop_ms', 'window_ms', 'gpu_ms', 'first_frame_ms'
+$milestones = 'logging_ms', 'event_loop_ms', 'window_ms', 'first_frame_ms', 'gpu_ms', 'gpu_frame_ms'
 Write-Output ("first run (cold): first_frame {0:N1} ms" -f $results[0].first_frame_ms)
 $warm = $results | Select-Object -Skip 1
 foreach ($m in $milestones) {

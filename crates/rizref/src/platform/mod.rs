@@ -29,6 +29,7 @@ pub mod clipboard_html;
 pub mod console;
 pub mod crash;
 pub mod drop_target;
+pub mod gdi;
 pub mod imaging;
 pub mod launch;
 pub mod message_box;

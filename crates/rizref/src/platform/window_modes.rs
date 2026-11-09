@@ -178,7 +178,7 @@ pub fn styled_ex_style(current: u32, modes: WindowModes) -> u32 {
 }
 
 /// The window's `HWND`, or `None` on a non-Windows backend.
-fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+pub(crate) fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
     let handle = window.window_handle().ok()?;
     match handle.as_raw() {
         RawWindowHandle::Win32(win32) => Some(windows::Win32::Foundation::HWND(

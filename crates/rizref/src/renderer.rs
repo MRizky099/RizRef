@@ -31,8 +31,31 @@ pub fn preferred_backends() -> wgpu::Backends {
 }
 
 /// The backend order as a list, for the adapter walk.
+///
+/// `RIZREF_GPU_BACKEND=dx12` or `=vulkan` restricts the walk (and the wgpu
+/// instance) to one backend: the escape hatch for a machine whose Vulkan
+/// driver misbehaves, and the switch the phase-07 startup measurements use.
 fn backend_priority() -> Vec<wgpu::Backends> {
-    vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12]
+    backend_override(std::env::var("RIZREF_GPU_BACKEND").ok().as_deref()).map_or_else(
+        || vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12],
+        |only| vec![only],
+    )
+}
+
+/// Parses a `RIZREF_GPU_BACKEND` value; anything unknown keeps the default.
+fn backend_override(value: Option<&str>) -> Option<wgpu::Backends> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "dx12" | "d3d12" => Some(wgpu::Backends::DX12),
+        "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
+        _ => None,
+    }
+}
+
+/// The backends the instance is created with: the override's one, or both.
+fn instance_backends() -> wgpu::Backends {
+    backend_priority()
+        .into_iter()
+        .fold(wgpu::Backends::empty(), |all, one| all | one)
 }
 
 /// Renders a backend set as the arrow-joined names a bug report should quote.
@@ -152,23 +175,38 @@ impl FrameParams<'_> {
     }
 }
 
-impl GpuSurface {
-    /// Creates the surface and picks the adapter/device for `window`.
+/// The swapchain format the background thread builds pipelines for. Both
+/// backends report it as the first (preferred) format on Windows; if a surface
+/// prefers another, `attach` rebuilds the pipelines on the spot.
+pub const PREDICTED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+
+/// Everything about the GPU that does not need the window: the instance, the
+/// chosen adapter, the device and queue, and the canvas pipelines.
+///
+/// This is the slow part of a launch — on a laptop whose only Vulkan/DX12
+/// adapter is a discrete GPU, the driver wakes the GPU while creating the
+/// instance and device, which costs most of a second (phase 07 measured
+/// ~800 ms) — so the application builds it on a background thread while the
+/// window opens and the first frames are presented by the CPU.
+pub struct GpuDevice {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    canvas: Canvas,
+}
+
+impl GpuDevice {
+    /// Creates the instance, picks the adapter and opens the device.
     ///
     /// The walk is explicit rather than `request_adapter`'s, because the plan
     /// fixes an order — Vulkan before DX12 — and a set-valued option cannot
     /// express order. Hardware adapters win over software ones inside a
     /// backend; every adapter found is logged at debug for bug reports.
-    pub fn new(window: Arc<Window>, size: (u32, u32)) -> Option<Self> {
+    pub fn create() -> Option<Self> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = preferred_backends();
+        descriptor.backends = instance_backends();
         let instance = wgpu::Instance::new(descriptor);
-        // Holding the window in an `Arc` (which the caller does) lets the
-        // surface claim `'static` rather than borrowing the window.
-        let surface = instance
-            .create_surface(window)
-            .inspect_err(|e| tracing::error!(%e, "cannot create the window surface"))
-            .ok()?;
 
         let mut chosen: Option<wgpu::Adapter> = None;
         for backend in backend_priority() {
@@ -200,6 +238,34 @@ impl GpuSurface {
         }))
         .inspect_err(|e| tracing::error!(%e, "cannot acquire a GPU device"))
         .ok()?;
+        // Shader compilation and pipeline creation, off the UI thread too.
+        let canvas = Canvas::new(&device, PREDICTED_FORMAT);
+        Some(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            canvas,
+        })
+    }
+}
+
+impl GpuSurface {
+    /// Creates the window surface on an existing device and configures it.
+    pub fn attach(gpu: GpuDevice, window: Arc<Window>, size: (u32, u32)) -> Option<Self> {
+        let GpuDevice {
+            instance,
+            adapter,
+            device,
+            queue,
+            mut canvas,
+        } = gpu;
+        // Holding the window in an `Arc` (which the caller does) lets the
+        // surface claim `'static` rather than borrowing the window.
+        let surface = instance
+            .create_surface(window)
+            .inspect_err(|e| tracing::error!(%e, "cannot create the window surface"))
+            .ok()?;
 
         let config = match surface.get_default_config(&adapter, size.0.max(1), size.1.max(1)) {
             Some(mut config) => {
@@ -221,8 +287,11 @@ impl GpuSurface {
             height = config.height,
             "surface configured"
         );
+        if config.format != PREDICTED_FORMAT {
+            tracing::info!(format = ?config.format, "rebuilding the pipelines for the surface format");
+            canvas = Canvas::new(&device, config.format);
+        }
 
-        let canvas = Canvas::new(&device, config.format);
         let max_side = device
             .limits()
             .max_texture_dimension_2d
@@ -492,6 +561,16 @@ mod tests {
     #[test]
     fn this_build_prefers_vulkan_then_dx12() {
         assert_eq!(describe_backends(preferred_backends()), "vulkan -> dx12");
+        assert_eq!(
+            super::backend_override(Some("DX12")),
+            Some(wgpu::Backends::DX12)
+        );
+        assert_eq!(
+            super::backend_override(Some(" vulkan ")),
+            Some(wgpu::Backends::VULKAN)
+        );
+        assert_eq!(super::backend_override(Some("gl")), None);
+        assert_eq!(super::backend_override(None), None);
     }
 
     #[test]

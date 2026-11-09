@@ -64,7 +64,7 @@ use crate::platform::{
 };
 use crate::provenance;
 use crate::recents::{Recents, now_unix};
-use crate::renderer::{FrameError, FrameParams, GpuSurface};
+use crate::renderer::{FrameError, FrameParams, GpuDevice, GpuSurface};
 use crate::settings::Settings;
 use crate::shortcuts::{Key as ShortcutKey, KeyChord, ShortcutId, Shortcuts};
 use crate::text::TextEngine;
@@ -434,6 +434,8 @@ pub(crate) enum AppEvent {
     Dropped(Box<DropEvent>),
     /// An accessibility adapter event (tree request, action, deactivation).
     Accessibility(accesskit_winit::Event),
+    /// The background GPU initialisation finished (successfully or not).
+    GpuReady,
 }
 
 impl From<accesskit_winit::Event> for AppEvent {
@@ -553,6 +555,10 @@ struct App {
     board_open_started: Option<Instant>,
     /// Open-to-first-frame time of the last opened board.
     last_board_load: Option<Duration>,
+    /// The device being created on a background thread, until it arrives.
+    gpu_init: Option<std::sync::mpsc::Receiver<Option<GpuDevice>>>,
+    /// Whether the device thread was started (after the first CPU frame).
+    gpu_started: bool,
     /// Changes since the last autosave.
     autosave: AutosaveTracker,
     /// When autosaves are due.
@@ -673,6 +679,8 @@ impl App {
             bench: None,
             board_open_started: None,
             last_board_load: None,
+            gpu_init: None,
+            gpu_started: false,
             autosave: AutosaveTracker::default(),
             autosave_policy: AutosavePolicy::default(),
             autosave_dir: autosave::autosave_dir(),
@@ -3573,6 +3581,113 @@ impl App {
         self.update_cursor_icon(window, screen);
         self.redraw();
     }
+    /// Takes the device from the background thread and attaches it to the
+    /// window. `wait` blocks for it (the thread has announced it is done);
+    /// otherwise a device that is not ready yet is left for `GpuReady`.
+    fn attach_gpu(&mut self, wait: bool, event_loop: &ActiveEventLoop) {
+        if self.renderer.is_some() {
+            return;
+        }
+        let (Some(receiver), Some(window)) = (self.gpu_init.as_ref(), self.window.clone()) else {
+            return;
+        };
+        let device = if wait {
+            receiver.recv().ok().flatten()
+        } else {
+            match receiver.try_recv() {
+                Ok(device) => device,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        self.gpu_init = None;
+        let size = window.inner_size();
+        match device.and_then(|device| {
+            GpuSurface::attach(device, window.clone(), (size.width, size.height))
+        }) {
+            Some(renderer) => {
+                self.startup.mark(Milestone::Gpu);
+                self.renderer = Some(renderer);
+                // Anything opened during the CPU frames gets its previews now.
+                self.upload_asset_previews();
+                window.request_redraw();
+            }
+            None => {
+                // No GPU device or surface at all. There is no CPU canvas for
+                // images yet; be loud and honest rather than a grey box.
+                platform::alert(
+                    "RizRef",
+                    "RizRef could not initialise a GPU surface (Vulkan or DirectX 12)\nand must close.",
+                );
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// A frame presented without the GPU: the background and the CPU-painted
+    /// shell layer (start view, title bar, menus, toasts) copied to the window
+    /// with GDI. Items appear once the device is attached, a moment later.
+    fn cpu_frame(&mut self, window: &Window, started: Instant, event_loop: &ActiveEventLoop) {
+        self.sync_title_bar_state();
+        let viewport = self.viewport();
+        let scale = window.scale_factor();
+        if self
+            .ui_layer
+            .needs_paint(viewport, scale, self.shell.revision())
+        {
+            let cursor = self.view.cursor_position();
+            self.ui_layer.paint(
+                &self.shell,
+                &self.settings,
+                &self.shortcuts,
+                &self.recents,
+                self.window_modes,
+                viewport,
+                scale,
+                cursor,
+                &mut self.text,
+            );
+        }
+        let painted = started.elapsed();
+        let size = window.inner_size();
+        let layer = self.ui_layer.upload();
+        let bgra = platform::gdi::compose_bgra(
+            size.width.max(1),
+            size.height.max(1),
+            self.settings.canvas_theme.rgba(),
+            layer
+                .as_ref()
+                .map(|(bytes, w, h)| (bytes.as_slice(), *w, *h)),
+        );
+        let composed = started.elapsed();
+        let shown = platform::gdi::present(window, &bgra, size.width.max(1), size.height.max(1));
+        tracing::debug!(
+            paint_ms = perf::ms(painted),
+            compose_ms = perf::ms(composed),
+            present_ms = perf::ms(started.elapsed()),
+            since_start_ms = perf::ms(perf::process_start().elapsed()),
+            "cpu frame"
+        );
+        // The GPU device is the slow part of a launch (the driver may have to
+        // wake a discrete GPU): it is built on its own thread, started only
+        // once the first CPU frame is on screen. Started earlier — before or
+        // right after window creation — the driver's start-up was measured to
+        // stall showing the window by up to ~500 ms in one launch out of five,
+        // and starting it after the window is shown gained nothing.
+        if !self.gpu_started {
+            self.gpu_started = true;
+            self.gpu_init = Some(spawn_gpu_init(self.proxy.clone()));
+        }
+        if shown {
+            self.last_drawn = 0;
+            let canvas_mode = self.shell.mode() == Mode::Canvas;
+            self.after_present(started, Duration::ZERO, canvas_mode, event_loop);
+        }
+        if self.published_accessibility != self.shell.revision() {
+            self.refresh_accessibility();
+        }
+    }
+
     /// Book-keeping after a presented frame: frame statistics, the startup
     /// and board-load milestones, and the scripted soak.
     fn after_present(
@@ -3586,9 +3701,12 @@ impl App {
         let total = now.saturating_duration_since(frame_started);
         self.frame_stats.record(total.saturating_sub(acquire_wait));
 
-        if self.startup.mark_at(Milestone::FirstFrame, now) {
+        self.startup.mark_at(Milestone::FirstFrame, now);
+        if self.renderer.is_some() && self.startup.mark_at(Milestone::GpuFrame, now) {
             tracing::info!("{}", self.startup.summary());
             if self.exit_after_first_frame {
+                // Both milestones are in: the first (CPU) frame and the
+                // first GPU frame, which also means the device thread is done.
                 println!("{}", self.startup.to_json());
                 event_loop.exit();
                 return;
@@ -3610,6 +3728,7 @@ impl App {
             }
         } else if let Some(frames) = self.bench_frames
             && canvas_mode
+            && self.renderer.is_some()
             && self.pending_paths.is_empty()
             && !self.board.scene().items().is_empty()
         {
@@ -3661,36 +3780,24 @@ impl ApplicationHandler<AppEvent> for App {
             size.height as f64 / scale,
         ));
         self.rebuild_hud(scale);
-        match GpuSurface::new(window.clone(), (size.width, size.height)) {
-            Some(renderer) => {
-                self.startup.mark(Milestone::Gpu);
-                tracing::info!(?size, scale, "window ready");
-                self.renderer = Some(renderer);
-                self.window = Some(window);
-                self.refresh_window_title();
-                self.install_drop_target();
-                self.window.as_ref().expect("just set").request_redraw();
+        tracing::info!(?size, scale, "window ready");
+        self.window = Some(window);
+        self.refresh_window_title();
+        self.install_drop_target();
+        // The GPU may already be ready (a fast driver); otherwise the first
+        // frames are CPU frames and `AppEvent::GpuReady` attaches it later.
+        self.attach_gpu(false, event_loop);
+        self.window.as_ref().expect("just set").request_redraw();
 
-                self.offer_recovery();
+        self.offer_recovery();
 
-                // Command-line and forwarded paths were held until the window
-                // (and therefore the camera and viewport) existed.
-                let pending = std::mem::take(&mut self.pending_paths);
-                if !pending.is_empty() {
-                    let drop_world = self.drop_world();
-                    let paths = pending.into_iter().map(PathBuf::from).collect();
-                    self.import_paths(paths, drop_world);
-                }
-            }
-            None => {
-                // No GPU surface at all. The CPU raster fallback is a later
-                // phase; for now be loud and honest rather than a grey box.
-                platform::alert(
-                    "RizRef",
-                    "RizRef could not initialise a GPU surface (Vulkan or DirectX 12)\nand must close.",
-                );
-                event_loop.exit();
-            }
+        // Command-line and forwarded paths were held until the window
+        // (and therefore the camera and viewport) existed.
+        let pending = std::mem::take(&mut self.pending_paths);
+        if !pending.is_empty() {
+            let drop_world = self.drop_world();
+            let paths = pending.into_iter().map(PathBuf::from).collect();
+            self.import_paths(paths, drop_world);
         }
     }
 
@@ -3711,10 +3818,11 @@ impl ApplicationHandler<AppEvent> for App {
         }
         match event {
             WindowEvent::Resized(size) => {
-                self.renderer
-                    .as_mut()
-                    .expect("a resized window has a renderer")
-                    .resize(size.width, size.height);
+                // Before the GPU is ready the CPU frame follows the window size
+                // by itself; the swapchain is created at the current size.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(size.width, size.height);
+                }
                 let scale = window.scale_factor();
                 self.view.set_viewport(DVec2::new(
                     size.width as f64 / scale,
@@ -4238,6 +4346,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 let frame_started = Instant::now();
+                if self.renderer.is_none() {
+                    self.cpu_frame(&window, frame_started, event_loop);
+                    return;
+                }
                 if let Some(bench) = &self.bench {
                     let index = bench.work.len() as u32;
                     self.view.camera = bench.camera(index, self.view.viewport());
@@ -4413,6 +4525,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let paths = pending.into_iter().map(PathBuf::from).collect();
                 self.import_paths(paths, drop_world);
             }
+            AppEvent::GpuReady => self.attach_gpu(true, event_loop),
             AppEvent::Import(outcome) => self.apply_import(*outcome),
             AppEvent::Dropped(event) => self.apply_drop(*event),
             AppEvent::Accessibility(event) => match event.window_event {
@@ -4656,6 +4769,25 @@ fn tick_animations(
 /// `guard` is `Some` when the single-instance mutex is held; it lives in the
 /// frame of this function, so the mutex is released exactly when the loop
 /// ends — before `run` returns and the process exits.
+/// Starts building the GPU device on its own thread; the result arrives on
+/// the returned channel, announced by `AppEvent::GpuReady`.
+fn spawn_gpu_init(proxy: EventLoopProxy<AppEvent>) -> std::sync::mpsc::Receiver<Option<GpuDevice>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("rizref-gpu-init".to_owned())
+        .spawn(move || {
+            let device = GpuDevice::create();
+            let _ = sender.send(device);
+            let _ = proxy.send_event(AppEvent::GpuReady);
+        });
+    if let Err(error) = spawned {
+        // The receiver reports a disconnect, which `attach_gpu` treats as
+        // "no GPU": the same honest failure as a device that cannot open.
+        tracing::error!(%error, "cannot start the GPU thread");
+    }
+    receiver
+}
+
 fn run_window(
     guard: Option<SingleInstance>,
     parsed: ParsedArgs,

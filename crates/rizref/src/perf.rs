@@ -42,20 +42,25 @@ pub enum Milestone {
     EventLoop,
     /// The native window exists (still hidden).
     Window,
-    /// The wgpu adapter, device and surface are configured.
+    /// The wgpu device (built on a background thread) is attached to the
+    /// window and its surface configured.
     Gpu,
-    /// The first frame was presented: the canvas is interactive.
+    /// The first frame was presented: the window shows the canvas or start
+    /// view and takes input. Before the GPU is ready it is a CPU frame.
     FirstFrame,
+    /// The first frame presented by the GPU: images draw from here on.
+    GpuFrame,
 }
 
 impl Milestone {
     /// Every milestone, in launch order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Logging,
         Self::EventLoop,
         Self::Window,
         Self::Gpu,
         Self::FirstFrame,
+        Self::GpuFrame,
     ];
 
     /// Stable lower-case name, used in the log line and the JSON report.
@@ -66,6 +71,7 @@ impl Milestone {
             Self::Window => "window",
             Self::Gpu => "gpu",
             Self::FirstFrame => "first_frame",
+            Self::GpuFrame => "gpu_frame",
         }
     }
 }
