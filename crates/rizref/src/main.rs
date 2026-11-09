@@ -31,6 +31,7 @@ mod hud;
 mod import;
 mod input;
 mod inspect;
+mod location;
 mod markdown;
 mod memory;
 mod note;

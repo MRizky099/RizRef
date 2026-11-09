@@ -7,6 +7,7 @@
 //! changed, which is what keeps an idle board at zero CPU and a menu hover from
 //! costing a full-screen upload every mouse event.
 
+pub mod image_info;
 pub mod menu;
 pub mod note_color;
 pub mod paint;
