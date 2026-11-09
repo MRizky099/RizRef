@@ -457,8 +457,13 @@ fn install_panic_hook(log_dir: PathBuf) {
 /// Events that arrive in the loop from outside winit's own flow.
 #[derive(Debug)]
 pub(crate) enum AppEvent {
-    /// A second launch handed its arguments to this instance.
+    /// A second launch handed its arguments to this instance (or, on macOS,
+    /// Finder asked it to open documents).
     ForwardedArgs(Vec<String>),
+    /// The system asked RizRef to quit (macOS: the Dock, a log-out); it closes
+    /// through the unsaved-changes path.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    QuitRequested,
     /// An import worker finished one request.
     Import(Box<ImportOutcome>),
     /// The OLE drop target received files, in client-area physical pixels.
@@ -1419,7 +1424,7 @@ impl App {
             let shortcut = button
                 .shortcut()
                 .and_then(|id| self.shortcuts.chord_for(id))
-                .map(|chord| chord.to_string());
+                .map(|chord| chord.label());
             let text = button.tooltip(
                 self.shell.title_bar.pinned(),
                 self.shell.title_bar.maximized(),
@@ -1476,7 +1481,7 @@ impl App {
     fn current_mods(&self) -> Modifiers {
         Modifiers {
             shift: self.modifiers.shift_key(),
-            ctrl: self.modifiers.control_key(),
+            ctrl: crate::shortcuts::primary_held(self.modifiers),
             alt: self.modifiers.alt_key(),
         }
     }
@@ -2029,9 +2034,12 @@ impl App {
                 self.apply_window_modes();
                 self.shell.title_bar.hide();
                 let message = if self.window_modes.effective_click_through() {
-                    "Click-through armed · Ctrl+Shift+X restores input"
+                    format!(
+                        "Click-through armed · {} restores input",
+                        KeyChord::ctrl_shift(ShortcutKey::X).label()
+                    )
                 } else {
-                    "Click-through off"
+                    "Click-through off".to_owned()
                 };
                 self.shell.toast(message, now);
                 self.redraw();
@@ -2042,9 +2050,12 @@ impl App {
                 self.apply_window_modes();
                 self.shell.title_bar.hide();
                 let message = if self.window_modes.ghost() {
-                    "Ghost mode · Ctrl+Shift+G restores the window"
+                    format!(
+                        "Ghost mode · {} restores the window",
+                        KeyChord::ctrl_shift(ShortcutKey::G).label()
+                    )
                 } else {
-                    "Ghost mode off"
+                    "Ghost mode off".to_owned()
                 };
                 self.shell.toast(message, now);
                 self.redraw();
@@ -3444,7 +3455,7 @@ impl App {
         if !pressed {
             return false;
         }
-        let ctrl = self.modifiers.control_key();
+        let ctrl = crate::shortcuts::primary_held(self.modifiers);
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.cancel_note_edit();
@@ -4623,7 +4634,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 let chord = shortcut_key(&event.logical_key).map(|key| KeyChord {
                     key,
-                    ctrl: self.modifiers.control_key(),
+                    ctrl: crate::shortcuts::primary_held(self.modifiers),
                     shift: self.modifiers.shift_key(),
                     alt: self.modifiers.alt_key(),
                 });
@@ -4690,7 +4701,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 if self.shell.note_color.is_some() {
                     if pressed {
-                        let ctrl = self.modifiers.control_key();
+                        let ctrl = crate::shortcuts::primary_held(self.modifiers);
                         let result = match (&event.logical_key, chord) {
                             (Key::Character(_), _) if !ctrl => {
                                 let typed = event.text.as_deref().unwrap_or_default();
@@ -4766,7 +4777,8 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
-                self.view.set_ctrl_held(modifiers.state().control_key());
+                self.view
+                    .set_ctrl_held(crate::shortcuts::primary_held(modifiers.state()));
             }
             WindowEvent::HoveredFile(path) => {
                 tracing::debug!(path = %path.display(), "file hovering; drop to import");
@@ -4952,6 +4964,13 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
+            AppEvent::QuitRequested => self.request_close(event_loop),
+            AppEvent::ForwardedArgs(args) if self.window.is_none() => {
+                // Finder's launch documents arrive before the window exists:
+                // hold them like command-line paths, opened in `resumed`.
+                tracing::info!(count = args.len(), "documents held until the window exists");
+                self.pending_paths.extend(args);
+            }
             AppEvent::ForwardedArgs(args) => {
                 tracing::info!(count = args.len(), "accepted forwarded args");
                 // The sender made them absolute; folding the spelling again
@@ -5249,7 +5268,16 @@ fn run_window(
     parsed: ParsedArgs,
     mut startup: StartupClock,
 ) -> ExitCode {
-    let event_loop = match EventLoop::<AppEvent>::with_user_event().build() {
+    let mut builder = EventLoop::<AppEvent>::with_user_event();
+    // macOS: no winit default menu. Its key equivalents (⌘Q, ⌘H, ⌘W) would
+    // reach AppKit before RizRef's own shortcut table, and its Quit would end
+    // the process without the unsaved-changes prompt.
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        builder.with_default_menu(false);
+    }
+    let event_loop = match builder.build() {
         Ok(event_loop) => event_loop,
         Err(error) => {
             tracing::error!(%error, "cannot create the event loop");
@@ -5267,6 +5295,16 @@ fn run_window(
     let proxy = event_loop.create_proxy();
     let app_proxy = proxy.clone();
     if !benchmark {
+        let open_proxy = proxy.clone();
+        let quit_proxy = proxy.clone();
+        platform::app_events::install(
+            move |paths| {
+                let _ = open_proxy.send_event(AppEvent::ForwardedArgs(paths));
+            },
+            move || {
+                let _ = quit_proxy.send_event(AppEvent::QuitRequested);
+            },
+        );
         serve_forwarded_args(move |args| {
             let _ = proxy.send_event(AppEvent::ForwardedArgs(args));
         });

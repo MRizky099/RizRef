@@ -70,7 +70,13 @@ pub fn for_backend(backend: Backend) -> Capabilities {
     };
     match backend {
         Backend::Win32 => Capabilities::WIN32,
-        Backend::X11 | Backend::AppKit => unix,
+        Backend::X11 => unix,
+        // `NSWindow` alpha and `CGEventSourceKeyState` (phase 08b).
+        Backend::AppKit => Capabilities {
+            window_opacity: true,
+            global_chords: true,
+            ..unix
+        },
         Backend::Wayland => Capabilities {
             // Not in the core protocol: the compositor alone decides stacking.
             always_on_top: false,
@@ -79,6 +85,8 @@ pub fn for_backend(backend: Backend) -> Capabilities {
         Backend::Unknown => {
             if cfg!(windows) {
                 Capabilities::WIN32
+            } else if cfg!(target_os = "macos") {
+                for_backend(Backend::AppKit)
             } else {
                 unix
             }
@@ -126,11 +134,20 @@ mod tests {
     }
 
     #[test]
-    fn only_windows_polls_chords_globally_or_drops_virtual_files() {
-        for backend in [Backend::X11, Backend::Wayland, Backend::AppKit] {
+    fn linux_has_no_global_chords_and_only_windows_drops_virtual_files() {
+        for backend in [Backend::X11, Backend::Wayland] {
             let caps = for_backend(backend);
             assert!(!caps.global_chords, "{backend:?}");
-            assert!(!caps.virtual_file_drops, "{backend:?}");
+            assert!(!caps.window_opacity, "{backend:?}");
         }
+        for backend in [Backend::X11, Backend::Wayland, Backend::AppKit] {
+            assert!(!for_backend(backend).virtual_file_drops, "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn macos_fades_the_window_and_sees_the_chords_from_other_apps() {
+        let mac = for_backend(Backend::AppKit);
+        assert!(mac.window_opacity && mac.global_chords && mac.always_on_top);
     }
 }

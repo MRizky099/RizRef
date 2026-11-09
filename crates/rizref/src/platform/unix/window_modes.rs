@@ -7,11 +7,13 @@
 //!   such request;
 //! * click-through — winit's cursor hit-test (an empty input shape on X11, an
 //!   empty input region on Wayland, `ignoresMouseEvents` on macOS);
-//! * whole-window opacity — not available through winit: transparency is the
-//!   canvas alone where the GPU surface composites alpha, otherwise opaque;
-//! * the global chords — no global key state without an OS hook, so they are
-//!   never "down"; the in-app shortcut leaves ghost mode once RizRef has
-//!   focus again.
+//! * whole-window opacity — `NSWindow` alpha on macOS
+//!   (`platform/macos/window_modes.rs`); not available through winit on
+//!   Linux, where transparency is the canvas alone if the GPU surface
+//!   composites alpha, otherwise opaque;
+//! * the global chords — `CGEventSourceKeyState` on macOS (⌘⇧G / ⌘⇧X); on
+//!   Linux no global key state without an OS hook, so they are never "down"
+//!   and the in-app shortcut leaves ghost mode once RizRef has focus again.
 
 use winit::window::{Window, WindowLevel};
 
@@ -33,14 +35,27 @@ pub fn apply(window: &Window, modes: &WindowModes) {
     {
         tracing::warn!(%error, "cannot change click-through");
     }
+    #[cfg(target_os = "macos")]
+    if caps.window_opacity {
+        crate::platform::macos::window_modes::set_window_alpha(
+            window,
+            f64::from(modes.effective_opacity_percent()) / 100.0,
+        );
+    }
 }
 
-/// No global key state on this OS.
+/// Whether the ghost chord is held anywhere (macOS), never on Linux.
 pub fn ghost_chord_down() -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::platform::macos::window_modes::ghost_chord_down();
+    #[cfg(not(target_os = "macos"))]
     false
 }
 
-/// No global key state on this OS.
+/// Whether the click-through chord is held anywhere (macOS), never on Linux.
 pub fn click_through_chord_down() -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::platform::macos::window_modes::click_through_chord_down();
+    #[cfg(not(target_os = "macos"))]
     false
 }

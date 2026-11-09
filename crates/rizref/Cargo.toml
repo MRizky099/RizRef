@@ -55,6 +55,9 @@ windows-core.workspace = true
 # the OS). Windows stays DX12 + Vulkan, Linux Vulkan.
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { workspace = true, features = ["metal"] }
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rizref-thumb = { path = "../rizref-thumb" }

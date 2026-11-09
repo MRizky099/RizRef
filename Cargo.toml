@@ -158,6 +158,25 @@ tracing-appender = "0.2.3"
 # futures even on native; pollster is the smallest pure-Rust executor (no
 # runtime, no dependencies).
 pollster = "0.4.0"
+# macOS (phase 08b): the Objective-C runtime and the AppKit / Foundation
+# declarations RizRef calls itself (the open-document delegate method and
+# `NSWindow` alpha). The same versions `arboard`, `rfd` and `wgpu` already pull
+# in; declarations only, the frameworks ship with the OS.
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSEnumerator",
+    "NSString",
+    "NSURL",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "objc2-core-foundation",
+] }
 # The Windows FFI surface, in one place so no crate has to guess a version:
 # the single-instance mutex and args pipe, the panic message box, the native
 # dialogs, and the OLE drop target (`IDropTarget`, CF_HDROP plus virtual files).

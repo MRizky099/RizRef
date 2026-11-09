@@ -47,6 +47,7 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
+pub mod app_events;
 pub mod capabilities;
 pub mod clipboard_html;
 pub mod console;
