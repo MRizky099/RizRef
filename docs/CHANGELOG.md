@@ -75,11 +75,18 @@ Reliability:
 - Autosave: every 20 changes or 60 s to a recovery copy
   (`%LOCALAPPDATA%\RizRef\autosave\<scene>.rizref` + sidecar), never the user's file;
   incremental appends after the first write. Deleted on save, discard and clean exit.
-  A session marker detects an unclean exit; the next launch offers the newest copy
-  ("RizRef recovered", Yes restores it as an unsaved document named after its board,
-  No deletes it) or, with nothing to recover, reopens the last board. A test spawns a
-  child that autosaves in a loop and kills it six times mid-write: every copy left
-  behind loads.
+  A session marker detects an unclean exit; the next launch offers the newest copy in
+  an in-app "Recover unsaved work" dialog (Restore, the default, loads it as an unsaved
+  document named after its board; "Discard the copy" deletes it) or, with nothing to
+  recover, reopens the last board. A test spawns a child that autosaves in a loop and
+  kills it six times mid-write: every copy left behind loads.
+- Fixes from the first manual test run: the recovery offer was a native modal box
+  opened before the window had presented — it stayed hidden and blocked the event
+  loop, so a relaunch after a crash looked dead (7.7); it is now the in-app dialog
+  above. The first GPU frame reused a UI layer the CPU frames had already consumed, so
+  the start view showed a bare canvas until the next input; attaching the GPU now
+  forces a repaint. Both checked on the release build by launching it (the offer,
+  Restore, the start view and a board opened from the command line draw unprompted).
 - Fix: the panic hook exited the process for every panic, so the `catch_unwind` guards
   around decoders and math never ran — one hostile image closed RizRef.
   `contain::contain` marks the boundary and the hook now lets it handle the panic.
@@ -100,7 +107,7 @@ Packaging and docs:
 - `docs/demo.rizref` (`examples/make_demo_board.rs`): four images drawn in code (CC0)
   and three markdown notes. README: status, layout, measured budgets, install and
   integration, releasing, licence. `LICENSE-MIT`, `LICENSE-APACHE`.
-- Tests: 664 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
+- Tests: 668 workspace tests pass (3 ignored), up from 630; clippy `-D warnings` and fmt
   clean; no new dependency crate and no new `-sys` crate (audit: `windows-sys`,
   `renderdoc-sys`).
 - Not verified here, by design or by environment: `register`/`unregister` and Explorer
@@ -108,7 +115,7 @@ Packaging and docs:
   the manual test plan; the registry plan, the COM factory and the DLL's rendering are
   unit-tested); the installer (no Inno Setup on this machine; the script is untested);
   a clean Win10 22H2 VM run (substituted by the import-table check); the release
-  workflow (runs on the first tag); the "RizRef recovered" prompt by hand.
+  workflow (runs on the first tag).
 - Deferred: code signing (no certificate; the hook is in place); README screenshots
   (best captured during the manual test run); undo history across a crash (the format
   stores no history, so recovery restores the board, not its undo tail); a CPU canvas
