@@ -377,6 +377,8 @@ an NVIDIA GeForce GTX 950M and Windows 10 Pro 22H2. Release build, 600 × 400 wi
 
 ## License
 
+Copyright (c) 2026 Muhammad Rizky Abdillah ([@MRizky099](https://github.com/MRizky099)).
+
 Licensed under either of
 
 - Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE) or
