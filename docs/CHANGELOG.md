@@ -38,7 +38,8 @@ unchanged: the Win32 code moved, it was not rewritten.
   on Linux and macOS KaTeX_SansSerif (already embedded for math, SIL OFL 1.1) is added
   as the last-resort face so a system without fonts still renders text.
 - **CI:** `fmt`, `clippy` and `test` on `windows-latest`, `ubuntu-22.04` and
-  `macos-14`, plus an `x86_64-apple-darwin` cross-check. `scripts/audit-native.sh`
+  `macos-15` (Apple Silicon) and `macos-15-intel`, plus an `x86_64-apple-darwin`
+  cross-check from arm64. `scripts/audit-native.sh`
   replaces the inline Windows audit: per-target `-sys` allow-lists (README), the
   `wayland-sys`/`wayland-backend` features that keep C out, and a scan for object files
   left by build scripts.

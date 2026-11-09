@@ -286,7 +286,7 @@ Lints are workspace-wide (`[workspace.lints]`):
 - OS calls are confined to `rizref::platform` (`windows/`, `unix/`, `linux/`, `macos/`).
 
 CI runs `fmt`, `clippy`, `test` and the dependency audit on `windows-latest`,
-`ubuntu-22.04` and `macos-14` (with an `x86_64-apple-darwin` cross-check), plus the fuzz
+`ubuntu-22.04`, `macos-15` and `macos-15-intel` (plus an `x86_64-apple-darwin` cross-check from arm64), plus the fuzz
 matrix.
 
 Release builds use fat LTO at `opt-level = "s"` and link the C runtime statically

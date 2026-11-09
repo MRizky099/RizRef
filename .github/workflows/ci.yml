@@ -22,16 +22,17 @@ env:
 
 jobs:
   # Phase 08: every check runs on the three release platforms. Ubuntu 22.04
-  # is the glibc baseline the Linux build documents (2.35); macOS 14 is an
-  # Apple Silicon runner, and the Intel half of the universal build is
-  # cross-checked from it (see the test job).
+  # is the glibc baseline the Linux build documents (2.35); macOS 15 is an
+  # Apple Silicon runner (GitHub retired the macOS 14 image), and the Intel
+  # half of the universal build is tested on macos-15-intel and
+  # cross-checked from the arm64 runner (see the test job).
   fmt:
     name: rustfmt (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04, macos-14]
+        os: [windows-latest, ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -46,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04, macos-14]
+        os: [windows-latest, ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -70,11 +71,13 @@ jobs:
             triple: x86_64-pc-windows-msvc
           - os: ubuntu-22.04
             triple: x86_64-unknown-linux-gnu
-          - os: macos-14
+          - os: macos-15
             triple: aarch64-apple-darwin
-            # The Intel half of the universal macOS build (10.13+), checked
-            # by cross-compilation until an Intel runner joins the matrix.
+            # The Intel half of the universal macOS build (10.13+), also
+            # checked by cross-compilation from the arm64 runner.
             cross: x86_64-apple-darwin
+          - os: macos-15-intel
+            triple: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
