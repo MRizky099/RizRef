@@ -186,7 +186,7 @@ cargo run -p rizref            # run the application (debug build)
 cargo run -p rizref -- --help  # flags this build accepts
 cargo test --workspace         # run all tests
 cargo run -p rizref-codecs --example make_fixtures   # regenerate committed codec fixtures
-cargo run -p rizref --example make_icon               # regenerate crates/rizref/assets/rizref.ico
+cargo run -p rizref --example make_icon               # regenerate both .ico files from assets/*.png
 cargo run -p rizref-format --example make_demo_board  # regenerate docs/demo.rizref
 cargo bench -p rizref-core -p rizref-format   # culling and container benches, board I/O budgets
 cargo fmt --all                # formatting
@@ -232,6 +232,11 @@ optional installer (`packaging/rizref.iss`, Inno Setup 6) installs per user to
 `%LOCALAPPDATA%\Programs\RizRef` and runs the same command.
 `packaging/package.ps1` builds both and the portable zip.
 
+Explorer caches icons and thumbnails. After registering, or after a build with new
+icons, `ie4uinit -show` refreshes the icon cache; if old icons persist, delete
+`%LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache_*.db` (and `thumbcache_*.db` for
+thumbnails) and restart Explorer.
+
 Settings and recents live in `%APPDATA%\RizRef`; logs, crash minidumps
 (`crashes\`) and autosave recovery copies (`autosave\`) in `%LOCALAPPDATA%\RizRef`
 (**Help → Open logs folder**). `-v`/`--verbose` logs at debug level; logs rotate daily
@@ -263,7 +268,7 @@ committed, repeatable harness.
 | Pan/zoom latency, input to presented frame | < 16 ms | **0.59 ms** median, 0.96 ms p95 frame work on a 100-item board; 1.04 ms p95 on 500 items / 1.6 GB; frames present every 16.5 ms (vsync) | `rizref --bench-frames=600 <board>` |
 | Loading a 100-item board (~200 MB) — first interactive frame | < 1 s | **905 ms** to the first frame with previews, on a *327 MB* 100-item board; the format's `load` alone takes 300 ms for 210 MB | `--bench-frames` (`board_load_ms`); `cargo bench -p rizref-format --bench board_io` |
 | Saving that board | < 500 ms incremental | **96 ms** after moving an item, **121 ms** after adding a 2 MiB image | `board_io` |
-| Release binary size | < 15 MB, single exe, no bundled C runtimes | **14.28 MB**; imports OS DLLs only | `scripts/check-imports.ps1` |
+| Release binary size | < 15 MB, single exe, no bundled C runtimes | **14.58 MB**; imports OS DLLs only | `scripts/check-imports.ps1` |
 
 Notes on reading the table:
 

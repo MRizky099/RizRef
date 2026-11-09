@@ -121,7 +121,8 @@ impl IThumbnailProvider_Impl for Provider_Impl {
             return Err(E_POINTER.into());
         }
         let stream = self.stream.borrow().clone().ok_or(E_UNEXPECTED)?;
-        let thumb = crate::render(StreamReader(stream), cx.clamp(1, 2048)).map_err(|_| E_FAIL)?;
+        // Never fails for a bad board: Explorer would show a blank page.
+        let thumb = crate::render_or_artwork(StreamReader(stream), cx.clamp(1, 2048));
 
         let header = BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,

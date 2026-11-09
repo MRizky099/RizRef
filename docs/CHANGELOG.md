@@ -36,7 +36,7 @@ Performance — every phase-00 budget measured by a committed harness, and met:
   its first preview frame in **905 ms**. `examples/make_soak_board.rs` writes the large
   real-JPEG boards.
 - Binary size: thin LTO at opt 3 was 18.37 MB, over budget. Fat LTO at `opt-level = "s"`
-  plus the static CRT: **14.28 MB**. `examples/decode_bench.rs` records the cost (12 MP
+  plus the static CRT: **14.28 MB** (14.58 MB with the artwork icons). `examples/decode_bench.rs` records the cost (12 MP
   JPEG 139 → 154 ms, PNG 116 → 154 ms); `opt-level = "z"` (12.52 MB) was rejected for a
   3.5× slower JPEG decode.
 - The release exe imported `VCRUNTIME140.dll` and six `api-ms-win-crt-*` forwarders,
@@ -61,9 +61,28 @@ Explorer and shell integration:
 - Jump list: opened and saved boards go to `SHAddToRecentDocs`, which feeds the taskbar
   jump list's Recent category once the type is registered (Windows keeps the list,
   pinning and removal; no `ICustomDestinationList` needed).
-- The exe embeds a generated multi-size icon (`examples/make_icon.rs`, drawn in code —
-  there was no brand asset) and version info, through a `build.rs` that writes the
-  `.res` itself: no `rc.exe`, no C toolchain.
+- The exe embeds two icons and version info, through a `build.rs` that writes the
+  `.res` itself (`resources.rs`): no `rc.exe`, no C toolchain. `RT_GROUP_ICON` 1 is the
+  application icon and 2 the `.rizref` document icon, generated from the user's
+  artwork (`assets/app_icon.png`, `assets/app_document_icon.png`, committed) by
+  `examples/make_icon.rs`: trimmed, padded to a centred square (the page is never
+  stretched), Lanczos-3 in premultiplied colour, a light unsharp mask at 32 px and
+  under, and a simplified mark where the full art turns to noise — the magnifier
+  alone at 16–24 px, and the page with that magnifier large up to 32 px. Ten sizes,
+  16–256, stored as PNG. `--sheet <png>` writes a review contact sheet. The window
+  sets the app icon at runtime (title bar, Alt-Tab, running taskbar button), and
+  `DefaultIcon` names `rizref.exe,1`, the document icon.
+- `rizref register` / `unregister` were never reachable: `platform/registry.rs` was
+  written and documented but neither declared as a module nor dispatched, so the
+  subcommands fell through to opening a file named "register" (and its tests never
+  ran). Both are wired now and listed in `--help`. The registry plan keeps its own
+  copy of the thumbnail class id, so the exe does not link the DLL's COM exports; a
+  test checks the copy against `rizref_thumb`.
+- The thumbnail DLL shows the document artwork instead of failing or drawing a blank
+  page for a board with nothing to picture (an empty board saves a 1 x 1 thumbnail)
+  or one it cannot read. Board thumbnails get no corner badge: tried at 30% of the
+  long side, it covered a note on a wide board at 256 px and dominated at 96 px.
+  `examples/thumb_preview.rs` renders what Explorer would show.
 
 Reliability:
 

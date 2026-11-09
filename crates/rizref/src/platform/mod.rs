@@ -30,9 +30,11 @@ pub mod console;
 pub mod crash;
 pub mod drop_target;
 pub mod gdi;
+pub mod icon;
 pub mod imaging;
 pub mod launch;
 pub mod message_box;
+pub mod registry;
 pub mod single_instance;
 pub mod window_modes;
 

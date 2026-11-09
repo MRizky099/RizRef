@@ -31,6 +31,15 @@ pub const EXTENSION: &str = ".rizref";
 /// The thumbnail DLL's file name, looked for next to the exe.
 pub const THUMB_DLL: &str = "rizref_thumb.dll";
 
+/// The thumbnail provider's class id: `rizref_thumb::CLSID_STRING`, repeated
+/// here so the exe does not link the DLL's crate (and its COM exports); a
+/// test keeps the two equal.
+pub const THUMB_CLSID: &str = "{6F1A3C52-8E4B-4D2A-9C7E-3B5D2F18A4C9}";
+
+/// The shell's thumbnail-handler category (`IThumbnailProvider`), mirrored
+/// from `rizref_thumb` and checked by the same test.
+pub const THUMBNAIL_HANDLER_CATEGORY: &str = "{e357fccd-a995-4576-b01f-234630154e96}";
+
 /// Where the keys go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -60,6 +69,9 @@ fn value(key: impl Into<String>, name: Option<&str>, data: impl Into<String>) ->
     }
 }
 
+/// The `.rizref` file icon's index among the exe's icon groups.
+pub const DOCUMENT_ICON_INDEX: u32 = 1;
+
 /// Every value `register` writes for an exe at `exe`, plus the thumbnail
 /// provider when `thumb_dll` is given.
 pub fn plan(exe: &Path, thumb_dll: Option<&Path>) -> Vec<Value> {
@@ -72,25 +84,35 @@ pub fn plan(exe: &Path, thumb_dll: Option<&Path>) -> Vec<Value> {
         value(format!("{EXTENSION}\\OpenWithProgids"), Some(PROG_ID), ""),
         value(PROG_ID, None, "RizRef board"),
         value(PROG_ID, Some("FriendlyTypeName"), "RizRef board"),
-        value(format!("{PROG_ID}\\DefaultIcon"), None, format!("\"{exe}\",0")),
+        // The second icon group in the exe: the document page, not the app
+        // mark (`build.rs` embeds the app icon first and the document second).
+        value(
+            format!("{PROG_ID}\\DefaultIcon"),
+            None,
+            format!("\"{exe}\",{DOCUMENT_ICON_INDEX}"),
+        ),
         value(format!("{PROG_ID}\\shell"), None, "open"),
         value(format!("{PROG_ID}\\shell\\open"), None, "Open with RizRef"),
-        value(format!("{PROG_ID}\\shell\\open\\command"), None, open.clone()),
         value(
-            "Applications\\rizref.exe\\shell\\open\\command",
+            format!("{PROG_ID}\\shell\\open\\command"),
             None,
-            open,
+            open.clone(),
         ),
+        value("Applications\\rizref.exe\\shell\\open\\command", None, open),
         value(
             "Applications\\rizref.exe\\SupportedTypes",
             Some(EXTENSION),
             "",
         ),
-        value("Applications\\rizref.exe", Some("FriendlyAppName"), "RizRef"),
+        value(
+            "Applications\\rizref.exe",
+            Some("FriendlyAppName"),
+            "RizRef",
+        ),
     ];
     if let Some(dll) = thumb_dll {
-        let clsid = rizref_thumb::CLSID_STRING;
-        let category = rizref_thumb::THUMBNAIL_HANDLER_CATEGORY;
+        let clsid = THUMB_CLSID;
+        let category = THUMBNAIL_HANDLER_CATEGORY;
         values.extend([
             value(format!("CLSID\\{clsid}"), None, "RizRef thumbnail provider"),
             value(
@@ -119,7 +141,7 @@ pub fn owned_trees() -> Vec<String> {
         EXTENSION.to_owned(),
         PROG_ID.to_owned(),
         "Applications\\rizref.exe".to_owned(),
-        format!("CLSID\\{}", rizref_thumb::CLSID_STRING),
+        format!("CLSID\\{THUMB_CLSID}"),
     ]
 }
 
@@ -216,7 +238,10 @@ pub fn run(register: bool, args: &[String]) -> std::process::ExitCode {
         [] => Scope::User,
         [flag] if flag == "--machine" => Scope::Machine,
         _ => {
-            eprintln!("usage: rizref {} [--machine]", if register { "register" } else { "unregister" });
+            eprintln!(
+                "usage: rizref {} [--machine]",
+                if register { "register" } else { "unregister" }
+            );
             return std::process::ExitCode::from(2);
         }
     };
@@ -229,7 +254,9 @@ pub fn run(register: bool, args: &[String]) -> std::process::ExitCode {
                     println!("registered {EXTENSION} for {} ({scope:?})", exe.display());
                     match &dll {
                         Some(dll) => println!("thumbnail provider: {}", dll.display()),
-                        None => println!("no {THUMB_DLL} next to the exe: Explorer thumbnails stay off"),
+                        None => {
+                            println!("no {THUMB_DLL} next to the exe: Explorer thumbnails stay off")
+                        }
                     }
                 }
                 outcome
@@ -254,8 +281,17 @@ pub fn run(register: bool, args: &[String]) -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXTENSION, PROG_ID, owned_trees, plan};
+    use super::{EXTENSION, PROG_ID, THUMB_CLSID, THUMBNAIL_HANDLER_CATEGORY, owned_trees, plan};
     use std::path::Path;
+
+    #[test]
+    fn the_mirrored_class_ids_match_the_thumbnail_dll() {
+        assert_eq!(THUMB_CLSID, rizref_thumb::CLSID_STRING);
+        assert_eq!(
+            THUMBNAIL_HANDLER_CATEGORY,
+            rizref_thumb::THUMBNAIL_HANDLER_CATEGORY
+        );
+    }
 
     fn find<'a>(values: &'a [super::Value], key: &str, name: Option<&str>) -> Option<&'a str> {
         values
@@ -273,7 +309,8 @@ mod tests {
         assert_eq!(find(&values, EXTENSION, None), Some(PROG_ID));
         assert_eq!(
             find(&values, &format!("{PROG_ID}\\DefaultIcon"), None),
-            Some(r#""C:\Apps\RizRef\rizref.exe",0"#)
+            Some(r#""C:\Apps\RizRef\rizref.exe",1"#),
+            "the document icon, not the app icon"
         );
         assert_eq!(
             find(&values, &format!("{PROG_ID}\\shell\\open\\command"), None),
@@ -292,14 +329,20 @@ mod tests {
 
         let values = plan(exe, Some(dll));
 
-        let clsid = rizref_thumb::CLSID_STRING;
+        let clsid = THUMB_CLSID;
         let inproc = format!("CLSID\\{clsid}\\InprocServer32");
-        assert_eq!(find(&values, &inproc, None), Some(r"C:\Apps\RizRef\rizref_thumb.dll"));
-        assert_eq!(find(&values, &inproc, Some("ThreadingModel")), Some("Apartment"));
+        assert_eq!(
+            find(&values, &inproc, None),
+            Some(r"C:\Apps\RizRef\rizref_thumb.dll")
+        );
+        assert_eq!(
+            find(&values, &inproc, Some("ThreadingModel")),
+            Some("Apartment")
+        );
         assert_eq!(
             find(
                 &values,
-                &format!("{EXTENSION}\\ShellEx\\{}", rizref_thumb::THUMBNAIL_HANDLER_CATEGORY),
+                &format!("{EXTENSION}\\ShellEx\\{}", THUMBNAIL_HANDLER_CATEGORY),
                 None
             ),
             Some(clsid)

@@ -35,6 +35,7 @@ use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 use crate::accessibility::Accessibility;
@@ -185,8 +186,11 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 /// Exit codes: `0` after a normal run, `2` for an argument this build does not
 /// understand, `1` when the application could not start at all.
 pub fn run(args: Vec<String>) -> ExitCode {
-    if args.first().map(String::as_str) == Some("inspect") {
-        return crate::inspect::run(&args[1..]);
+    match args.first().map(String::as_str) {
+        Some("inspect") => return crate::inspect::run(&args[1..]),
+        Some("register") => return platform::registry::run(true, &args[1..]),
+        Some("unregister") => return platform::registry::run(false, &args[1..]),
+        _ => {}
     }
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => {
@@ -260,6 +264,7 @@ fn print_help() {
     println!("USAGE:");
     println!("    rizref [OPTION]... [FILE]...");
     println!("    rizref inspect <FILE> [--verify]");
+    println!("    rizref register|unregister [--machine]");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help            print this help and exit");
@@ -278,6 +283,12 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    inspect <FILE>        print a board's header, chunks and document summary");
     println!("                          (--verify recomputes every digest)");
+    println!(
+        "    register [--machine]  associate .rizref with this exe: file icon, open verb and,"
+    );
+    println!("                          when rizref_thumb.dll is beside it, Explorer thumbnails");
+    println!("    unregister [--machine]");
+    println!("                          remove exactly what register wrote");
     println!();
     println!("A second launch hands its FILE arguments to the running instance and exits.");
     println!();
@@ -3802,8 +3813,11 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
 
+        let (small_icon, big_icon) = platform::icon::app_icons();
         let attributes = Window::default_attributes()
             .with_title(self.plan.title)
+            .with_window_icon(small_icon)
+            .with_taskbar_icon(big_icon)
             .with_inner_size(self.plan.size)
             // The window draws its own auto-hiding title bar; a native frame
             // would sit above the board permanently.

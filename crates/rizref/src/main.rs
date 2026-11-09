@@ -51,6 +51,12 @@ mod platform;
 mod provenance;
 mod recents;
 mod renderer;
+#[cfg(test)]
+mod resource_tests;
+// The `.res` writer `build.rs` uses, compiled here for the tests only.
+#[cfg(test)]
+#[path = "../resources.rs"]
+mod resources;
 mod settings;
 mod shortcuts;
 mod text;

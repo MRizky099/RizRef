@@ -62,14 +62,85 @@ pub struct Thumbnail {
     pub has_alpha: bool,
 }
 
+/// The `.rizref` document icon (`rizref_document.ico`, generated from the
+/// artwork by `cargo run -p rizref --example make_icon`): shown instead of a
+/// blank page for a board with nothing to picture or that cannot be read.
+const DOCUMENT_ICO: &[u8] = include_bytes!("../../rizref/assets/rizref_document.ico");
+
 /// Reads the board in `source` and renders its thumbnail fitted into a
-/// `max_side` square, the contract of `IThumbnailProvider::GetThumbnail`.
+/// `max_side` square. Errors are the board's: the shell entry point uses
+/// [`render_or_artwork`], which never fails.
 pub fn render<S: Read + Seek>(source: S, max_side: u32) -> Result<Thumbnail, String> {
+    Ok(to_bgra(&scale_to_fit(&board_image(source)?, max_side)))
+}
+
+/// The thumbnail Explorer gets, the contract of
+/// `IThumbnailProvider::GetThumbnail`: the board's own picture, or — for a
+/// board with nothing to picture
+/// (an empty board composites to a single background pixel) or one that
+/// cannot be read — the document artwork, so Explorer never shows a blank
+/// page.
+///
+/// Board pictures carry no corner badge: tried at 30% of the long side, the
+/// mark covered a note on a wide board at 256 px and dominated at 96 px.
+pub fn render_or_artwork<S: Read + Seek>(source: S, max_side: u32) -> Thumbnail {
+    match board_image(source) {
+        // A board with no items saves a 1 x 1 background pixel.
+        Ok(image) if image.width() > 1 && image.height() > 1 => {
+            to_bgra(&scale_to_fit(&image, max_side))
+        }
+        _ => to_bgra(&document_artwork(max_side)),
+    }
+}
+
+/// The board's stored (or composited) picture at its own size.
+fn board_image<S: Read + Seek>(source: S) -> Result<ImageBuffer, String> {
     let mut reader = BoardReader::open(source, "shell stream").map_err(|e| e.to_string())?;
-    let image = reader
+    reader
         .thumbnail_image(FALLBACK_BACKGROUND)
-        .map_err(|e| e.to_string())?;
-    Ok(to_bgra(&scale_to_fit(&image, max_side)))
+        .map_err(|e| e.to_string())
+}
+
+/// The document artwork fitted into a `max_side` square: the smallest
+/// embedded size at least that large (the hand-tuned small renditions are
+/// used as they are), scaled down to fit.
+pub fn document_artwork(max_side: u32) -> ImageBuffer {
+    let max_side = max_side.max(1);
+    let mut entries = ico_pngs(DOCUMENT_ICO);
+    entries.sort_by_key(|(side, _)| *side);
+    let chosen = entries
+        .iter()
+        .find(|(side, _)| *side >= max_side)
+        .or(entries.last())
+        .and_then(|(_, png)| rizref_codecs::decode(png).ok());
+    match chosen {
+        Some(image) => scale_to_fit(&image, max_side),
+        // Unreachable with the committed asset; a plain page colour beats a
+        // failed call.
+        None => ImageBuffer::filled(max_side, max_side, [1, 35, 79, 255]),
+    }
+}
+
+/// `(side, png)` for each image of an ICO whose images are PNGs.
+fn ico_pngs(ico: &[u8]) -> Vec<(u32, &[u8])> {
+    let u32_at = |at: usize| {
+        ico.get(at..at + 4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let count = ico
+        .get(4..6)
+        .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+    (0..usize::from(count))
+        .filter_map(|index| {
+            let entry = 6 + index * 16;
+            let side = match *ico.get(entry)? {
+                0 => 256,
+                side => u32::from(side),
+            };
+            let (len, offset) = (u32_at(entry + 8) as usize, u32_at(entry + 12) as usize);
+            Some((side, ico.get(offset..offset + len)?))
+        })
+        .collect()
 }
 
 /// Scales `image` so its longer side is `max_side`, keeping the aspect ratio.
@@ -288,5 +359,58 @@ mod tests {
 
     fn glam_vec(x: f32, y: f32) -> glam::Vec2 {
         glam::Vec2::new(x, y)
+    }
+
+    fn save_board(scene: &rizref_core::Scene, tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rizref-thumb-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("b.rizref");
+        rizref_format::save(
+            &path,
+            &rizref_format::SaveRequest::new(scene, rizref_core::Camera::default(), "b"),
+        )
+        .expect("save");
+        path
+    }
+
+    /// The document page's fill, as straight RGB, is dark blue.
+    fn is_page_blue(bgra: &[u8]) -> bool {
+        let [b, g, r, a] = [bgra[0], bgra[1], bgra[2], bgra[3]];
+        a > 200 && b > 40 && r < 40 && b > g
+    }
+
+    #[test]
+    fn an_empty_board_shows_the_document_artwork() {
+        let scene = rizref_core::Scene::new(rizref_core::SceneId::random());
+        let path = save_board(&scene, "empty");
+
+        let file = std::fs::File::open(&path).expect("open");
+        let thumb = super::render_or_artwork(file, 256);
+
+        // The page is taller than wide, centred in the square.
+        assert_eq!((thumb.width, thumb.height), (256, 256));
+        assert!(thumb.has_alpha, "transparent margins around the page");
+        let centre = ((128 * 256 + 128) * 4) as usize;
+        let corner = 0;
+        assert_eq!(thumb.bgra[corner + 3], 0, "the corner is margin");
+        // Somewhere along the middle row the page fill shows.
+        let row = &thumb.bgra[(128 * 256 * 4) as usize..(129 * 256 * 4) as usize];
+        assert!(
+            row.chunks(4).any(is_page_blue),
+            "page colour on the middle row"
+        );
+        assert_ne!(thumb.bgra[centre + 3], 0);
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    #[test]
+    fn an_unreadable_board_shows_the_document_artwork_instead_of_failing() {
+        let garbage = std::io::Cursor::new(b"not a board at all".to_vec());
+        assert!(super::render(garbage.clone(), 48).is_err());
+
+        let thumb = super::render_or_artwork(garbage, 48);
+
+        assert_eq!((thumb.width, thumb.height), (48, 48));
+        assert!(thumb.bgra.chunks(4).any(is_page_blue));
     }
 }
