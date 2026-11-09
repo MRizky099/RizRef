@@ -41,7 +41,7 @@ with strict http/https launching, and a read-only image info dialog) and phase 0
 CPU-presented first frames while the GPU starts in the background, visible-set culling,
 a parallel board load, autosave to recovery copies with a restore prompt, crash
 minidumps, the Explorer thumbnail provider, per-user file-type registration and jump
-list, a 14.2 MB single exe with no C runtime, a packaging script, an Inno Setup
+list, a 14.3 MB single exe with no C runtime, a packaging script, an Inno Setup
 installer and a draft-release workflow) have landed. The workspace builds, tests and
 lints clean. Hand-testing of the 1.0 build against the manual test plan is the step
 before tagging a release.
@@ -254,7 +254,7 @@ run.
 The phase-00 targets, measured in phase 07 on the reference machine: a 2015 laptop,
 Intel Core i7-4720HQ, 12 GB RAM, NVIDIA GeForce GTX 950M (the only Vulkan/DX12
 adapter — its Intel HD 4600 is offered by neither API), Windows 10 Pro 22H2, release
-build of `b78db1f`, default 600 × 400 window, 60 Hz display. Every number comes from a
+build of `feat/phase-07-polish-and-ship`, default 600 × 400 window, 60 Hz display. Every number comes from a
 committed, repeatable harness.
 
 | Budget | Target | Measured | Harness |
@@ -263,7 +263,7 @@ committed, repeatable harness.
 | Pan/zoom latency, input to presented frame | < 16 ms | **0.59 ms** median, 0.96 ms p95 frame work on a 100-item board; 1.04 ms p95 on 500 items / 1.6 GB; frames present every 16.5 ms (vsync) | `rizref --bench-frames=600 <board>` |
 | Loading a 100-item board (~200 MB) — first interactive frame | < 1 s | **905 ms** to the first frame with previews, on a *327 MB* 100-item board; the format's `load` alone takes 300 ms for 210 MB | `--bench-frames` (`board_load_ms`); `cargo bench -p rizref-format --bench board_io` |
 | Saving that board | < 500 ms incremental | **96 ms** after moving an item, **121 ms** after adding a 2 MiB image | `board_io` |
-| Release binary size | < 15 MB, single exe, no bundled C runtimes | **14.21 MB**; imports OS DLLs only | `scripts/check-imports.ps1` |
+| Release binary size | < 15 MB, single exe, no bundled C runtimes | **14.28 MB**; imports OS DLLs only | `scripts/check-imports.ps1` |
 
 Notes on reading the table:
 

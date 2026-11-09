@@ -36,7 +36,7 @@ Performance — every phase-00 budget measured by a committed harness, and met:
   its first preview frame in **905 ms**. `examples/make_soak_board.rs` writes the large
   real-JPEG boards.
 - Binary size: thin LTO at opt 3 was 18.37 MB, over budget. Fat LTO at `opt-level = "s"`
-  plus the static CRT: **14.21 MB**. `examples/decode_bench.rs` records the cost (12 MP
+  plus the static CRT: **14.28 MB**. `examples/decode_bench.rs` records the cost (12 MP
   JPEG 139 → 154 ms, PNG 116 → 154 ms); `opt-level = "z"` (12.52 MB) was rejected for a
   3.5× slower JPEG decode.
 - The release exe imported `VCRUNTIME140.dll` and six `api-ms-win-crt-*` forwarders,
