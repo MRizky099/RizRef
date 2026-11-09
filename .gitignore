@@ -7,8 +7,10 @@
 # Local design documents — deliberately NOT published:
 #   docs/plans  (working phase plans)
 #   docs/study   (reverse-engineering notes on the reference application)
+#   docs/manual-test-plan.md  (hand/computer-use test runs and their results)
 /docs/plans/
 /docs/study/
+/docs/manual-test-plan.md
 
 # Local scratch space (generated helpers, issue bodies, exports)
 /.local/
