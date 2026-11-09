@@ -16,9 +16,9 @@ use glam::{DVec2, Vec2};
 use rizref_core::{
     AddGroup, AddItems, Align, ArrangeMode, Camera, DEFAULT_NOTE_SIZE, DissolveGroup, Effects,
     GroupChild, Handle, History, Item, ItemId, ItemState, NOTE_PADDING, NoteContent, NoteFormat,
-    Orientation, Pivot, RemoveItems, ReorderItems, Selection, SelectionFrame, SetNoteContent,
+    Orientation, RemoveItems, ReorderItems, Selection, SelectionFrame, SetNoteContent,
     SetTransforms, SizeAxis, align, arrange, distribute, scale_item, scale_item_in_frame,
-    screen_tolerance, snap_rect,
+    scale_rules, screen_tolerance, snap_rect,
 };
 
 /// Screen-pixel tolerance for edge/centre snapping.
@@ -135,6 +135,8 @@ enum Gesture {
         frame: SelectionFrame,
         before: Vec<(ItemId, ItemState)>,
         single: bool,
+        /// Whether a note is being scaled: notes resize freely by default.
+        has_note: bool,
         start_screen: DVec2,
         moved: bool,
     },
@@ -989,11 +991,15 @@ impl Board {
                     moved: false,
                 }
             } else {
+                let has_note = before
+                    .iter()
+                    .any(|(id, _)| self.scene.item(*id).is_some_and(Item::is_note));
                 Gesture::Scale {
                     handle,
                     frame,
                     before,
                     single: self.selection.len() == 1,
+                    has_note,
                     start_screen: screen,
                     moved: false,
                 }
@@ -1097,6 +1103,7 @@ impl Board {
                 frame,
                 before,
                 single,
+                has_note,
                 start_screen,
                 moved,
             } => {
@@ -1104,12 +1111,8 @@ impl Board {
                     *moved = true;
                 }
                 if *moved {
-                    let pivot = if mods.alt {
-                        Pivot::Opposite
-                    } else {
-                        Pivot::Center
-                    };
-                    let keep_aspect = mods.shift;
+                    let (keep_aspect, pivot) =
+                        scale_rules(*handle, mods.alt, mods.shift, *has_note);
                     let states: Vec<(ItemId, ItemState)> = if *single {
                         before
                             .iter()
@@ -1484,8 +1487,13 @@ mod tests {
         let se = frame.handle_position(rizref_core::Handle::Se, 0.0);
         board.pointer_down(screen(&camera, se), view, Modifiers::default());
         let target = frame.center + (se - frame.center) * 2.0;
-        board.pointer_move(screen(&camera, target), view, Modifiers::default());
-        board.pointer_up(screen(&camera, target), view, Modifiers::default());
+        // Alt scales about the centre (the default anchors the opposite corner).
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        board.pointer_move(screen(&camera, target), view, alt);
+        board.pointer_up(screen(&camera, target), view, alt);
         let scaled = item(&board, 1);
         assert_eq!(scaled.size(), Vec2::splat(40.0));
         assert_eq!(scaled.center(), Vec2::new(30.0, 40.0));
@@ -1879,7 +1887,33 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_selection_scales_around_its_frame_centre() {
+    fn a_default_corner_drag_keeps_the_opposite_corner_fixed() {
+        let mut board = board(2);
+        board.set_snap_enabled(false);
+        board.select_all();
+        let camera = view();
+        let view = info(&camera);
+        let frame = board.frame().expect("two items");
+        let nw = frame.handle_position(rizref_core::Handle::Nw, 0.0);
+        let se = frame.handle_position(rizref_core::Handle::Se, 0.0);
+
+        // Drag the south-east corner out by half the frame, askew.
+        let target = se + Vec2::new(30.0, 25.0);
+        board.pointer_down(screen(&camera, se), view, Modifiers::default());
+        board.pointer_move(screen(&camera, target), view, Modifiers::default());
+        board.pointer_up(screen(&camera, target), view, Modifiers::default());
+
+        let after = board.frame().expect("still selected");
+        let new_nw = after.handle_position(rizref_core::Handle::Nw, 0.0);
+        assert!((new_nw - nw).length() < 1e-3, "{new_nw} vs {nw}");
+        assert!(
+            (after.size.x / after.size.y - frame.size.x / frame.size.y).abs() < 1e-4,
+            "images keep their aspect on a corner drag"
+        );
+    }
+
+    #[test]
+    fn a_multi_selection_scales_around_its_frame_centre_with_alt() {
         let mut board = board(2);
         board.set_snap_enabled(false);
         board.select_all();
@@ -1891,9 +1925,13 @@ mod tests {
 
         let se = frame.handle_position(rizref_core::Handle::Se, 0.0);
         let target = frame.center + (se - frame.center) * 2.0;
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
         board.pointer_down(screen(&camera, se), view, Modifiers::default());
-        board.pointer_move(screen(&camera, target), view, Modifiers::default());
-        board.pointer_up(screen(&camera, target), view, Modifiers::default());
+        board.pointer_move(screen(&camera, target), view, alt);
+        board.pointer_up(screen(&camera, target), view, alt);
 
         assert_eq!(item(&board, 1).center(), Vec2::new(-20.0, 0.0));
         assert_eq!(item(&board, 2).center(), Vec2::new(60.0, 0.0));

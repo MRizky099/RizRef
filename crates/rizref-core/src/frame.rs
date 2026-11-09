@@ -68,6 +68,11 @@ impl Handle {
         }
     }
 
+    /// Whether this is one of the four corner handles.
+    pub const fn is_corner(self) -> bool {
+        matches!(self, Handle::Nw | Handle::Ne | Handle::Se | Handle::Sw)
+    }
+
     /// Whether this is one of the eight scale handles.
     pub const fn is_scale(self) -> bool {
         !matches!(self, Handle::Rotate)
@@ -93,10 +98,28 @@ impl Handle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pivot {
     /// Scale about the selection centre; the dragged handle still follows the
-    /// pointer, and the opposite side moves symmetrically. The default.
+    /// pointer, and the opposite side moves symmetrically (alt).
     Center,
-    /// Scale about the opposite corner, the classic canvas behaviour (alt).
+    /// Scale about the opposite corner or edge, the classic canvas behaviour.
+    /// The default.
     Opposite,
+}
+
+/// How a scale drag behaves for the held modifiers and what is selected.
+///
+/// The opposite corner/edge stays put unless `alt` scales about the centre.
+/// A corner drag keeps the aspect ratio of images (a photo is never meant to
+/// be stretched) and `shift` frees it; notes are free text cards, so a corner
+/// drag resizes them freely and `shift` locks the ratio. Edge drags change
+/// one axis, except that `shift` scales both from an edge too.
+pub fn scale_rules(handle: Handle, alt: bool, shift: bool, has_note: bool) -> (bool, Pivot) {
+    let pivot = if alt { Pivot::Center } else { Pivot::Opposite };
+    let keep_aspect = if handle.is_corner() && !has_note {
+        !shift
+    } else {
+        shift
+    };
+    (keep_aspect, pivot)
 }
 
 /// An oriented box around the selection.
@@ -374,7 +397,54 @@ pub fn scale_item_in_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::{Handle, Pivot, SelectionFrame, scale_item, scale_item_in_frame};
+    use super::{Handle, Pivot, SelectionFrame, scale_item, scale_item_in_frame, scale_rules};
+
+    #[test]
+    fn the_opposite_corner_is_the_default_pivot_and_alt_uses_the_centre() {
+        assert_eq!(
+            scale_rules(Handle::Se, false, false, false).1,
+            Pivot::Opposite
+        );
+        assert_eq!(
+            scale_rules(Handle::E, false, false, true).1,
+            Pivot::Opposite
+        );
+        assert_eq!(scale_rules(Handle::Se, true, false, false).1, Pivot::Center);
+    }
+
+    #[test]
+    fn image_corners_keep_the_aspect_and_notes_resize_freely() {
+        // Images: corners locked, shift frees; edges free, shift locks.
+        assert!(scale_rules(Handle::Nw, false, false, false).0);
+        assert!(!scale_rules(Handle::Nw, false, true, false).0);
+        assert!(!scale_rules(Handle::N, false, false, false).0);
+        assert!(scale_rules(Handle::N, false, true, false).0);
+        // Notes: free everywhere, shift locks.
+        assert!(!scale_rules(Handle::Se, false, false, true).0);
+        assert!(scale_rules(Handle::Se, false, true, true).0);
+    }
+
+    #[test]
+    fn a_default_corner_drag_on_an_image_keeps_its_aspect_exactly() {
+        // The manual-test case: a 4000 x 3000 image dragged far and askew
+        // from its south-east corner must stay exactly 4:3, with its
+        // north-west corner fixed.
+        let transform = Transform::new(Vec2::new(2000.0, 1500.0), Vec2::new(4000.0, 3000.0));
+        let (keep_aspect, pivot) = scale_rules(Handle::Se, false, false, false);
+
+        let scaled = scale_item(
+            transform,
+            Handle::Se,
+            Vec2::new(6975.0, 5198.0),
+            keep_aspect,
+            pivot,
+        );
+
+        let size = scaled.size();
+        assert!((size.x / size.y - 4.0 / 3.0).abs() < 1e-5, "{size}");
+        let nw = scaled.center() - size * 0.5;
+        assert!(nw.length() < 1e-2, "the opposite corner moved: {nw}");
+    }
     use crate::scene::{Scene, SceneId};
     use crate::selection::Selection;
     use crate::transform::{MIN_ITEM_SIZE, Transform};

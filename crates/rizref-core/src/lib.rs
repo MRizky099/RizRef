@@ -38,7 +38,7 @@ pub use command::{
     AddGroup, AddItems, CoalesceKey, Command, DissolveGroup, Effects, History, RemoveItems,
     ReorderItems, SetNoteContent, SetTransforms,
 };
-pub use frame::{Handle, Pivot, SelectionFrame, scale_item, scale_item_in_frame};
+pub use frame::{Handle, Pivot, SelectionFrame, scale_item, scale_item_in_frame, scale_rules};
 pub use geometry::Rect;
 pub use group::{Group, GroupChild, GroupId, Groups};
 pub use item::{
