@@ -4,6 +4,7 @@ description = "Windows Explorer thumbnail provider (IThumbnailProvider) for `.ri
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true

@@ -4,6 +4,7 @@ description = "Reader and writer for the `.rizref` board container: the single s
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true
@@ -27,5 +28,11 @@ tiny-skia.workspace = true
 # running those timings as a unit test.
 [[bench]]
 name = "container"
+harness = false
+test = false
+
+# Phase-07 budgets: board load and save on a 100-item, ~200 MB board.
+[[bench]]
+name = "board_io"
 harness = false
 test = false

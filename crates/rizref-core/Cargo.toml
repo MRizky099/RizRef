@@ -4,6 +4,7 @@ description = "Scene model, geometry and command history for RizRef: determinist
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [lints]
 workspace = true

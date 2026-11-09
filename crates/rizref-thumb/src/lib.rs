@@ -168,7 +168,7 @@ pub fn scale_to_fit(image: &ImageBuffer, max_side: u32) -> ImageBuffer {
 pub fn to_bgra(image: &ImageBuffer) -> Thumbnail {
     let mut bgra = Vec::with_capacity(image.pixels().len());
     let mut has_alpha = false;
-    for px in image.pixels().chunks_exact(4) {
+    for px in image.pixels().as_chunks::<4>().0 {
         let a = u16::from(px[3]);
         has_alpha |= px[3] != 255;
         let pm = |c: u8| ((u16::from(c) * a + 127) / 255) as u8;

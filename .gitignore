@@ -19,3 +19,6 @@
 *.swp
 Thumbs.db
 desktop.ini
+
+# Packaging output (packaging/package.ps1)
+/dist/

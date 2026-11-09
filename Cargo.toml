@@ -21,8 +21,9 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/MRizky099/RizRef"
 
 # ---------------------------------------------------------------------------
@@ -203,9 +204,21 @@ dbg_macro = "deny"
 
 # ---------------------------------------------------------------------------
 # Release profile, sized against the phase-07 budget of a < 15 MB single exe.
-# Budgets are recorded in README.md; phase 07 measures them.
+#
+# Measured in phase 07 (README, "Performance budgets"; same tree, MSVC x64):
+#   lto thin, opt 3   18.37 MB   (the phase-00 profile — over budget)
+#   lto fat,  opt 3   17.92 MB
+#   lto fat,  opt s   13.96 MB   <- chosen
+#   lto fat,  opt z   12.52 MB
+# The runtime cost (`cargo run --release -p rizref-codecs --example
+# decode_bench`, 12 MP image, best of 5): opt s decodes JPEG ~10% and PNG ~35%
+# slower than opt 3 (154 vs 139 ms, 154 vs 116 ms); opt z makes JPEG decode
+# 3.5x slower (496 ms), which is why it lost despite being smaller. Raising
+# the codec crates back to opt 3 per package made no measurable difference
+# under fat LTO, so the profile stays uniform.
 # ---------------------------------------------------------------------------
 [profile.release]
-lto = "thin"
+lto = "fat"
+opt-level = "s"
 codegen-units = 1
 strip = true
