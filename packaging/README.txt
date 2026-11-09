@@ -21,6 +21,32 @@ registered by that command when it is present. If you move the folder, run
 
     rizref.exe unregister
 
+Installer
+---------
+RizRef-<version>-x64-setup.exe installs for the current user by default,
+into %LOCALAPPDATA%\Programs\RizRef, without administrator rights. Its first
+dialog also offers "Install for all users", which needs administrator
+rights and defaults to Program Files.
+
+Setup always asks where to install, including when upgrading (it starts
+from the folder the previous version used). A per-user install needs a
+folder you can write to without administrator rights; Setup says so before
+copying anything if you pick one it cannot write to, such as Program Files.
+A network folder works, but Explorer usually will not load the thumbnail
+provider from one, so Setup asks first. Picking a different folder when
+upgrading leaves the old one behind: uninstall first to move RizRef.
+
+Silent install into a chosen folder:
+
+    RizRef-<version>-x64-setup.exe /VERYSILENT /DIR="D:\Apps\RizRef"
+
+Add /ALLUSERS for an all-users install (run elevated), or /CURRENTUSER to
+force a per-user one. With the "associate" task (on by default) Setup runs
+"rizref.exe register" from the chosen folder, so double-click, the file
+icon and Explorer thumbnails point there; an all-users install registers
+for every user ("register --machine"). Uninstalling (Settings -> Apps)
+runs "rizref.exe unregister" and removes the folder.
+
 Where RizRef keeps things
 -------------------------
 Settings and recent boards: %APPDATA%\RizRef

@@ -175,6 +175,16 @@ Reliability:
     property to it, so the shortcut also stays in the description, which Narrator
     reads as the full description. Tests: Save gives `Ctrl+S`, and a rebound Undo
     gives the new chord.
+  - Installer: the folder page always shows, also on upgrades (pre-filled with the
+    previous folder). The default follows the install mode (`{autopf}`: still
+    `%LOCALAPPDATA%\Programs\RizRef` per user, Program Files for all users). Setup
+    checks the chosen folder before copying: a folder a per-user install cannot
+    write to (Program Files without elevation) gets a message pointing at the
+    all-users mode, and a network folder asks first because Explorer will not load
+    the thumbnail DLL from it. `register` / `unregister` (with `--machine` for all
+    users) run from the chosen folder; uninstall removes it. Silent installs take
+    `/DIR="..."` and `/ALLUSERS` or `/CURRENTUSER`. Not compiled here (no Inno Setup
+    on this machine).
   - The colour picker: no path was found by which it drops the next key or the
     dirty mark (it changes neither selection nor history, and the dirty mark comes
     from the board's effects); not reproduced, left unchanged.

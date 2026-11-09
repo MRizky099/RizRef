@@ -229,7 +229,9 @@ rizref register --machine    # for every user (an elevated installer)
 
 Registration writes only `HKCU\Software\Classes` (no administrator rights). The
 optional installer (`packaging/rizref.iss`, Inno Setup 6) installs per user to
-`%LOCALAPPDATA%\Programs\RizRef` and runs the same command.
+`%LOCALAPPDATA%\Programs\RizRef` by default, or for all users into Program Files, always
+letting you choose the folder (silently: `/DIR="..."`), and runs the same command
+from the chosen folder.
 `packaging/package.ps1` builds both and the portable zip.
 
 Explorer caches icons and thumbnails. After registering, or after a build with new
