@@ -357,7 +357,7 @@ impl ShortcutsPanel {
                 painter.text(action.label(), row.x + 12.0, y, 13.0, TEXT);
                 let chord = shortcuts
                     .chord_for(*action)
-                    .map_or_else(|| "—".to_owned(), |chord| chord.to_string());
+                    .map_or_else(|| "—".to_owned(), |chord| chord.label());
                 painter.text_right(
                     &chord,
                     row.right() - 12.0,

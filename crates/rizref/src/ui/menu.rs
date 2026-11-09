@@ -300,7 +300,7 @@ impl MenuEntry {
 fn accelerate(mut entries: Vec<MenuEntry>, shortcuts: &Shortcuts) -> Vec<MenuEntry> {
     for entry in &mut entries {
         if let Some(id) = entry.shortcut {
-            entry.accel = shortcuts.chord_for(id).map(|chord| chord.to_string());
+            entry.accel = shortcuts.chord_for(id).map(|chord| chord.label());
         }
         let children = std::mem::take(&mut entry.children);
         entry.children = accelerate(children, shortcuts);
@@ -1421,7 +1421,10 @@ mod tests {
         settings.scene_border = true;
         let on = find(&build(&context(&settings, &shortcuts, &recents)));
         assert!(on.toggles && on.checked);
-        assert_eq!(on.accel.as_deref(), Some("Ctrl+B"));
+        assert_eq!(
+            on.accel,
+            Some(crate::shortcuts::KeyChord::ctrl(crate::shortcuts::Key::B).label())
+        );
         assert_eq!(on.action, Some(Action::ToggleBorder));
 
         settings.scene_border = false;
@@ -1447,7 +1450,10 @@ mod tests {
             .iter()
             .find(|entry| entry.label == "Undo")
             .expect("edit menu has undo");
-        assert_eq!(undo.accel.as_deref(), Some("Ctrl+U"));
+        assert_eq!(
+            undo.accel,
+            Some(crate::shortcuts::KeyChord::ctrl(crate::shortcuts::Key::U).label())
+        );
     }
 
     #[test]

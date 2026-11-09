@@ -286,8 +286,12 @@ pub fn paint(
     }
 
     if layout.footer_visible {
+        let footer = format!(
+            "F1 shortcuts · {} open images · right-click a recent board to remove it",
+            crate::shortcuts::KeyChord::ctrl(crate::shortcuts::Key::O).label()
+        );
         painter.text(
-            "F1 shortcuts · Ctrl+O open images · right-click a recent board to remove it",
+            &footer,
             layout.content.x,
             viewport.y as f32 - 30.0,
             10.5,

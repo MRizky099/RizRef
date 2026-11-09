@@ -438,13 +438,19 @@ impl UiLayer {
 
 /// The accent border and HUD note that say a window is ignoring the mouse.
 fn paint_mode_indicator(painter: &mut Painter, viewport: DVec2, modes: WindowModes) {
+    use crate::shortcuts::{Key, KeyChord};
+    let ghost = format!(
+        "GHOST MODE · {} to restore",
+        KeyChord::ctrl_shift(Key::G).label()
+    );
+    let click_through = format!(
+        "CLICK-THROUGH · {} to restore",
+        KeyChord::ctrl_shift(Key::X).label()
+    );
     let (message, alpha) = if modes.ghost() {
-        ("GHOST MODE · Ctrl+Shift+G to restore", paint::GHOST_ACCENT)
+        (ghost.as_str(), paint::GHOST_ACCENT)
     } else if modes.effective_click_through() {
-        (
-            "CLICK-THROUGH · Ctrl+Shift+X to restore",
-            paint::GHOST_ACCENT,
-        )
+        (click_through.as_str(), paint::GHOST_ACCENT)
     } else if modes.effective_opacity_percent() < 100 {
         (
             "TRANSPARENT WINDOW",

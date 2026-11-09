@@ -8,6 +8,17 @@
 //!
 //! Pointer gestures stay in [`crate::input`]: a wheel notch and a pan drag are
 //! structural, not user preferences.
+//!
+//! # The primary modifier
+//!
+//! `KeyChord::ctrl` is the platform's *primary* modifier: Control on Windows
+//! and Linux, Command (⌘) on macOS, read from the live keyboard by
+//! [`primary_held`]. One default table therefore serves every OS — `Ctrl+S`
+//! on Windows is `⌘S` on a Mac. Settings spell it [`PRIMARY_NAME`] (`Ctrl+S`
+//! on Windows and Linux, so their files are unchanged; `Cmd+S` on macOS), and
+//! the parser accepts either spelling everywhere, so a settings file carried
+//! between systems keeps its meaning. Menus show [`KeyChord::label`]: the same
+//! text, or on macOS Apple's glyphs in Apple's order (`⌥⇧⌘S`).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -279,12 +290,48 @@ impl Key {
     ];
 }
 
+/// How the primary modifier is spelled in text and settings: `Ctrl`, or `Cmd`
+/// on macOS.
+pub const PRIMARY_NAME: &str = if cfg!(target_os = "macos") {
+    "Cmd"
+} else {
+    "Ctrl"
+};
+
+/// Whether the platform's primary modifier is held: Command on macOS,
+/// Control elsewhere.
+pub fn primary_held(modifiers: winit::keyboard::ModifiersState) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.super_key()
+    } else {
+        modifiers.control_key()
+    }
+}
+
+/// `chord` in macOS menu notation: the modifier glyphs in Apple's order
+/// (Option ⌥, Shift ⇧, Command ⌘) followed by the key, with no separators.
+pub fn mac_glyphs(chord: KeyChord) -> String {
+    let mut label = String::new();
+    if chord.alt {
+        label.push('⌥');
+    }
+    if chord.shift {
+        label.push('⇧');
+    }
+    if chord.ctrl {
+        label.push('⌘');
+    }
+    label.push_str(chord.key.name());
+    label
+}
+
 /// One key plus the exact modifier set that must be held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyChord {
     /// The non-modifier key.
     pub key: Key,
-    /// Control held.
+    /// The primary modifier held: Control, or Command on macOS (see the
+    /// module notes).
     pub ctrl: bool,
     /// Shift held.
     pub shift: bool,
@@ -334,10 +381,23 @@ impl KeyChord {
     }
 }
 
+impl KeyChord {
+    /// The chord as menus, tooltips and the shortcut overlay show it:
+    /// [`mac_glyphs`] on macOS, the settings spelling elsewhere.
+    pub fn label(&self) -> String {
+        if cfg!(target_os = "macos") {
+            mac_glyphs(*self)
+        } else {
+            self.to_string()
+        }
+    }
+}
+
 impl fmt::Display for KeyChord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.ctrl {
-            formatter.write_str("Ctrl+")?;
+            formatter.write_str(PRIMARY_NAME)?;
+            formatter.write_str("+")?;
         }
         if self.shift {
             formatter.write_str("Shift+")?;
@@ -372,7 +432,7 @@ impl FromStr for KeyChord {
         let mut key = None;
         for part in text.split('+').map(str::trim).filter(|p| !p.is_empty()) {
             match part.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" => chord.ctrl = true,
+                "ctrl" | "control" | "cmd" | "command" | "⌘" => chord.ctrl = true,
                 "shift" => chord.shift = true,
                 "alt" => chord.alt = true,
                 _ => {
@@ -977,6 +1037,7 @@ impl Shortcuts {
 #[cfg(test)]
 mod tests {
     use super::{Key, KeyChord, ShortcutId, Shortcuts};
+    use super::{PRIMARY_NAME, mac_glyphs};
     use std::collections::BTreeMap;
 
     #[test]
@@ -1003,13 +1064,55 @@ mod tests {
 
     #[test]
     fn chords_parse_and_format_in_both_directions() {
-        for text in ["Ctrl+Shift+Z", "F11", "Shift+H", "Ctrl+Shift+G", ",", "Del"] {
+        let primary_shift_z = format!("{PRIMARY_NAME}+Shift+Z");
+        let primary_shift_g = format!("{PRIMARY_NAME}+Shift+G");
+        for text in [
+            primary_shift_z.as_str(),
+            "F11",
+            "Shift+H",
+            primary_shift_g.as_str(),
+            ",",
+            "Del",
+        ] {
             let chord: KeyChord = text.parse().expect("a valid chord");
             assert_eq!(chord.to_string(), text, "round trip of {text}");
         }
         assert!("Ctrl+".parse::<KeyChord>().is_err());
         assert!("Ctrl+A+B".parse::<KeyChord>().is_err());
         assert!("Nonsense".parse::<KeyChord>().is_err());
+    }
+
+    #[test]
+    fn ctrl_and_cmd_name_the_same_primary_modifier_on_every_os() {
+        let windows: KeyChord = "Ctrl+Shift+Z".parse().expect("windows spelling");
+        let mac: KeyChord = "Cmd+Shift+Z".parse().expect("mac spelling");
+        assert_eq!(windows, mac);
+        assert_eq!(windows, KeyChord::ctrl_shift(Key::Z));
+        let expected = if cfg!(target_os = "macos") {
+            "Cmd+Shift+Z"
+        } else {
+            "Ctrl+Shift+Z"
+        };
+        assert_eq!(windows.to_string(), expected, "settings spelling");
+    }
+
+    #[test]
+    fn mac_menus_use_apple_glyphs_in_apple_order() {
+        assert_eq!(mac_glyphs(KeyChord::ctrl(Key::S)), "⌘S");
+        let all = KeyChord {
+            key: Key::Z,
+            ctrl: true,
+            shift: true,
+            alt: true,
+        };
+        assert_eq!(mac_glyphs(all), "⌥⇧⌘Z");
+        assert_eq!(mac_glyphs(KeyChord::plain(Key::F11)), "F11");
+        let label = KeyChord::ctrl(Key::S).label();
+        if cfg!(target_os = "macos") {
+            assert_eq!(label, "⌘S");
+        } else {
+            assert_eq!(label, "Ctrl+S");
+        }
     }
 
     #[test]

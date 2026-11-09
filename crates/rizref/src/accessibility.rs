@@ -553,10 +553,11 @@ mod tests {
 
         let save = menu_node(&shortcuts, "Save");
 
-        assert_eq!(save.keyboard_shortcut(), Some("Ctrl+S"));
+        let expected = crate::shortcuts::KeyChord::ctrl(crate::shortcuts::Key::S).label();
+        assert_eq!(save.keyboard_shortcut(), Some(expected.as_str()));
         assert_eq!(
             save.description(),
-            Some("Ctrl+S"),
+            Some(expected.as_str()),
             "what Narrator reads today"
         );
     }
@@ -571,7 +572,10 @@ mod tests {
 
         let undo = menu_node(&shortcuts, "Undo");
 
-        assert_eq!(undo.keyboard_shortcut(), Some("Ctrl+U"));
+        assert_eq!(
+            undo.keyboard_shortcut(),
+            Some(KeyChord::ctrl(Key::U).label().as_str())
+        );
     }
 
     #[test]
