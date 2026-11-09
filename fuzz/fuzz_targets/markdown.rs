@@ -10,20 +10,23 @@
 
 use libfuzzer_sys::fuzz_target;
 
+// Declared at the crate root so each `#[path]` resolves from `fuzz_targets/`
+// (a path inside an inline module would go through a `markdown/` directory that
+// does not exist, which Linux cannot step back out of). `parse.rs` refers to
+// `super::style`, which is this crate root's `style`.
 #[allow(dead_code, missing_docs, clippy::all)]
-mod markdown {
-    #[path = "../../../crates/rizref/src/markdown/style.rs"]
-    pub mod style;
-    #[path = "../../../crates/rizref/src/markdown/parse.rs"]
-    pub mod parse;
-}
+#[path = "../../crates/rizref/src/markdown/parse.rs"]
+mod parse;
+#[allow(dead_code, missing_docs, clippy::all)]
+#[path = "../../crates/rizref/src/markdown/style.rs"]
+mod style;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(source) = std::str::from_utf8(data) else {
         return;
     };
-    let document = markdown::parse::parse(source);
-    assert!(document.math.len() <= markdown::parse::MAX_EQUATIONS);
-    let (text, _) = markdown::parse::extract_math(source);
-    assert!(text.len() <= source.len() + 4 * markdown::parse::MAX_EQUATIONS);
+    let document = parse::parse(source);
+    assert!(document.math.len() <= parse::MAX_EQUATIONS);
+    let (text, _) = parse::extract_math(source);
+    assert!(text.len() <= source.len() + 4 * parse::MAX_EQUATIONS);
 });
