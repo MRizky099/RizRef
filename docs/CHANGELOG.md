@@ -2,7 +2,39 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
-## Phase 08a — Portability layer + Linux (in review)
+## Phase 08b — macOS (in review)
+
+Branch `feat/phase-08b-macos`, part of issue #24. No format change; Windows and Linux
+behaviour unchanged.
+
+- **⌘ shortcuts.** `KeyChord::ctrl` is the platform's primary modifier: Command on
+  macOS, Control elsewhere (`shortcuts::primary_held`). Settings spell it `Cmd+` on
+  macOS and `Ctrl+` elsewhere (Windows and Linux files unchanged); either spelling
+  parses on every OS. Menus, the shortcut overlay, AccessKit and the mode banners show
+  Apple's glyphs in Apple's order (`⌥⇧⌘S`) on macOS.
+- **Finder integration.** `application:openURLs:` is added to winit's
+  `WinitApplicationDelegate` before the loop runs, so a double-clicked `.rizref` opens
+  at launch and in a running RizRef (paths held until the window exists).
+  `applicationShouldTerminate:` cancels and closes through the unsaved-changes path;
+  winit's default menu is off so ⌘Q / ⌘H / ⌘W reach the shortcut table.
+- **Window modes.** Whole-window opacity through `NSWindow` alpha; ghost and
+  click-through chords (⌘⇧G / ⌘⇧X) seen from other apps through
+  `CGEventSourceKeyState`. Always on top and click-through come from winit.
+- **Bundle.** `packaging/macos/Info.plist` (`com.rizref.board` exported UTI,
+  `application/x-rizref`, document icon, `LSMinimumSystemVersion` 10.13, images as an
+  Alternate handler); `assets/rizref.icns` / `rizref_document.icns` from `make_icon`
+  (16–1024 px PNG chunks); `packaging/macos/build-app.sh` builds x86_64 at 10.13 and
+  arm64 at 11.0, merges them with `lipo`, and fails unless `otool` shows the right
+  minimum OS per slice and only system libraries. CI job `macos-app` runs it and keeps
+  the unsigned bundle as an artifact.
+- The colour picker samples RizRef's own board, so it needs no screen-recording
+  permission and works unchanged.
+
+Owner decisions still open (recommendations in #24): Finder thumbnails, AVIF outside
+Windows, Developer ID signing / notarization, `.dmg` vs `.pkg`, and the 10.13 test Mac.
+Not verified on a real Mac: everything above is checked by CI on macOS 15 runners only.
+
+## Phase 08a — Portability layer + Linux (done)
 
 Branch `claude/phase-08a-portability-linux-6315f5`, part of issue #24 (phase 08:
 v1.0 on Windows, Linux and macOS together). No format change. Windows behaviour is

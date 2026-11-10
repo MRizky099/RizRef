@@ -92,9 +92,10 @@ No runtime or redistributable is needed. The C runtime is linked in, and the exe
 uses DLLs that ship with Windows.
 
 Linux (x86_64, X11 or Wayland, glibc 2.35 / Ubuntu 22.04 or newer, a **Vulkan**
-driver) builds from source as a preview; packages arrive with phase 08c. macOS 10.13+
-is in progress (see [Status](#status)). v1.0.0 will be released for all three
-platforms together.
+driver) builds from source as a preview; packages arrive with phase 08c. macOS (10.13+
+on Intel, 11.0+ on Apple Silicon, **Metal**) builds as one universal `RizRef.app`
+from source as a preview; the signed download arrives with phase 08c. v1.0.0 will
+be released for all three platforms together.
 
 ## Installation
 
@@ -189,7 +190,7 @@ needs DX12; on Vulkan it fades the whole window instead.
 |---|---|---|
 | 00–07 | Windows app: canvas, import, editing, UI shell, `.rizref` format, notes, provenance, performance, packaging | ✅ merged |
 | 08a | Portability layer + Linux (X11 + Wayland): per-OS platform glue, XDG directories, `rizref register` / `thumbnail`, CI on Windows, Linux and macOS | ✅ done ([#26](https://github.com/MRizky099/RizRef/pull/26)) |
-| 08b | macOS 10.13+ (Metal, Finder integration, ⌘ shortcuts) | 🚧 next |
+| 08b | macOS 10.13+: Metal, ⌘ shortcuts, Finder opens and the `com.rizref.board` type, window modes, universal bundle | 🚧 in review ([#27](https://github.com/MRizky099/RizRef/pull/27)) |
 | 08c | Installer + portable build for every OS, the three-platform release workflow | ⏳ after 08b |
 | **v1.0.0** | One release for Windows, Linux and macOS | ⏳ after phase 08 |
 
@@ -216,6 +217,14 @@ Packaging (portable zip + installer; the installer needs
 
 ```bash
 powershell -File packaging/package.ps1
+```
+
+On macOS, the universal app bundle (unsigned; it checks each slice's minimum OS
+and linked libraries with `otool`):
+
+```bash
+rustup target add x86_64-apple-darwin aarch64-apple-darwin
+packaging/macos/build-app.sh            # dist/macos/RizRef.app
 ```
 
 ## For developers
