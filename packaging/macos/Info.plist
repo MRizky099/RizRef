@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  RizRef.app/Contents/Info.plist. packaging/macos/build-app.sh fills in
+  @VERSION@ from the workspace version; everything else is literal.
+  - LSMinimumSystemVersion 10.13: the Intel slice is built for 10.13, the
+    Apple Silicon slice for 11.0 (the first macOS on arm64); the system
+    applies each slice's own LC_BUILD_VERSION.
+  - com.rizref.board is exported: RizRef defines the type, conforming to
+    public.data (bytes) and public.content (a document), so Finder shows the
+    document icon and opens boards with RizRef.
+  - Images are listed with LSHandlerRank Alternate: RizRef appears in
+    "Open With" and accepts images dropped on its Dock icon, without
+    claiming to be their default app.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>RizRef</string>
+	<key>CFBundleName</key>
+	<string>RizRef</string>
+	<key>CFBundleExecutable</key>
+	<string>rizref</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.rizref.RizRef</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>CFBundleIconFile</key>
+	<string>rizref</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>10.13</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.graphics-design</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>© Muhammad Rizky Abdillah (MRizky099). MIT OR Apache-2.0.</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>RizRef board</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleTypeIconFile</key>
+			<string>rizref_document</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.rizref.board</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.png</string>
+				<string>public.jpeg</string>
+				<string>com.compuserve.gif</string>
+				<string>org.webmproject.webp</string>
+				<string>com.microsoft.bmp</string>
+				<string>com.microsoft.ico</string>
+				<string>com.truevision.tga-image</string>
+				<string>public.heic</string>
+				<string>public.heif</string>
+			</array>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.rizref.board</string>
+			<key>UTTypeDescription</key>
+			<string>RizRef board</string>
+			<key>UTTypeIconFile</key>
+			<string>rizref_document</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+				<string>public.content</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>rizref</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>application/x-rizref</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>

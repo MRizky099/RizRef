@@ -104,6 +104,32 @@ jobs:
         shell: bash
         run: scripts/audit-native.sh ${{ matrix.cross }} target/${{ matrix.cross }}/debug/build
 
+  # The universal macOS bundle (phase 08b): Intel built for 10.13, Apple
+  # Silicon for 11.0, merged with lipo and checked with otool (minimum OS per
+  # slice, system libraries only), plutil and an ad-hoc codesign. The bundle
+  # is kept as an artifact for testing on real Macs; it is not a release.
+  macos-app:
+    name: macOS app bundle (universal)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and check RizRef.app
+        run: packaging/macos/build-app.sh dist/macos
+      # ditto keeps the executable bit and the signature, which a plain
+      # artifact upload of the .app folder would lose.
+      - name: Zip the bundle
+        run: ditto -c -k --keepParent dist/macos/RizRef.app dist/macos/RizRef-macos-universal-unsigned.zip
+      - name: Keep the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: RizRef-macos-universal-unsigned
+          path: dist/macos/RizRef-macos-universal-unsigned.zip
+          if-no-files-found: error
+
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest

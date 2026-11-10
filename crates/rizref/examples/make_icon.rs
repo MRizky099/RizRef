@@ -16,6 +16,12 @@
 //! ICO, which Windows has read since Vista. Pure Rust: the PNGs go through
 //! `rizref-codecs`.
 //!
+//! The same renditions, plus 512 and 1024 px, also go into
+//! `assets/rizref.icns` and `assets/rizref_document.icns` for the macOS app
+//! bundle (`CFBundleIconFile`, `CFBundleTypeIconFile`). An `.icns` is a
+//! big-endian chunk list; each chunk here holds a PNG, which Finder has read
+//! since 10.7.
+//!
 //! ```bash
 //! cargo run -p rizref --example make_icon
 //! ```
@@ -373,9 +379,19 @@ fn simplified_document(document: &Canvas, app: &Canvas) -> Canvas {
 /// Every size of one icon: `full` above `simplify_up_to`, `simple` at and
 /// below it.
 fn renditions(full: &Canvas, simple: &Canvas, simplify_up_to: u32) -> Vec<(u32, ImageBuffer)> {
+    renditions_at(full, simple, simplify_up_to, &SIZES)
+}
+
+/// [`renditions`] at an explicit list of sizes.
+fn renditions_at(
+    full: &Canvas,
+    simple: &Canvas,
+    simplify_up_to: u32,
+    sizes: &[u32],
+) -> Vec<(u32, ImageBuffer)> {
     let full = full.squared();
     let simple = simple.squared();
-    SIZES
+    sizes
         .iter()
         .map(|&size| {
             let source = if size <= simplify_up_to {
@@ -390,6 +406,44 @@ fn renditions(full: &Canvas, simple: &Canvas, simplify_up_to: u32) -> Vec<(u32, 
             (size, canvas.to_image())
         })
         .collect()
+}
+
+/// The `.icns` sizes, one PNG chunk each. The @2x chunk types (`ic11`–`ic14`)
+/// would repeat the same PNGs; AppKit picks the next larger rendition for a
+/// Retina display without them, so each image is stored once.
+const ICNS_SIZES: [u32; 7] = [16, 32, 64, 128, 256, 512, 1024];
+
+/// The `.icns` chunk type for a `side`-pixel PNG.
+fn icns_types(side: u32) -> &'static [&'static [u8; 4]] {
+    match side {
+        16 => &[b"icp4"],
+        32 => &[b"icp5"],
+        64 => &[b"icp6"],
+        128 => &[b"ic07"],
+        256 => &[b"ic08"],
+        512 => &[b"ic09"],
+        1024 => &[b"ic10"],
+        _ => &[],
+    }
+}
+
+/// An `.icns` file: `icns`, the total length, then one `type, length, PNG`
+/// chunk per type (all big-endian).
+fn icns(images: &[(u32, ImageBuffer)]) -> Vec<u8> {
+    let mut chunks = Vec::new();
+    for (side, image) in images {
+        let png = rizref_codecs::encode_png(image).expect("png");
+        for kind in icns_types(*side) {
+            chunks.extend_from_slice(*kind);
+            chunks.extend_from_slice(&(png.len() as u32 + 8).to_be_bytes());
+            chunks.extend_from_slice(&png);
+        }
+    }
+    let mut out = Vec::with_capacity(chunks.len() + 8);
+    out.extend_from_slice(b"icns");
+    out.extend_from_slice(&(chunks.len() as u32 + 8).to_be_bytes());
+    out.extend_from_slice(&chunks);
+    out
 }
 
 /// An ICO file holding each image as PNG.
@@ -526,6 +580,28 @@ fn main() {
             bytes.len(),
             images.len()
         );
+    }
+
+    let app_mac = renditions_at(
+        &app_art,
+        &magnifier(&app_art),
+        APP_SIMPLIFY_UP_TO,
+        &ICNS_SIZES,
+    );
+    let document_mac = renditions_at(
+        &document_art,
+        &simplified_document(&document_art, &app_art),
+        DOCUMENT_SIMPLIFY_UP_TO,
+        &ICNS_SIZES,
+    );
+    for (images, name) in [
+        (&app_mac, "rizref.icns"),
+        (&document_mac, "rizref_document.icns"),
+    ] {
+        let bytes = icns(images);
+        let out = assets.join(name);
+        std::fs::write(&out, &bytes).expect("write icns");
+        println!("wrote {} ({} bytes)", out.display(), bytes.len());
     }
 
     let mut args = std::env::args().skip(1);

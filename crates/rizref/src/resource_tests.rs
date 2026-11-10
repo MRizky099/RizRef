@@ -133,3 +133,72 @@ fn the_exe_resources_hold_the_app_icon_then_the_document_icon() {
             .any(|(kind, id, _)| (*kind, *id) == (RT_VERSION, 1))
     );
 }
+
+/// The macOS bundle icons `examples/make_icon.rs` writes.
+const APP_ICNS: &[u8] = include_bytes!("../assets/rizref.icns");
+const DOCUMENT_ICNS: &[u8] = include_bytes!("../assets/rizref_document.icns");
+
+/// `(type, side)` of each `.icns` chunk, checking the framing on the way.
+fn icns_chunks(icns: &[u8]) -> Vec<([u8; 4], u32)> {
+    let be = |at: usize| u32::from_be_bytes(icns[at..at + 4].try_into().expect("4 bytes"));
+    assert_eq!(&icns[..4], b"icns");
+    assert_eq!(
+        be(4) as usize,
+        icns.len(),
+        "the header length is the file length"
+    );
+    let mut chunks = Vec::new();
+    let mut at = 8;
+    while at < icns.len() {
+        let kind: [u8; 4] = icns[at..at + 4].try_into().expect("4 bytes");
+        let len = be(at + 4) as usize;
+        let png = &icns[at + 8..at + len];
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "chunk {kind:?} is a PNG");
+        chunks.push((kind, u32_at_be(png, 16)));
+        at += len;
+    }
+    assert_eq!(at, icns.len(), "chunks end exactly at the file end");
+    chunks
+}
+
+/// A PNG's IHDR width (big-endian, at byte 16).
+fn u32_at_be(bytes: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+}
+
+#[test]
+fn both_icns_files_hold_every_size_finder_asks_for() {
+    let expected: Vec<([u8; 4], u32)> = [
+        (*b"icp4", 16),
+        (*b"icp5", 32),
+        (*b"icp6", 64),
+        (*b"ic07", 128),
+        (*b"ic08", 256),
+        (*b"ic09", 512),
+        (*b"ic10", 1024),
+    ]
+    .into();
+    assert_eq!(icns_chunks(APP_ICNS), expected);
+    assert_eq!(icns_chunks(DOCUMENT_ICNS), expected);
+}
+
+#[test]
+fn the_bundle_plist_declares_the_board_type_it_opens() {
+    let plist = include_str!("../../../packaging/macos/Info.plist");
+    for needle in [
+        "<string>com.rizref.board</string>",
+        "<string>rizref</string>",
+        "<string>application/x-rizref</string>",
+        "<key>LSMinimumSystemVersion</key>\n\t<string>10.13</string>",
+        "<key>CFBundleIconFile</key>\n\t<string>rizref</string>",
+        "<string>rizref_document</string>",
+        "<string>@VERSION@</string>",
+    ] {
+        assert!(plist.contains(needle), "Info.plist lacks {needle:?}");
+    }
+    assert_eq!(
+        crate::platform::register::MIME_TYPE,
+        "application/x-rizref",
+        "the plist repeats the MIME type"
+    );
+}

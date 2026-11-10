@@ -10,7 +10,11 @@
 # checkout would make bash read a carriage return as part of every command.
 *.sh text eol=lf
 
+# The macOS bundle plist is read by plutil and pinned by a test, byte for byte.
+*.plist text eol=lf
+
 # Binary assets
 *.rizref binary
 *.png binary
 *.ico binary
+*.icns binary
