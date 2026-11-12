@@ -477,6 +477,8 @@ pub enum ShortcutId {
     ArrangeStack,
     /// Create a note.
     CreateNote,
+    /// Add a free-standing text item.
+    CreateText,
     /// Align left.
     AlignLeft,
     /// Align right.
@@ -551,7 +553,7 @@ pub enum ShortcutId {
 
 impl ShortcutId {
     /// Every shortcut, in the order the F1 overlay lists them.
-    pub const ALL: [Self; 65] = [
+    pub const ALL: [Self; 66] = [
         Self::Undo,
         Self::Redo,
         Self::SelectAll,
@@ -582,6 +584,7 @@ impl ShortcutId {
         Self::ArrangeSpread,
         Self::ArrangeStack,
         Self::CreateNote,
+        Self::CreateText,
         Self::AlignLeft,
         Self::AlignRight,
         Self::AlignTop,
@@ -652,6 +655,7 @@ impl ShortcutId {
             Self::ArrangeSpread => "Spread evenly",
             Self::ArrangeStack => "Stack",
             Self::CreateNote => "New note",
+            Self::CreateText => "Add text",
             Self::AlignLeft => "Align left",
             Self::AlignRight => "Align right",
             Self::AlignTop => "Align top",
@@ -760,6 +764,7 @@ impl ShortcutId {
             Self::ArrangeSpread => Command::ArrangeSpread,
             Self::ArrangeStack => Command::ArrangeStack,
             Self::CreateNote => Command::CreateNote,
+            Self::CreateText => Command::CreateText,
             Self::AlignLeft => Command::AlignLeft,
             Self::AlignRight => Command::AlignRight,
             Self::AlignTop => Command::AlignTop,
@@ -813,6 +818,7 @@ impl ShortcutId {
             Self::ArrangeSpread => vec![KeyChord::plain(Digit5)],
             Self::ArrangeStack => vec![KeyChord::plain(Digit6)],
             Self::CreateNote => vec![KeyChord::plain(N)],
+            Self::CreateText => vec![KeyChord::plain(T)],
             Self::AlignLeft => vec![KeyChord::ctrl_shift(Left)],
             Self::AlignRight => vec![KeyChord::ctrl_shift(Right)],
             Self::AlignTop => vec![KeyChord::ctrl_shift(Up)],

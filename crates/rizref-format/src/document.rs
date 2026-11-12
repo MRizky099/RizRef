@@ -31,7 +31,7 @@ use glam::{DVec2, Vec2};
 use rizref_codecs::{ImageBuffer, ImageFormat};
 use rizref_core::{
     Asset, AssetId, Camera, Group, GroupChild, GroupId, Item, ItemId, NoteContent, NoteFormat,
-    Rect, Scene, SceneId, Transform, clamp_wrap_width,
+    Rect, Scene, SceneId, TextSpan, TextStyle, Transform, clamp_wrap_width,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -177,6 +177,11 @@ pub struct ItemEntry {
     /// load. Absent means the note's inner box width.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrap_width: Option<f32>,
+    /// A rich text item's styled runs: `[{"start", "end", "bold", "italic",
+    /// "underline", "color": "#rrggbb"}]` over byte offsets of `text`. Kept
+    /// as raw JSON so a malformed list is reported and ignored, never fatal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spans: Option<Value>,
     /// Centre in world units.
     pub position: [f32; 2],
     /// Extent in world units.
@@ -218,6 +223,7 @@ pub const fn text_format_name(format: NoteFormat) -> &'static str {
     match format {
         NoteFormat::Plain => "plain",
         NoteFormat::Markdown => "markdown",
+        NoteFormat::Rich => "rich",
     }
 }
 
@@ -226,6 +232,7 @@ pub fn parse_text_format(name: &str) -> Option<NoteFormat> {
     match name {
         "plain" => Some(NoteFormat::Plain),
         "markdown" => Some(NoteFormat::Markdown),
+        "rich" => Some(NoteFormat::Rich),
         _ => None,
     }
 }
@@ -286,13 +293,94 @@ impl ItemEntry {
             }
             clamped
         });
+        let text = self.text.clone().unwrap_or_default();
+        let spans = match (&self.spans, format) {
+            (Some(value), NoteFormat::Rich) => parse_spans(value).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "note {} has invalid spans; its text is shown unstyled",
+                    self.id
+                ));
+                Vec::new()
+            }),
+            _ => Vec::new(),
+        };
+        let spans = rizref_core::rich::normalize(&text, spans);
         NoteContent {
-            text: self.text.clone().unwrap_or_default(),
+            text,
             format,
             background,
             wrap_width,
+            spans,
         }
     }
+}
+
+/// Serialises styled runs for the document.
+pub fn format_spans(spans: &[TextSpan]) -> Value {
+    Value::Array(
+        spans
+            .iter()
+            .map(|span| {
+                let mut entry = serde_json::Map::new();
+                entry.insert("start".into(), span.start.into());
+                entry.insert("end".into(), span.end.into());
+                for (key, on) in [
+                    ("bold", span.style.bold),
+                    ("italic", span.style.italic),
+                    ("underline", span.style.underline),
+                ] {
+                    if on {
+                        entry.insert(key.into(), Value::Bool(true));
+                    }
+                }
+                if let Some(color) = span.style.color {
+                    entry.insert("color".into(), Value::String(format_background(color)));
+                }
+                if let Some(size) = span.style.size {
+                    entry.insert("size".into(), size.into());
+                }
+                Value::Object(entry)
+            })
+            .collect(),
+    )
+}
+
+/// Parses the document's styled runs; `None` when the list is malformed.
+pub fn parse_spans(value: &Value) -> Option<Vec<TextSpan>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            let entry = entry.as_object()?;
+            let offset =
+                |key: &str| -> Option<usize> { usize::try_from(entry.get(key)?.as_u64()?).ok() };
+            let flag = |key: &str| entry.get(key).and_then(Value::as_bool).unwrap_or(false);
+            let color = match entry.get("color") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(parse_background(value.as_str()?)?),
+            };
+            let size = match entry.get("size") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let size = value
+                        .as_f64()
+                        .filter(|size| size.is_finite() && *size > 0.0)?;
+                    Some(size.round().min(f64::from(u16::MAX)) as u16)
+                }
+            };
+            Some(TextSpan {
+                start: offset("start")?,
+                end: offset("end")?,
+                style: TextStyle {
+                    bold: flag("bold"),
+                    italic: flag("italic"),
+                    underline: flag("underline"),
+                    color,
+                    size,
+                },
+            })
+        })
+        .collect()
 }
 
 /// What an item shows.
@@ -472,6 +560,10 @@ impl SceneDocument {
                         .and_then(|note| note.background)
                         .map(format_background),
                     wrap_width: note.as_ref().and_then(|note| note.wrap_width),
+                    spans: note
+                        .as_ref()
+                        .filter(|note| !note.spans.is_empty())
+                        .map(|note| format_spans(&note.spans)),
                     position: [transform.center().x, transform.center().y],
                     size: [transform.size().x, transform.size().y],
                     rotation: transform.rotation(),
@@ -818,6 +910,7 @@ mod tests {
     use rizref_codecs::ImageBuffer;
     use rizref_core::{
         Asset, AssetId, Camera, GroupChild, Item, NoteContent, NoteFormat, Scene, SceneId,
+        TextSpan, TextStyle,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -1064,6 +1157,7 @@ mod tests {
             text_format: None,
             background: None,
             wrap_width: None,
+            spans: None,
             position: [0.0, 0.0],
             size: [10.0, 10.0],
             rotation: 0.0,
@@ -1158,6 +1252,7 @@ mod tests {
             format: NoteFormat::Markdown,
             background: Some([0xfa, 0xf0, 0xe6]),
             wrap_width: Some(172.5),
+            spans: Vec::new(),
         };
         scene.item_mut(note).expect("note").set_note(&content);
         let document = SceneDocument::from_scene(&scene, "n", &Camera::default(), Vec::new());
@@ -1178,6 +1273,55 @@ mod tests {
         );
         assert_eq!(back.markdown_note_count(), 1);
         assert_eq!(back.styled_note_count(), 1);
+    }
+
+    #[test]
+    fn rich_text_spans_round_trip_and_bad_spans_only_warn() {
+        let mut scene = Scene::new(scene_id());
+        let id = scene.insert_note("", Vec2::ZERO, Vec2::new(200.0, 40.0));
+        let mut content = NoteContent::rich("bold red");
+        content.spans = vec![
+            TextSpan {
+                start: 0,
+                end: 4,
+                style: TextStyle {
+                    bold: true,
+                    underline: true,
+                    ..TextStyle::default()
+                },
+            },
+            TextSpan {
+                start: 5,
+                end: 8,
+                style: TextStyle {
+                    color: Some([0xff, 0x00, 0x00]),
+                    italic: true,
+                    size: Some(48),
+                    ..TextStyle::default()
+                },
+            },
+        ];
+        scene.item_mut(id).expect("note").set_note(&content);
+        let document = SceneDocument::from_scene(&scene, "t", &Camera::default(), Vec::new());
+        let json = String::from_utf8(document.to_json().expect("json")).expect("utf-8");
+        assert!(json.contains(r#""text_format":"rich""#), "{json}");
+        assert!(json.contains(r##""color":"#ff0000""##), "{json}");
+        assert!(json.contains(r#""size":48"#), "{json}");
+        let back = SceneDocument::from_json(json.as_bytes()).expect("parses");
+        let loaded = back
+            .build_scene(&BTreeMap::new(), &BTreeMap::new())
+            .expect("scene");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(
+            loaded.scene.item(id).and_then(Item::note_content),
+            Some(content)
+        );
+
+        let mut warnings = Vec::new();
+        let bad = note_entry(r#","text_format":"rich","spans":[{"start":"x"}]"#);
+        let content = bad.note_content(&mut warnings);
+        assert!(content.spans.is_empty() && content.is_rich());
+        assert_eq!(warnings.len(), 1);
     }
 
     #[test]

@@ -52,10 +52,13 @@ your notes and a thumbnail, all in one file you can copy anywhere.
 **Arrange**
 - Infinite canvas with smooth pan, zoom (0.5 %–3200 %) and view rotation.
 - Move, scale from the opposite corner (`Alt` scales from the centre), rotate, flip,
-  group, align, distribute, and arrange as grid, stack, spread or hierarchy.
+  group, align, distribute, and arrange as grid, stack, spread or hierarchy. Type an
+  exact size or angle with `Set size…` / `Set rotation…` in the right-click menu.
 - Snapping with smart guides, z-order, duplicate, and a full undo/redo history.
 - **Markdown notes** with headings, lists, task lists, tables, code, coloured
   `<span style>` text and LaTeX math (`$…$`, `$$…$$`), on any background colour.
+- **Text** you style as you type: bold, italic, underline, size and colour from a small
+  format bar, with no markup and no background. Drag a corner to scale the text.
 
 **Stay out of the way**
 - Frameless window with an auto-hiding title bar and button hints.
@@ -162,6 +165,7 @@ Right-click anywhere (or click **☰** in the title bar) for every command.
 | `Shift+H` / `Shift+V` | Flip | `Ctrl+G` / `Ctrl+Shift+U` | Group / ungroup |
 | `3` `4` `5` `6` | Arrange: grid, hierarchy, spread, stack | `Ctrl+Shift+Arrows` | Align |
 | `N` | New note | `I` | Colour picker |
+| `T` | Add text | `Ctrl+B` `Ctrl+I` `Ctrl+U` `Ctrl+[` `Ctrl+]` | Bold / italic / underline / smaller / larger (while typing text) |
 | `G` / `Ctrl+B` | Grid / scene boundary | `U` | Grayscale |
 | `Ctrl+Shift+T` | Always on top | `Ctrl+Shift+O` | Cycle canvas transparency |
 | `Ctrl+Shift+X` | Click-through | `Ctrl+Shift+G` | Ghost mode (works unfocused) |

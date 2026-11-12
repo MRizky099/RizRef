@@ -562,6 +562,7 @@ pub struct SetNoteContent {
     item: ItemId,
     before: NoteContent,
     after: NoteContent,
+    states: Option<(ItemState, ItemState)>,
     coalesce: bool,
 }
 
@@ -572,8 +573,17 @@ impl SetNoteContent {
             item,
             before,
             after,
+            states: None,
             coalesce: false,
         }
+    }
+
+    /// Also moves the item's placement in the same step: a text item's box
+    /// hugs its text, so an edit that adds a line grows the box with it.
+    #[must_use]
+    pub const fn with_states(mut self, before: ItemState, after: ItemState) -> Self {
+        self.states = Some((before, after));
+        self
     }
 
     /// Lets consecutive edits of the same note within the coalescing window
@@ -609,17 +619,32 @@ fn write_note(scene: &mut Scene, id: ItemId, content: &NoteContent) -> Effects {
     }
 }
 
+fn write_state(scene: &mut Scene, id: ItemId, state: ItemState, effects: &mut Effects) {
+    if let Some(item) = scene.item_mut(id) {
+        item.set_state(state);
+        effects.geometry.insert(id);
+    }
+}
+
 impl Command for SetNoteContent {
     fn label(&self) -> &str {
         "Edit note"
     }
 
     fn apply(&mut self, scene: &mut Scene) -> Effects {
-        write_note(scene, self.item, &self.after)
+        let mut effects = write_note(scene, self.item, &self.after);
+        if let Some((_, after)) = self.states {
+            write_state(scene, self.item, after, &mut effects);
+        }
+        effects
     }
 
     fn revert(&mut self, scene: &mut Scene) -> Effects {
-        write_note(scene, self.item, &self.before)
+        let mut effects = write_note(scene, self.item, &self.before);
+        if let Some((before, _)) = self.states {
+            write_state(scene, self.item, before, &mut effects);
+        }
+        effects
     }
 
     fn coalesce_key(&self) -> Option<CoalesceKey> {
@@ -634,10 +659,59 @@ impl Command for SetNoteContent {
             return false;
         }
         self.after.clone_from(&newer.after);
+        if let Some((_, after)) = newer.states {
+            let before = self.states.map_or(after, |(before, _)| before);
+            self.states = Some((before, after));
+        }
         true
     }
 
     impl_as_any!(SetNoteContent);
+}
+
+/// Several commands as one undo step: applied in order, reverted in reverse.
+///
+/// A corner drag on a text item is a placement change *and* a content change
+/// (its font sizes are baked in at the new scale); the user undoes both with
+/// one Ctrl+Z.
+#[derive(Debug)]
+pub struct Compound {
+    label: String,
+    commands: Vec<Box<dyn Command>>,
+}
+
+impl Compound {
+    /// Bundles `commands` under `label`.
+    pub fn new(label: impl Into<String>, commands: Vec<Box<dyn Command>>) -> Self {
+        Self {
+            label: label.into(),
+            commands,
+        }
+    }
+}
+
+impl Command for Compound {
+    fn label(&self) -> &str {
+        &self.label
+    }
+
+    fn apply(&mut self, scene: &mut Scene) -> Effects {
+        let mut effects = Effects::default();
+        for command in &mut self.commands {
+            effects.merge(&command.apply(scene));
+        }
+        effects
+    }
+
+    fn revert(&mut self, scene: &mut Scene) -> Effects {
+        let mut effects = Effects::default();
+        for command in self.commands.iter_mut().rev() {
+            effects.merge(&command.revert(scene));
+        }
+        effects
+    }
+
+    impl_as_any!(Compound);
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,6 +1256,7 @@ mod tests {
             format: NoteFormat::Markdown,
             background: Some([250, 250, 240]),
             wrap_width: Some(120.0),
+            spans: Vec::new(),
         };
         let mut history = History::default();
 

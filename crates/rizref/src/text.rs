@@ -119,7 +119,7 @@ impl TextEngine {
     }
 
     /// Draws a shaped buffer at `x`, `y`, blending into the pixmap.
-    fn draw_buffer(
+    pub fn draw_buffer(
         &mut self,
         pixmap: &mut Pixmap,
         buffer: &mut Buffer,
@@ -128,28 +128,14 @@ impl TextEngine {
         color: [u8; 4],
     ) {
         let tint = Color::rgba(color[0], color[1], color[2], color[3]);
-        let offset_x = x as i32;
-        let offset_y = y as i32;
-        let width = pixmap.width() as i32;
-        let height = pixmap.height() as i32;
+        let origin = (x as i32, y as i32);
+        let clip = [0, 0, pixmap.width() as i32, pixmap.height() as i32];
         buffer.draw(
             &mut self.fonts,
             &mut self.swash,
             tint,
-            |gx, gy, _, _, pixel| {
-                let px = offset_x + gx;
-                let py = offset_y + gy;
-                if px < 0 || py < 0 || px >= width || py >= height {
-                    return;
-                }
-                blend_premultiplied(
-                    pixmap.data_mut(),
-                    (py as usize * width as usize + px as usize) * 4,
-                    pixel.r(),
-                    pixel.g(),
-                    pixel.b(),
-                    pixel.a(),
-                );
+            |gx, gy, w, h, pixel| {
+                fill_blend(pixmap, origin, [gx, gy], [w, h], pixel, clip);
             },
         );
     }
@@ -171,10 +157,7 @@ impl TextEngine {
         selected_text_color: [u8; 4],
         clip: [i32; 4],
     ) {
-        let offset_x = x as i32;
-        let offset_y = y as i32;
-        let width = pixmap.width() as i32;
-        let height = pixmap.height() as i32;
+        let origin = (x as i32, y as i32);
         editor.draw(
             &mut self.fonts,
             &mut self.swash,
@@ -197,25 +180,7 @@ impl TextEngine {
                 selected_text_color[2],
                 selected_text_color[3],
             ),
-            |gx, gy, _, _, pixel| {
-                let px = offset_x + gx;
-                let py = offset_y + gy;
-                if px < clip[0].max(0)
-                    || py < clip[1].max(0)
-                    || px >= width.min(clip[2])
-                    || py >= height.min(clip[3])
-                {
-                    return;
-                }
-                blend_premultiplied(
-                    pixmap.data_mut(),
-                    (py as usize * width as usize + px as usize) * 4,
-                    pixel.r(),
-                    pixel.g(),
-                    pixel.b(),
-                    pixel.a(),
-                );
-            },
+            |gx, gy, w, h, pixel| fill_blend(pixmap, origin, [gx, gy], [w, h], pixel, clip),
         );
     }
 
@@ -302,6 +267,45 @@ impl TextEngine {
 impl Default for TextEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Blends a `size` rectangle of one colour at `at` (relative to `origin`)
+/// into the pixmap, inside `clip` (`[x0, y0, x1, y1]`).
+///
+/// cosmic-text's draw callback reports glyph coverage as 1 x 1 rectangles,
+/// but selection highlights and text decorations (underline) as wider ones;
+/// painting only their first pixel lost both.
+fn fill_blend(
+    pixmap: &mut Pixmap,
+    origin: (i32, i32),
+    at: [i32; 2],
+    size: [u32; 2],
+    color: Color,
+    clip: [i32; 4],
+) {
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let x0 = (origin.0 + at[0]).max(clip[0].max(0));
+    let y0 = (origin.1 + at[1]).max(clip[1].max(0));
+    let x1 = (origin.0 + at[0])
+        .saturating_add(size[0] as i32)
+        .min(clip[2].min(width));
+    let y1 = (origin.1 + at[1])
+        .saturating_add(size[1] as i32)
+        .min(clip[3].min(height));
+    let data = pixmap.data_mut();
+    for py in y0..y1 {
+        for px in x0..x1 {
+            blend_premultiplied(
+                data,
+                (py as usize * width as usize + px as usize) * 4,
+                color.r(),
+                color.g(),
+                color.b(),
+                color.a(),
+            );
+        }
     }
 }
 
@@ -401,6 +405,37 @@ mod tests {
 
         engine.draw_str(&mut pixmap, "zoom 100%", -4.0, 6.0, 14.0, [255, 0, 0, 255]);
         engine.draw_str(&mut pixmap, "zoom 100%", 0.0, 8.0, 14.0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rectangles_from_the_shaper_are_filled_not_dotted() {
+        // A selection highlight or underline arrives as one wide rectangle.
+        let mut pixmap = Pixmap::new(20, 10).expect("pixmap");
+        super::fill_blend(
+            &mut pixmap,
+            (2, 1),
+            [1, 2],
+            [10, 3],
+            cosmic_text::Color::rgba(255, 0, 0, 255),
+            [0, 0, 20, 10],
+        );
+        let red = pixmap
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] == 255 && p[3] == 255)
+            .count();
+        assert_eq!(red, 30);
+        // Clipped at the pixmap edge, never out of bounds.
+        super::fill_blend(
+            &mut pixmap,
+            (15, 8),
+            [0, 0],
+            [100, 100],
+            cosmic_text::Color::rgba(0, 255, 0, 255),
+            [0, 0, 20, 10],
+        );
     }
 
     #[test]

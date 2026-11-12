@@ -88,6 +88,8 @@ pub enum Command {
     ArrangeStack,
     /// `N` — create a note and start editing it.
     CreateNote,
+    /// `T` — add a text item and start typing into it.
+    CreateText,
     /// `ctrl+shift+left` — flush left.
     AlignLeft,
     /// `ctrl+shift+right` — flush right.

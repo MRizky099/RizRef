@@ -37,14 +37,16 @@ use cosmic_text::{
 };
 use glam::Vec2;
 use rizref_codecs::ImageBuffer;
-use rizref_core::{AssetId, Item, ItemId, NoteContent, NoteFormat, checksum};
+use rizref_core::{AssetId, Item, ItemId, ItemState, NoteContent, NoteFormat, checksum};
 use tiny_skia::{Color, FillRule, Paint as SkPaint, Path, PathBuilder, Pixmap, Transform};
 
 use crate::markdown::layout::{BASE_FONT_SIZE, Fill, NoteLayout, Paint, layout};
 use crate::markdown::math::MathCache;
 use crate::markdown::parse::parse;
 use crate::markdown::style::NotePalette;
+use crate::rich_text::{self, RichState, StyleToggle};
 use crate::text::TextEngine;
+use rizref_core::rich::TextStyle;
 
 /// Texture pixels per world unit for a note.
 pub const NOTE_SUPERSAMPLE: f32 = 2.0;
@@ -94,6 +96,14 @@ pub struct NoteSession {
     pixels_per_world: f32,
     provisional: bool,
     was_clean: bool,
+    /// The styled-editing state of a text item; `None` for a note.
+    rich: Option<RichState>,
+    /// The caret's last drawn rectangle in texture pixels: `[x, top,
+    /// height]`, set by every render of the session.
+    caret: Option<[f32; 3]>,
+    /// The item's placement when the session began (a text item's box
+    /// grows as it is typed into; cancel and undo put it back).
+    original_state: ItemState,
 }
 
 impl NoteSession {
@@ -109,6 +119,15 @@ impl NoteSession {
         was_clean: bool,
     ) -> Option<Self> {
         let original = item.note_content()?;
+        if original.is_rich() {
+            return Some(Self::begin_rich(
+                engine,
+                item,
+                original,
+                provisional,
+                was_clean,
+            ));
+        }
         let wrap = wrap_width(&original, item.size());
         let pixels_per_world = pixels_per_world(item.size());
         let font_size = NOTE_FONT_SIZE * pixels_per_world;
@@ -128,7 +147,239 @@ impl NoteSession {
             pixels_per_world,
             provisional,
             was_clean,
+            rich: None,
+            original_state: item.state(),
+            caret: None,
         })
+    }
+
+    /// Starts editing a text item at the scale its box shows it at (1 for a
+    /// settled item), so the glyphs sit exactly where the rendered item had
+    /// them. Lines break only at Enter.
+    fn begin_rich(
+        engine: &mut TextEngine,
+        item: &Item,
+        original: NoteContent,
+        provisional: bool,
+        was_clean: bool,
+    ) -> Self {
+        let density = pixels_per_world(item.size());
+        let natural = rich_text::natural_size(engine, &original, density);
+        // An empty item has no text to scale: its box was sized for the size
+        // about to be typed, not for the default size an empty buffer measures
+        // at (reading that as a scale made new text at 18% zoom 3.25x too big).
+        let scale = if original.text.is_empty() {
+            1.0
+        } else {
+            rich_text::scale_for(natural, item.size())
+        };
+        let pixels = density * scale;
+        let mut buffer = rich_text::new_buffer(engine, pixels);
+        rich_text::set_buffer_text(&mut buffer, &original.text, &original.spans, pixels);
+        let mut editor = Editor::new(buffer);
+        // The caret starts at the end, ready to keep typing.
+        let end = editor.with_buffer(|buffer| {
+            let line = buffer.lines.len().saturating_sub(1);
+            Cursor::new(line, buffer.lines.last().map_or(0, |l| l.text().len()))
+        });
+        editor.set_cursor(end);
+        let typing = RichState::style_at_caret(&editor, pixels);
+        let mut session = Self {
+            item: item.id(),
+            editor,
+            original,
+            wrap_width: 0.0,
+            pixels_per_world: density,
+            provisional,
+            was_clean,
+            rich: Some(RichState {
+                typing,
+                shown: typing,
+                scale,
+            }),
+            original_state: item.state(),
+            caret: None,
+        };
+        session.sync_empty_metrics();
+        session.resize(item.size());
+        session
+    }
+
+    /// Pixels per text unit: the texture density times the item's scale.
+    /// Every font size of a text item is converted with this.
+    fn text_pixels(&self) -> f32 {
+        self.pixels_per_world * self.rich.map_or(1.0, |rich| rich.scale)
+    }
+
+    /// An empty text item's single line takes the typing size, so its caret
+    /// and box are as tall as what is about to be typed; otherwise the
+    /// buffer's default size is the default text size (unstyled characters
+    /// rely on it).
+    fn sync_empty_metrics(&mut self) {
+        let Some(rich) = self.rich else {
+            return;
+        };
+        let pixels = self.text_pixels();
+        let empty = self
+            .editor
+            .with_buffer(|buffer| buffer.lines.iter().all(|line| line.text().is_empty()));
+        let size = if empty {
+            rich.typing.size_or_default()
+        } else {
+            rizref_core::DEFAULT_TEXT_SIZE
+        };
+        let font = (f32::from(size) * pixels).max(1.0);
+        let metrics = Metrics::new(font, font * rich_text::TEXT_LINE_HEIGHT);
+        self.editor
+            .with_buffer_mut(|buffer| buffer.set_metrics(metrics));
+    }
+
+    /// Whether this session edits a text item rather than a note.
+    pub const fn is_rich(&self) -> bool {
+        self.rich.is_some()
+    }
+
+    /// Sets the style a new, empty text item starts typing in.
+    pub fn set_typing(&mut self, style: TextStyle) {
+        if let Some(rich) = self.rich.as_mut() {
+            rich.typing = style;
+            rich.shown = style;
+        }
+        self.sync_empty_metrics();
+    }
+
+    /// The box a text item needs now, in world units: its text's natural box
+    /// at the session's scale. The box hugs the text while it is typed.
+    pub fn rich_size(&mut self, engine: &mut TextEngine) -> Option<Vec2> {
+        let scale = self.rich?.scale;
+        let pixels = self.text_pixels();
+        let mut editor = self.editor.borrow_with(engine.font_system_mut());
+        editor.shape_as_needed(false);
+        let natural = editor.with_buffer(|buffer| rich_text::buffer_natural(buffer, pixels));
+        Some(natural * scale)
+    }
+
+    /// The content padding in texture pixels.
+    fn padding_px(&self) -> f32 {
+        match self.rich {
+            Some(_) => rizref_core::TEXT_PADDING * self.text_pixels(),
+            None => NOTE_PADDING * self.pixels_per_world,
+        }
+    }
+
+    /// The caret as a note-local segment in world units: its top point and
+    /// its height, with `(0, 0)` the item's centre and before any mirroring.
+    /// `None` until the session has been drawn once.
+    pub fn caret_local(&self, size: Vec2) -> Option<(Vec2, f32)> {
+        let [x, top, height] = self.caret?;
+        let padding = self.padding_px();
+        let ppw = self.pixels_per_world;
+        let local = Vec2::new((padding + x) / ppw, (padding + top) / ppw) - size * 0.5;
+        Some((local, height / ppw))
+    }
+
+    /// The colour the caret of a text item is drawn in: its typing colour.
+    pub fn caret_colour(&self) -> Option<[u8; 3]> {
+        self.rich
+            .map(|rich| rich.typing.color.unwrap_or(rich_text::DEFAULT_TEXT_INK))
+    }
+
+    /// Whether any text is selected.
+    #[cfg(test)]
+    pub fn has_selection(&self) -> bool {
+        self.editor.selection_bounds().is_some()
+    }
+
+    /// The style the format toolbar shows: for a selection, a property is on
+    /// when every selected character has it (the colour and size are the
+    /// first character's); otherwise the typing style. Cached: free to call
+    /// every frame and on every pointer move.
+    pub fn display_style(&self) -> Option<TextStyle> {
+        self.rich.map(|rich| rich.shown)
+    }
+
+    /// Recomputes [`Self::display_style`] after anything that can change it.
+    fn refresh_shown(&mut self) {
+        let Some(typing) = self.rich.map(|rich| rich.typing) else {
+            return;
+        };
+        let shown = match self.selection_spans() {
+            None => typing,
+            Some((text, spans, range)) => {
+                let all = |toggle: StyleToggle| {
+                    rizref_core::rich::all_in_range(&text, &spans, range.clone(), |s| toggle.get(s))
+                };
+                let first = rizref_core::rich::style_at(&spans, range.start);
+                TextStyle {
+                    bold: all(StyleToggle::Bold),
+                    italic: all(StyleToggle::Italic),
+                    underline: all(StyleToggle::Underline),
+                    color: first.color,
+                    size: first.size,
+                }
+            }
+        };
+        if let Some(rich) = self.rich.as_mut() {
+            rich.shown = shown;
+        }
+    }
+
+    /// The joined text, its spans and the selected byte range, when there is
+    /// a selection.
+    fn selection_spans(
+        &self,
+    ) -> Option<(String, Vec<rizref_core::TextSpan>, std::ops::Range<usize>)> {
+        let (start, end) = self.editor.selection_bounds()?;
+        let pixels = self.text_pixels();
+        self.editor.with_buffer(|buffer| {
+            let (text, spans) = rich_text::buffer_content(buffer, pixels);
+            let range = rich_text::offset_of(buffer, start)..rich_text::offset_of(buffer, end);
+            (range.start < range.end).then_some((text, spans, range))
+        })
+    }
+
+    /// Restyles the selection with `change`, or, with nothing selected, the
+    /// characters typed next.
+    fn restyle(&mut self, change: impl Fn(&mut TextStyle)) {
+        let Some(rich) = self.rich.as_mut() else {
+            return;
+        };
+        change(&mut rich.typing);
+        if let Some((text, spans, range)) = self.selection_spans() {
+            let spans = rizref_core::rich::apply_style(&text, &spans, range, change);
+            let pixels = self.text_pixels();
+            self.editor
+                .with_buffer_mut(|buffer| rich_text::write_buffer_spans(buffer, &spans, pixels));
+            self.editor.set_redraw(true);
+        }
+        self.refresh_shown();
+        self.sync_empty_metrics();
+    }
+
+    /// Steps the font size of the selection (or of what is typed next) to the
+    /// next size up or down; returns the new size.
+    pub fn step_size(&mut self, larger: bool) -> Option<u16> {
+        let current = self.display_style()?.size_or_default();
+        let size = rizref_core::rich::step_text_size(current, larger);
+        let stored = rizref_core::rich::normalize_size(Some(size));
+        self.restyle(|style| style.size = stored);
+        Some(size)
+    }
+
+    /// Toggles bold, italic or underline: off when the whole selection (or
+    /// the typing style) already has it, on otherwise.
+    pub fn toggle(&mut self, toggle: StyleToggle) {
+        let Some(shown) = self.display_style() else {
+            return;
+        };
+        let on = !toggle.get(&shown);
+        self.restyle(|style| toggle.set(style, on));
+    }
+
+    /// Sets the text colour; the default ink is stored as no colour.
+    pub fn set_colour(&mut self, rgb: [u8; 3]) {
+        let colour = (rgb != rich_text::DEFAULT_TEXT_INK).then_some(rgb);
+        self.restyle(|style| style.color = colour);
     }
 
     /// The note being edited.
@@ -139,6 +390,11 @@ impl NoteSession {
     /// The content as it was when the session began.
     pub const fn original(&self) -> &NoteContent {
         &self.original
+    }
+
+    /// The item's placement as it was when the session began.
+    pub const fn original_state(&self) -> ItemState {
+        self.original_state
     }
 
     /// Whether the note was created by this session and is not in history.
@@ -164,17 +420,32 @@ impl NoteSession {
     /// The content a commit writes: the edited source as markdown, the
     /// original background, and the session's wrap width persisted.
     pub fn content(&self) -> NoteContent {
+        if self.rich.is_some() {
+            return self.live_content();
+        }
         NoteContent {
             text: self.text(),
             format: NoteFormat::Markdown,
             background: self.original.background,
             wrap_width: Some(self.wrap_width),
+            spans: Vec::new(),
         }
     }
 
     /// The content the live preview writes while typing: the original
     /// format and wrap width, so a cancelled edit leaves nothing behind.
     pub fn live_content(&self) -> NoteContent {
+        if self.rich.is_some() {
+            let pixels = self.text_pixels();
+            let (text, spans) = self
+                .editor
+                .with_buffer(|buffer| rich_text::buffer_content(buffer, pixels));
+            return NoteContent {
+                text,
+                spans,
+                ..self.original.clone()
+            };
+        }
         NoteContent {
             text: self.text(),
             ..self.original.clone()
@@ -184,6 +455,20 @@ impl NoteSession {
     /// Updates the visible height after the box was resized; the wrap width
     /// (and so every line break) is unchanged.
     pub fn resize(&mut self, size: Vec2) {
+        if self.rich.is_some() {
+            self.adapt_density(size);
+            // Text items never wrap (the box follows the text), but the
+            // buffer still gets the box's text width: a multi-line selection
+            // highlights each line out to the buffer width, and with no width
+            // every line but the last lost its highlight.
+            let width = (size.x * self.pixels_per_world - 2.0 * self.padding_px()).max(1.0);
+            self.editor.with_buffer_mut(|buffer| {
+                if buffer.size().0 != Some(width) {
+                    buffer.set_size(Some(width), None);
+                }
+            });
+            return;
+        }
         let (_, height) = text_area(size, self.pixels_per_world);
         let width = self.wrap_width * self.pixels_per_world;
         self.editor.with_buffer_mut(|buffer| {
@@ -193,9 +478,139 @@ impl NoteSession {
 
     /// Applies one editor action.
     pub fn action(&mut self, engine: &mut TextEngine, action: Action) {
+        let moves = !matches!(action, Action::Insert(_) | Action::Enter);
         self.editor
             .borrow_with(engine.font_system_mut())
             .action(action);
+        if moves {
+            self.refresh_typing();
+        } else {
+            self.refresh_shown();
+        }
+        self.sync_empty_metrics();
+    }
+
+    /// Moves the caret, extending the selection when `extend` is set (shift
+    /// held) and dropping it otherwise.
+    pub fn motion(&mut self, engine: &mut TextEngine, motion: cosmic_text::Motion, extend: bool) {
+        if extend {
+            if self.editor.selection() == TextSelection::None {
+                let cursor = self.editor.cursor();
+                self.editor.set_selection(TextSelection::Normal(cursor));
+            }
+        } else if let Some((start, end)) = self.editor.selection_bounds() {
+            // Without shift, left and right first collapse the selection to
+            // its edge, as every text field does.
+            self.editor.set_selection(TextSelection::None);
+            match motion {
+                cosmic_text::Motion::Left => {
+                    self.editor.set_cursor(start);
+                    self.refresh_typing();
+                    return;
+                }
+                cosmic_text::Motion::Right => {
+                    self.editor.set_cursor(end);
+                    self.refresh_typing();
+                    return;
+                }
+                _ => {}
+            }
+        } else {
+            self.editor.set_selection(TextSelection::None);
+        }
+        self.action(engine, Action::Motion(motion));
+    }
+
+    /// Extends the selection to a note-local pixel position (a drag).
+    pub fn drag(&mut self, engine: &mut TextEngine, x: f32, y: f32) {
+        self.action(
+            engine,
+            Action::Drag {
+                x: x.round() as i32,
+                y: y.round() as i32,
+            },
+        );
+    }
+
+    /// Selects the word at a note-local pixel position (a double-click).
+    pub fn select_word(&mut self, engine: &mut TextEngine, x: f32, y: f32) {
+        self.action(
+            engine,
+            Action::DoubleClick {
+                x: x.round() as i32,
+                y: y.round() as i32,
+            },
+        );
+    }
+
+    /// The selected text, if any.
+    pub fn selected_text(&self) -> Option<String> {
+        self.editor.copy_selection().filter(|text| !text.is_empty())
+    }
+
+    /// Removes the selection, returning whether there was one.
+    pub fn delete_selection(&mut self) -> bool {
+        let deleted = self.editor.delete_selection();
+        self.refresh_typing();
+        deleted
+    }
+
+    fn refresh_typing(&mut self) {
+        let pixels = self.text_pixels();
+        // With no characters left there is nothing to continue the style
+        // of: keep what was being typed (deleting the first letter of a new
+        // text item at 17% zoom used to drop its size back to the default,
+        // so the rest came out tiny).
+        let empty = self
+            .editor
+            .with_buffer(|buffer| buffer.lines.iter().all(|line| line.text().is_empty()));
+        if let Some(rich) = self.rich.as_mut()
+            && !empty
+        {
+            rich.typing = RichState::style_at_caret(&self.editor, pixels);
+        }
+        self.refresh_shown();
+    }
+
+    /// Re-shapes a text item at the texture density its box now needs.
+    ///
+    /// The density is capped so the texture's longest side stays within
+    /// [`NOTE_MAX_SIDE`]. A text item grows while it is typed, and at a low
+    /// zoom its type is large in world units, so it soon passes that cap:
+    /// kept at the density it started with, the texture was clipped at the
+    /// cap and stretched across the box (the typed words showed as a few
+    /// smeared letters until the edit ended).
+    fn adapt_density(&mut self, size: Vec2) {
+        if self.rich.is_none() {
+            return;
+        }
+        let target = pixels_per_world(size);
+        if (target - self.pixels_per_world).abs() <= self.pixels_per_world * 0.01 {
+            return;
+        }
+        let old = self.text_pixels();
+        let (text, spans) = self
+            .editor
+            .with_buffer(|buffer| rich_text::buffer_content(buffer, old));
+        let cursor = self.editor.cursor();
+        let selection = self.editor.selection();
+        self.pixels_per_world = target;
+        let new = self.text_pixels();
+        self.editor
+            .with_buffer_mut(|buffer| rich_text::set_buffer_text(buffer, &text, &spans, new));
+        // The text is unchanged, so the caret and selection still address
+        // the same characters.
+        self.editor.set_cursor(cursor);
+        self.editor.set_selection(selection);
+        self.sync_empty_metrics();
+    }
+
+    /// Converts a note-local world position (`(0, 0)` the centre, already
+    /// un-mirrored) into editor pixels.
+    pub fn local_to_editor(&self, local: Vec2, size: Vec2) -> (f32, f32) {
+        let padding = self.padding_px();
+        let point = (local + size * 0.5) * self.pixels_per_world - Vec2::splat(padding);
+        (point.x, point.y)
     }
 
     /// Places the caret at a note-local pixel position.
@@ -211,6 +626,10 @@ impl NoteSession {
 
     /// Inserts text, one character per action so newlines stay lines.
     pub fn insert_text(&mut self, engine: &mut TextEngine, text: &str) {
+        if let Some(rich) = self.rich {
+            self.insert_styled(engine, text, rich.typing);
+            return;
+        }
         for character in text.chars() {
             if character.is_control() && character != '\n' {
                 continue;
@@ -226,6 +645,38 @@ impl NoteSession {
         }
     }
 
+    /// Inserts text in the typing style of a text item.
+    fn insert_styled(&mut self, engine: &mut TextEngine, text: &str, style: TextStyle) {
+        if self.editor.selection_bounds().is_some() {
+            self.editor.delete_selection();
+        }
+        let attrs = rich_text::attrs_for(&style, self.text_pixels());
+        for character in text.chars() {
+            if character == '\n' {
+                self.action(engine, Action::Enter);
+                continue;
+            }
+            if character.is_control() {
+                continue;
+            }
+            let before = self.editor.cursor();
+            self.action(engine, Action::Insert(character));
+            let after = self.editor.cursor();
+            if after.line == before.line && after.index > before.index {
+                self.editor.with_buffer_mut(|buffer| {
+                    let line = &mut buffer.lines[after.line];
+                    let mut list = line.attrs_list().clone();
+                    list.add_span(before.index..after.index, &attrs);
+                    line.set_attrs_list(list);
+                });
+            }
+        }
+        if let Some(rich) = self.rich.as_mut() {
+            rich.typing = style;
+            rich.shown = style;
+        }
+    }
+
     /// Selects the whole note, so the next typed character replaces it.
     pub fn select_all(&mut self) {
         let (line, index) = self.editor.with_buffer(|buffer| {
@@ -236,6 +687,58 @@ impl NoteSession {
         self.editor
             .set_selection(TextSelection::Normal(Cursor::new(0, 0)));
         self.editor.set_cursor(Cursor::new(line, index));
+        self.refresh_shown();
+    }
+
+    /// Draws the session into `pixmap` (glyphs, selection and decorations,
+    /// but not the caret: the overlay draws that so it can blink and stays
+    /// a readable width at any zoom) and records where the caret is.
+    fn draw(
+        &mut self,
+        engine: &mut TextEngine,
+        pixmap: &mut Pixmap,
+        ink: [u8; 4],
+        selection: [u8; 4],
+        clip: [i32; 4],
+    ) {
+        let padding = self.padding_px();
+        engine.draw_editor(
+            pixmap,
+            &mut self.editor,
+            padding,
+            padding,
+            ink,
+            [0, 0, 0, 0],
+            selection,
+            ink,
+            clip,
+        );
+        // The caret is as tall as the line it is on (its largest text), so it
+        // follows the text size; on an empty line of a text item, as tall as
+        // what is about to be typed there.
+        let cursor = self.editor.cursor();
+        let typing_line = self.rich.map(|rich| {
+            f32::from(rich.typing.size_or_default())
+                * self.text_pixels()
+                * rich_text::TEXT_LINE_HEIGHT
+        });
+        self.caret = self.editor.with_buffer(|buffer| {
+            let empty = buffer
+                .lines
+                .get(cursor.line)
+                .is_some_and(|line| line.text().is_empty());
+            buffer
+                .layout_runs()
+                .filter(|run| run.line_i == cursor.line)
+                .find_map(|run| {
+                    let x = run.cursor_position(&cursor)?;
+                    let height = match typing_line {
+                        Some(typing) if empty => typing,
+                        _ => run.line_height,
+                    };
+                    Some([x, run.line_top, height])
+                })
+        });
     }
 }
 
@@ -262,7 +765,7 @@ pub fn pixels_per_world(size: Vec2) -> f32 {
 }
 
 /// The text area of a note in texture pixels.
-fn text_area(size: Vec2, pixels_per_world: f32) -> (f32, f32) {
+pub(crate) fn text_area(size: Vec2, pixels_per_world: f32) -> (f32, f32) {
     let (width, height) = texture_size(size, pixels_per_world);
     let padding = NOTE_PADDING * pixels_per_world;
     (
@@ -272,7 +775,7 @@ fn text_area(size: Vec2, pixels_per_world: f32) -> (f32, f32) {
 }
 
 /// The texture dimensions for a note of `size`.
-fn texture_size(size: Vec2, pixels_per_world: f32) -> (u32, u32) {
+pub(crate) fn texture_size(size: Vec2, pixels_per_world: f32) -> (u32, u32) {
     (
         (size.x * pixels_per_world)
             .round()
@@ -374,10 +877,16 @@ impl NoteRenderer {
         content: &NoteContent,
         size: Vec2,
     ) -> f32 {
+        if content.is_rich() {
+            let density = pixels_per_world(size);
+            let natural = rich_text::natural_size(engine, content, density);
+            return (natural.y - 2.0 * rizref_core::TEXT_PADDING)
+                * rich_text::scale_for(natural, size);
+        }
         let wrap = wrap_width(content, size);
         match content.format {
             NoteFormat::Markdown => self.layout(engine, &content.text, wrap).height,
-            NoteFormat::Plain => plain_height(engine, &content.text, wrap),
+            NoteFormat::Plain | NoteFormat::Rich => plain_height(engine, &content.text, wrap),
         }
     }
 
@@ -389,6 +898,24 @@ impl NoteRenderer {
         size: Vec2,
         session: Option<&mut NoteSession>,
     ) -> Option<ImageBuffer> {
+        if content.is_rich() {
+            return match session {
+                Some(session) => {
+                    let (width, height) = texture_size(size, session.pixels_per_world);
+                    let mut pixmap = Pixmap::new(width, height)?;
+                    let ink = rich_text::DEFAULT_TEXT_INK;
+                    session.draw(
+                        engine,
+                        &mut pixmap,
+                        [ink[0], ink[1], ink[2], 255],
+                        [0x53, 0x9b, 0xf5, 110],
+                        [0, 0, width as i32, height as i32],
+                    );
+                    ImageBuffer::from_rgba(width, height, straight_rgba(&pixmap))
+                }
+                None => rich_text::render(engine, content, size, pixels_per_world(size)),
+            };
+        }
         let colours = palette(content);
         let pixels_per_world = match &session {
             Some(session) => session.pixels_per_world,
@@ -407,18 +934,8 @@ impl NoteRenderer {
         let ink = rgba(colours.ink, 255);
 
         match (session, content.format) {
-            (Some(session), _) => engine.draw_editor(
-                &mut pixmap,
-                &mut session.editor,
-                padding,
-                padding,
-                ink,
-                rgba(colours.caret, 255),
-                colours.selection,
-                ink,
-                clip,
-            ),
-            (None, NoteFormat::Plain) => engine.draw_block(
+            (Some(session), _) => session.draw(engine, &mut pixmap, ink, colours.selection, clip),
+            (None, NoteFormat::Plain | NoteFormat::Rich) => engine.draw_block(
                 &mut pixmap,
                 &content.text,
                 padding,
@@ -803,6 +1320,9 @@ pub const NOTE_LOW_SIDE: f32 = 256.0;
 /// a note shows for the moment between appearing and its worker render
 /// arriving. Costs well under a millisecond, so it is safe on the UI thread.
 pub fn render_placeholder(content: &NoteContent, size: Vec2) -> Option<ImageBuffer> {
+    if content.is_rich() {
+        return rich_text::render_placeholder(size);
+    }
     let density = (NOTE_LOW_SIDE / size.x.max(size.y).max(1.0)).min(NOTE_SUPERSAMPLE);
     let (width, height) = texture_size(size, density);
     let mut pixmap = Pixmap::new(width, height)?;
@@ -839,7 +1359,17 @@ pub fn texture_id(content: &NoteContent, size: Vec2, pixels_per_world: f32) -> A
     bytes.push(match content.format {
         NoteFormat::Plain => 0,
         NoteFormat::Markdown => 1,
+        NoteFormat::Rich => 2,
     });
+    for span in &content.spans {
+        bytes.extend_from_slice(&(span.start as u64).to_le_bytes());
+        bytes.extend_from_slice(&(span.end as u64).to_le_bytes());
+        let style = span.style;
+        bytes.push(
+            u8::from(style.bold) | (u8::from(style.italic) << 1) | (u8::from(style.underline) << 2),
+        );
+        bytes.extend_from_slice(&style.color.map_or([0; 4], |[r, g, b]| [1, r, g, b]));
+    }
     bytes.extend_from_slice(&content.background_or_default());
     bytes.extend_from_slice(&wrap_width(content, size).to_bits().to_le_bytes());
     bytes.extend_from_slice(&size.x.to_bits().to_le_bytes());
@@ -964,7 +1494,7 @@ fn rounded_rect(rect: tiny_skia::Rect, radius: f32) -> Option<Path> {
 /// Through a table of every `(alpha, channel)` result, built once: the
 /// per-channel division cost 17 ms on a 626 x 2048 note. The table holds the
 /// exact rounded quotient, so the output is unchanged.
-fn straight_rgba(pixmap: &Pixmap) -> Vec<u8> {
+pub(crate) fn straight_rgba(pixmap: &Pixmap) -> Vec<u8> {
     static TABLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| {
         let mut table = vec![0_u8; 256 * 256];
@@ -981,6 +1511,18 @@ fn straight_rgba(pixmap: &Pixmap) -> Vec<u8> {
     // the previous output without a lookup.
     let (mut last_in, mut last_out) = ([0_u8; 4], [0_u8; 4]);
     for pixel in out.as_chunks_mut::<4>().0 {
+        // Opaque pixels are already straight, and a transparent text item
+        // is mostly empty pixels: both skip the cache and the table.
+        match pixel[3] {
+            255 => continue,
+            0 => {
+                if pixel[..3] != [0, 0, 0] {
+                    pixel[..3].fill(0);
+                }
+                continue;
+            }
+            _ => {}
+        }
         if *pixel == last_in {
             *pixel = last_out;
             continue;
@@ -1003,7 +1545,9 @@ fn straight_rgba(pixmap: &Pixmap) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NOTE_PADDING, NoteRenderer, NoteSession, pixels_per_world, texture_id};
+    use super::{
+        NOTE_MAX_SIDE, NOTE_PADDING, NoteRenderer, NoteSession, pixels_per_world, texture_id,
+    };
     use crate::markdown::style::{DARK_INK, LIGHT_INK};
     use crate::text::TextEngine;
     use cosmic_text::Action;
@@ -1329,16 +1873,14 @@ mod tests {
         let item = note("");
         let mut session = NoteSession::begin(&mut engine, &item, true, false).expect("a note");
 
+        let size = Vec2::new(200.0, 120.0);
+        assert_eq!(session.caret_local(size), None, "not drawn yet");
         let image = renderer
-            .render(
-                &mut engine,
-                &content("", None),
-                Vec2::new(200.0, 120.0),
-                Some(&mut session),
-            )
+            .render(&mut engine, &content("", None), size, Some(&mut session))
             .expect("renders");
 
-        // The caret uses the warm accent on the dark default card.
+        // The caret is not baked into the texture (the overlay draws it, so
+        // it can blink): no warm accent pixels at the text origin.
         let padding = (NOTE_PADDING * session.pixels_per_world()) as usize;
         let width = image.width() as usize;
         let mut warm = 0;
@@ -1351,7 +1893,407 @@ mod tests {
                 }
             }
         }
-        assert!(warm > 0, "the caret is visible at the text origin");
+        assert_eq!(warm, 0, "the texture holds no caret");
+
+        // Instead the session reports where it is: at the text origin, one
+        // line tall, in note-local world units.
+        let (top, height) = session.caret_local(size).expect("drawn");
+        let origin = Vec2::splat(NOTE_PADDING) - size * 0.5;
+        assert!((top - origin).length() < 1.0, "{top:?} vs {origin:?}");
+        assert!(height > 15.0 && height < 30.0, "{height}");
+    }
+
+    /// A text item whose box is its text's natural size (scale 1).
+    fn rich_item(text: &str) -> Item {
+        let mut engine = TextEngine::new();
+        let content = NoteContent::rich(text);
+        let size = crate::rich_text::natural_size(&mut engine, &content, 2.0);
+        Item::note_with(ItemId::from_raw(5), content, Vec2::ZERO, size)
+    }
+
+    #[test]
+    fn a_text_session_styles_the_selection_and_the_typing() {
+        use crate::rich_text::StyleToggle;
+        let mut engine = TextEngine::new();
+        let item = rich_item("hello");
+        let mut session = NoteSession::begin(&mut engine, &item, false, true).expect("rich");
+        assert!(session.is_rich());
+
+        // Nothing selected: bold applies to what is typed next.
+        session.toggle(StyleToggle::Bold);
+        assert!(session.display_style().expect("rich").bold);
+        session.insert_text(&mut engine, " world");
+        let content = session.content();
+        assert_eq!(content.text, "hello world");
+        assert_eq!(content.format, NoteFormat::Rich);
+        assert_eq!(content.spans.len(), 1);
+        assert_eq!((content.spans[0].start, content.spans[0].end), (5, 11));
+        assert!(content.spans[0].style.bold);
+
+        // Select everything, underline and colour it.
+        session.select_all();
+        session.toggle(StyleToggle::Underline);
+        session.set_colour([255, 0, 0]);
+        let content = session.content();
+        assert!(
+            content
+                .spans
+                .iter()
+                .all(|s| s.style.underline && s.style.color == Some([255, 0, 0]))
+        );
+        assert_eq!(content.spans.first().map(|s| s.start), Some(0));
+        assert_eq!(content.spans.last().map(|s| s.end), Some(11));
+        // Mixed bold: the toolbar shows bold off, and a toggle makes it all bold.
+        assert!(!session.display_style().expect("rich").bold);
+        session.toggle(StyleToggle::Bold);
+        assert!(session.content().spans.iter().all(|s| s.style.bold));
+        session.toggle(StyleToggle::Bold);
+        assert!(session.content().spans.iter().all(|s| !s.style.bold));
+    }
+
+    #[test]
+    fn toggles_turn_off_again_across_several_lines() {
+        use crate::rich_text::StyleToggle;
+        let mut engine = TextEngine::new();
+        let item = rich_item("Roses are red,\nRoses are blue");
+        let mut session = NoteSession::begin(&mut engine, &item, false, true).expect("rich");
+        session.select_all();
+        for toggle in [
+            StyleToggle::Bold,
+            StyleToggle::Italic,
+            StyleToggle::Underline,
+        ] {
+            session.toggle(toggle);
+            assert!(
+                toggle.get(&session.display_style().expect("rich")),
+                "{toggle:?} on"
+            );
+            assert!(
+                session.content().spans.iter().all(|s| toggle.get(&s.style)),
+                "{toggle:?} on everywhere"
+            );
+            session.toggle(toggle);
+            assert!(
+                !toggle.get(&session.display_style().expect("rich")),
+                "{toggle:?} off"
+            );
+            assert!(
+                session
+                    .content()
+                    .spans
+                    .iter()
+                    .all(|s| !toggle.get(&s.style)),
+                "{toggle:?} off everywhere"
+            );
+        }
+        assert!(session.content().spans.is_empty());
+    }
+
+    #[test]
+    fn shift_motion_selects_and_a_plain_motion_collapses() {
+        use cosmic_text::Motion;
+        let mut engine = TextEngine::new();
+        let item = rich_item("abc");
+        let mut session = NoteSession::begin(&mut engine, &item, false, true).expect("rich");
+        session.motion(&mut engine, Motion::Left, true);
+        session.motion(&mut engine, Motion::Left, true);
+        assert_eq!(session.selected_text().as_deref(), Some("bc"));
+        session.motion(&mut engine, Motion::Left, false);
+        assert!(!session.has_selection());
+        session.insert_text(&mut engine, "X");
+        assert_eq!(session.text(), "aXbc");
+    }
+
+    #[test]
+    fn a_text_item_renders_without_a_card_while_editing() {
+        let mut engine = TextEngine::new();
+        let mut renderer = NoteRenderer::new();
+        let item = rich_item("Text");
+        let mut session = NoteSession::begin(&mut engine, &item, false, true).expect("rich");
+        let content = item.note_content().expect("note");
+        let image = renderer
+            .render(&mut engine, &content, item.size(), Some(&mut session))
+            .expect("renders");
+        assert_eq!(image.pixels()[3], 0, "transparent corner");
+        assert!(session.caret_local(item.size()).is_some());
+        assert!(session.caret_colour().is_some());
+    }
+
+    #[test]
+    fn the_box_hugs_the_text_while_typing_and_a_size_step_restyles_the_selection() {
+        let mut engine = TextEngine::new();
+        let item = rich_item("");
+        let mut session = NoteSession::begin(&mut engine, &item, true, false).expect("rich");
+        let empty = session.rich_size(&mut engine).expect("rich");
+        assert!((empty - item.size()).abs().max_element() < 1.0, "{empty}");
+        session.insert_text(&mut engine, "one two three");
+        let one_line = session.rich_size(&mut engine).expect("rich");
+        assert!(one_line.x > empty.x * 3.0, "grows to the right: {one_line}");
+        assert!((one_line.y - empty.y).abs() < 1.0);
+        session.insert_text(&mut engine, "\nfour\nfive");
+        let three = session.rich_size(&mut engine).expect("rich");
+        assert!(three.y > one_line.y * 2.0 && (three.x - one_line.x).abs() < 1.0);
+
+        session.select_all();
+        assert_eq!(session.step_size(true), Some(28));
+        let content = session.content();
+        assert!(content.spans.iter().all(|s| s.style.size == Some(28)));
+        assert_eq!(session.display_style().and_then(|s| s.size), Some(28));
+        // Bigger type, bigger box both ways.
+        let bigger = session.rich_size(&mut engine).expect("rich");
+        assert!(bigger.x > three.x && bigger.y > three.y);
+        // Deleting shrinks it back.
+        session.select_all();
+        session.insert_text(&mut engine, "x");
+        assert!(session.rich_size(&mut engine).expect("rich").x < one_line.x);
+    }
+
+    /// What the app does after every keystroke: the box follows the text,
+    /// then the edited item renders with the session.
+    fn type_and_render(
+        engine: &mut TextEngine,
+        renderer: &mut NoteRenderer,
+        session: &mut NoteSession,
+        text: &str,
+    ) -> (Vec2, ImageBuffer) {
+        session.insert_text(engine, text);
+        let size = session.rich_size(engine).expect("rich");
+        session.resize(size);
+        let content = session.live_content();
+        let image = renderer
+            .render(engine, &content, size, Some(session))
+            .expect("renders");
+        (size, image)
+    }
+
+    #[test]
+    fn large_type_grown_past_the_texture_cap_is_not_clipped_or_stretched() {
+        // The video's case: Add text at 17% zoom types at ~141 world units,
+        // so a line of 21 letters is several thousand units wide.
+        let mut engine = TextEngine::new();
+        let mut renderer = NoteRenderer::new();
+        let item = rich_item("");
+        let mut session = NoteSession::begin(&mut engine, &item, true, false).expect("rich");
+        session.set_typing(rizref_core::TextStyle {
+            size: Some(141),
+            ..rizref_core::TextStyle::default()
+        });
+        let mut last = None;
+        for letter in "abcdefghijklmnopqrstu".chars() {
+            last = Some(type_and_render(
+                &mut engine,
+                &mut renderer,
+                &mut session,
+                &letter.to_string(),
+            ));
+        }
+        let (size, image) = last.expect("typed");
+        assert!(
+            size.x * 2.0 > NOTE_MAX_SIDE,
+            "past the cap at density 2: {size}"
+        );
+        // The texture has the box's proportions (not clipped on one axis).
+        let texture = image.width() as f32 / image.height() as f32;
+        assert!(
+            (texture - size.x / size.y).abs() / (size.x / size.y) < 0.02,
+            "texture {}x{} for box {size}",
+            image.width(),
+            image.height()
+        );
+        // And the ink reaches the far end: the last letters are drawn.
+        let width = image.width() as usize;
+        let rightmost = image
+            .pixels()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p[3] > 128)
+            .map(|(i, _)| i % width)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            rightmost as f32 > width as f32 * 0.9,
+            "ink ends at {rightmost} of {width}"
+        );
+        assert_eq!(session.content().text, "abcdefghijklmnopqrstu");
+        assert!(
+            session
+                .content()
+                .spans
+                .iter()
+                .all(|span| span.style.size == Some(141))
+        );
+    }
+
+    #[test]
+    fn a_new_text_item_at_low_zoom_types_at_its_size_not_scaled_up() {
+        // Add text at 18% zoom: the app sizes the empty box for 133-unit
+        // type and sets that as the typing size.
+        let mut engine = TextEngine::new();
+        let item = Item::note_with(
+            ItemId::from_raw(6),
+            NoteContent::rich(""),
+            Vec2::ZERO,
+            crate::rich_text::new_box(133),
+        );
+        let mut session = NoteSession::begin(&mut engine, &item, true, false).expect("rich");
+        session.set_typing(rizref_core::TextStyle {
+            size: Some(133),
+            ..rizref_core::TextStyle::default()
+        });
+        let empty = session.rich_size(&mut engine).expect("rich");
+        assert!(
+            (empty - item.size()).abs().max_element() < 1.0,
+            "{empty} vs {}",
+            item.size()
+        );
+        session.insert_text(&mut engine, "abc");
+        let size = session.rich_size(&mut engine).expect("rich");
+        let one_line = 133.0 * crate::rich_text::TEXT_LINE_HEIGHT + 2.0 * rizref_core::TEXT_PADDING;
+        assert!((size.y - one_line).abs() < 2.0, "{size} vs {one_line}");
+        assert!(
+            session
+                .content()
+                .spans
+                .iter()
+                .all(|span| span.style.size == Some(133))
+        );
+    }
+
+    #[test]
+    fn deleting_back_to_empty_keeps_the_typing_size() {
+        let mut engine = TextEngine::new();
+        let item = rich_item("");
+        let mut session = NoteSession::begin(&mut engine, &item, true, false).expect("rich");
+        session.set_typing(rizref_core::TextStyle {
+            size: Some(141),
+            bold: true,
+            ..rizref_core::TextStyle::default()
+        });
+        session.insert_text(&mut engine, "h");
+        session.action(&mut engine, Action::Backspace);
+        assert_eq!(session.text(), "");
+        session.insert_text(&mut engine, "abc");
+        let spans = session.content().spans;
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].style.size, Some(141));
+        assert!(spans[0].style.bold);
+    }
+
+    #[test]
+    fn select_all_highlights_every_line_of_a_text_item() {
+        let mut engine = TextEngine::new();
+        let mut renderer = NoteRenderer::new();
+        let item = rich_item("first line\nsecond");
+        let mut session = NoteSession::begin(&mut engine, &item, false, true).expect("rich");
+        session.select_all();
+        let image = renderer
+            .render(
+                &mut engine,
+                &item.note_content().expect("text"),
+                item.size(),
+                Some(&mut session),
+            )
+            .expect("renders");
+        // The highlight is a translucent blue; count it in each half.
+        let width = image.width() as usize;
+        let half = image.height() as usize / 2;
+        let highlighted = |rows: std::ops::Range<usize>| {
+            rows.flat_map(|y| (0..width).map(move |x| (y * width + x) * 4))
+                .filter(|&i| {
+                    let p = &image.pixels()[i..i + 4];
+                    p[3] > 60 && p[3] < 200 && p[2] > p[0]
+                })
+                .count()
+        };
+        assert!(highlighted(0..half) > 200, "first line highlighted");
+        assert!(highlighted(half..2 * half) > 200, "second line highlighted");
+    }
+
+    #[test]
+    fn the_caret_is_as_tall_as_the_text_it_is_in() {
+        let mut engine = TextEngine::new();
+        let mut renderer = NoteRenderer::new();
+        let item = rich_item("");
+        let mut session = NoteSession::begin(&mut engine, &item, true, false).expect("rich");
+        let mut caret_height = |session: &mut NoteSession, engine: &mut TextEngine| {
+            let content = session.live_content();
+            let size = session.rich_size(engine).expect("rich");
+            renderer
+                .render(engine, &content, size, Some(session))
+                .expect("renders");
+            session.caret_local(size).expect("drawn").1
+        };
+        session.insert_text(&mut engine, "small");
+        let small = caret_height(&mut session, &mut engine);
+        session.select_all();
+        for _ in 0..4 {
+            session.step_size(true);
+        }
+        session.motion(&mut engine, cosmic_text::Motion::End, false);
+        let big = caret_height(&mut session, &mut engine);
+        assert!(big > small * 1.5, "{big} vs {small}");
+        // An empty item takes the typing size before anything is typed.
+        let empty = rich_item("");
+        let mut fresh = NoteSession::begin(&mut engine, &empty, true, false).expect("rich");
+        fresh.set_typing(rizref_core::TextStyle {
+            size: Some(72),
+            ..rizref_core::TextStyle::default()
+        });
+        let tall = caret_height(&mut fresh, &mut engine);
+        assert!(tall > 72.0, "{tall}");
+    }
+
+    /// What one keystroke into a text item costs on the UI thread: the edit,
+    /// reading the content back, measuring the box and re-rendering. Run
+    /// with `cargo test -p rizref --release -- --ignored --nocapture
+    /// text_keystroke_budget`.
+    #[test]
+    #[ignore = "a timing report, not a correctness check"]
+    fn text_keystroke_budget() {
+        use std::time::Instant;
+        let mut engine = TextEngine::new();
+        let mut renderer = NoteRenderer::new();
+        let mut item = rich_item("");
+        let mut transform = item.transform();
+        transform.set_size(Vec2::new(600.0, 400.0));
+        item.set_transform(transform);
+        let mut session = NoteSession::begin(&mut engine, &item, false, true).expect("rich");
+        let sentence = "The quick brown fox jumps over the lazy dog. ";
+        let mut worst = std::time::Duration::ZERO;
+        let mut total = std::time::Duration::ZERO;
+        let mut parts = [std::time::Duration::ZERO; 4];
+        let mut count = 0;
+        for character in sentence.repeat(6).chars() {
+            let start = Instant::now();
+            session.insert_text(&mut engine, &character.to_string());
+            let edited = Instant::now();
+            let content = session.live_content();
+            let _ = session.display_style();
+            let read = Instant::now();
+            let size = session.rich_size(&mut engine).expect("rich");
+            session.resize(size);
+            let measured = Instant::now();
+            renderer.render(&mut engine, &content, size, Some(&mut session));
+            let done = Instant::now();
+            parts[0] += edited - start;
+            parts[1] += read - edited;
+            parts[2] += measured - read;
+            parts[3] += done - measured;
+            let spent = done - start;
+            worst = worst.max(spent);
+            total += spent;
+            count += 1;
+        }
+        println!(
+            "text keystroke: mean {:?}, worst {worst:?} over {count} keys;              edit {:?}, read back {:?}, measure {:?}, render {:?}",
+            total / count,
+            parts[0] / count,
+            parts[1] / count,
+            parts[2] / count,
+            parts[3] / count,
+        );
     }
 
     /// The note budgets (phase 06a, met in phase 07), measured rather than

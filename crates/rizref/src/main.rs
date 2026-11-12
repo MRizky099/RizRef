@@ -58,6 +58,7 @@ mod resource_tests;
 #[cfg(test)]
 #[path = "../resources.rs"]
 mod resources;
+mod rich_text;
 mod settings;
 mod shortcuts;
 mod text;

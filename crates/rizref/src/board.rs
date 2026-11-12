@@ -137,6 +137,9 @@ enum Gesture {
         single: bool,
         /// Whether a note is being scaled: notes resize freely by default.
         has_note: bool,
+        /// Whether a text item is scaled: its box is its text, so the drag
+        /// always keeps the ratio and the text grows or shrinks with it.
+        has_text: bool,
         start_screen: DVec2,
         moved: bool,
     },
@@ -151,6 +154,37 @@ enum Gesture {
         start_world: Vec2,
         base: BTreeSet<ItemId>,
     },
+}
+
+/// The selection's size and angle, as the size and rotation dialog shows
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SelectionGeometry {
+    /// One item's own box, or several items' bounding box.
+    pub size: Vec2,
+    /// The angle every rotatable item shares, in radians.
+    pub rotation: Option<f32>,
+    /// Whether exactly one item is selected.
+    pub single: bool,
+    /// Whether the selection holds a text item (its size keeps its aspect).
+    pub text: bool,
+    /// Whether anything in the selection can be turned.
+    pub rotatable: bool,
+}
+
+/// An angle in degrees as the user reads it: in `(-180, 180]`, to a tenth
+/// of a degree.
+pub fn angle_degrees(radians: f32) -> f32 {
+    let mut degrees = radians.to_degrees().rem_euclid(360.0);
+    if degrees > 180.0 {
+        degrees -= 360.0;
+    }
+    let rounded = (degrees * 10.0).round() / 10.0;
+    if rounded <= -180.0 {
+        180.0
+    } else {
+        rounded + 0.0
+    }
 }
 
 /// The editing controller for one board.
@@ -526,8 +560,136 @@ impl Board {
                     asset.pixel_height() as f32,
                 ))
             }
+            // A text item's box is sized to its text: reset keeps it.
+            rizref_core::ItemBody::Note {
+                format: NoteFormat::Rich,
+                ..
+            } => Some(item.size()),
             rizref_core::ItemBody::Note { .. } => Some(DEFAULT_NOTE_SIZE),
         }
+    }
+
+    /// What the size and rotation dialog shows for the selection: one item's
+    /// own size and angle, or several items' bounding box and their shared
+    /// angle (`None` when they differ or nothing in it turns).
+    pub fn selection_geometry(&self) -> Option<SelectionGeometry> {
+        let states = self.selected_states();
+        let items: Vec<&Item> = states
+            .iter()
+            .filter_map(|(id, _)| self.scene.item(*id))
+            .collect();
+        let text = items.iter().any(|item| item.is_rich_text());
+        let rotatable: Vec<f32> = items
+            .iter()
+            .filter(|item| item.is_rotatable())
+            .map(|item| item.rotation())
+            .collect();
+        let rotation = rotatable.first().copied().filter(|first| {
+            rotatable
+                .iter()
+                .all(|angle| angle_degrees(*angle) == angle_degrees(*first))
+        });
+        let size = match states.as_slice() {
+            [] => return None,
+            [(_, state)] => state.transform.size(),
+            _ => {
+                let bounds = self.selection_bounds()?;
+                Vec2::new(bounds.width(), bounds.height())
+            }
+        };
+        Some(SelectionGeometry {
+            size,
+            rotation,
+            single: states.len() == 1,
+            text,
+            rotatable: !rotatable.is_empty(),
+        })
+    }
+
+    /// Resizes the selection to `size` world units as one undo step: one
+    /// item's own box (about its centre), or several items scaled about
+    /// their bounding box's centre. A text item's font sizes follow its box.
+    pub fn set_selection_size(&mut self, size: Vec2) -> bool {
+        let Some(geometry) = self.selection_geometry() else {
+            return false;
+        };
+        if !(size.x.is_finite() && size.y.is_finite()) || size.x <= 0.0 || size.y <= 0.0 {
+            return false;
+        }
+        let before = self.selected_states();
+        let after: Vec<(ItemId, ItemState)> = if geometry.single {
+            before
+                .iter()
+                .map(|(id, state)| {
+                    let mut transform = state.transform;
+                    transform.set_size(size);
+                    (
+                        *id,
+                        ItemState {
+                            transform,
+                            ..*state
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            let Some(bounds) = self.selection_bounds() else {
+                return false;
+            };
+            let factors = size / geometry.size.max(Vec2::splat(1.0e-3));
+            let pivot = bounds.center();
+            before
+                .iter()
+                .map(|(id, state)| {
+                    (
+                        *id,
+                        ItemState {
+                            transform: state.transform.scaled_about(pivot, factors),
+                            ..*state
+                        },
+                    )
+                })
+                .collect()
+        };
+        if after == before {
+            return false;
+        }
+        let baked = self.baked_text_sizes(&before, &after);
+        let resize = Box::new(SetTransforms::new("Set size", before, after));
+        if baked.is_empty() {
+            self.run(resize);
+        } else {
+            let mut commands: Vec<Box<dyn rizref_core::Command>> = vec![resize];
+            commands.extend(baked);
+            self.run(Box::new(rizref_core::Compound::new("Set size", commands)));
+        }
+        true
+    }
+
+    /// Turns every rotatable selected item to `radians` about its own
+    /// centre, as one undo step. Note cards stay upright.
+    pub fn set_selection_rotation(&mut self, radians: f32) -> bool {
+        if !radians.is_finite() {
+            return false;
+        }
+        let after: Vec<(ItemId, ItemState)> = self
+            .selected_states()
+            .into_iter()
+            .filter(|(id, state)| {
+                self.scene.item(*id).is_some_and(Item::is_rotatable)
+                    && state.transform.rotation() != radians
+            })
+            .map(|(id, state)| {
+                let mut transform = state.transform;
+                transform.set_rotation(radians);
+                (id, ItemState { transform, ..state })
+            })
+            .collect();
+        if after.is_empty() {
+            return false;
+        }
+        self.run(Box::new(SetTransforms::from_after("Set rotation", after)));
+        true
     }
 
     /// Gives every selected item the selection's largest width or height.
@@ -785,6 +947,19 @@ impl Board {
         id
     }
 
+    /// Creates an empty text item of `size` (its natural box at the chosen
+    /// scale), selects it and returns its id — provisional, like a new note.
+    pub fn create_provisional_text(&mut self, center: Vec2, size: Vec2) -> ItemId {
+        let id = self.scene.allocate_item_id();
+        let item = Item::note_with(id, NoteContent::rich(""), center, size);
+        let top = self.scene.items().len();
+        self.scene.insert_item_at(top, item);
+        self.pending.added.insert(id);
+        self.pending.content.insert(id);
+        self.selection.set_single(id);
+        id
+    }
+
     /// Removes a provisional note without touching the history.
     pub fn discard_provisional_note(&mut self, id: ItemId) -> bool {
         if self.scene.remove(id).is_none() {
@@ -809,8 +984,13 @@ impl Board {
         if content.text.trim().is_empty() {
             return false;
         }
+        let label = if content.is_rich() {
+            "Add text"
+        } else {
+            "Add note"
+        };
         item.set_note(content);
-        self.run(Box::new(AddItems::on_top("Add note", vec![item])));
+        self.run(Box::new(AddItems::on_top(label, vec![item])));
         self.selection.set_single(id);
         true
     }
@@ -830,6 +1010,54 @@ impl Board {
     /// Restores a note's pre-edit content outside the history (cancel).
     pub fn restore_note(&mut self, id: ItemId, content: &NoteContent) -> bool {
         self.set_note_live(id, content)
+    }
+
+    /// Sets an item's box size during an edit session, outside the history,
+    /// keeping its top-left corner where it is: a text item grows to the
+    /// right and down as it is typed into.
+    pub fn set_box_live(&mut self, id: ItemId, size: Vec2) -> bool {
+        let Some(item) = self.scene.item(id) else {
+            return false;
+        };
+        let mut state = item.state();
+        let old = state.transform.size();
+        if (old - size).abs().max_element() < 1.0e-3 {
+            return false;
+        }
+        let (sin, cos) = state.transform.rotation().sin_cos();
+        let right = Vec2::new(cos, sin) * if state.flip_x { -1.0 } else { 1.0 };
+        let down = Vec2::new(-sin, cos) * if state.flip_y { -1.0 } else { 1.0 };
+        let delta = (size - old) * 0.5;
+        state
+            .transform
+            .set_center(state.transform.center() + right * delta.x + down * delta.y);
+        state.transform.set_size(size);
+        self.apply_states(&[(id, state)]);
+        true
+    }
+
+    /// Commits a text item's edit session as one undo step: its content and
+    /// the box that grew with it.
+    pub fn commit_text(
+        &mut self,
+        id: ItemId,
+        before: (&NoteContent, ItemState),
+        after: (&NoteContent, ItemState),
+    ) -> bool {
+        if before.0 == after.0 && before.1 == after.1 {
+            return false;
+        }
+        self.run(Box::new(
+            SetNoteContent::new(id, before.0.clone(), after.0.clone())
+                .with_states(before.1, after.1),
+        ));
+        true
+    }
+
+    /// Restores an item's placement outside the history (a cancelled text
+    /// edit puts its box back).
+    pub fn restore_state(&mut self, id: ItemId, state: ItemState) {
+        self.apply_states(&[(id, state)]);
     }
 
     /// Commits an edit session as one undo step.
@@ -884,6 +1112,10 @@ impl Board {
         let Some(mut content) = item.note_content() else {
             return false;
         };
+        if content.is_rich() {
+            // Text breaks only where the author pressed Enter.
+            return false;
+        }
         content.wrap_width = Some(rizref_core::inner_note_width(item.size().x));
         if content.format == NoteFormat::Plain {
             content.format = NoteFormat::Markdown;
@@ -931,18 +1163,18 @@ impl Board {
         let radius = view.pixels_to_world(HANDLE_PIXELS);
         self.frame().is_some_and(|frame| {
             frame
-                .hit(world, radius, rotate_offset)
+                .hit_with(world, radius, rotate_offset, self.selection_corners_only())
                 .is_some_and(|handle| handle != Handle::Rotate || self.selection_rotatable())
         })
     }
 
     /// Whether the selection has anything the rotate gesture may turn.
-    /// Notes are never rotated, so a note-only selection has no rotate
-    /// handle.
+    /// Note cards are never rotated, so a note-only selection has no rotate
+    /// handle; images and text items turn.
     pub fn selection_rotatable(&self) -> bool {
         self.selection
             .iter()
-            .any(|id| self.scene.item(id).is_some_and(|item| !item.is_note()))
+            .any(|id| self.scene.item(id).is_some_and(Item::is_rotatable))
     }
 
     // -----------------------------------------------------------------------
@@ -976,7 +1208,7 @@ impl Board {
 
         if let Some(frame) = self.frame()
             && let Some(handle) = frame
-                .hit(world, radius, rotate_offset)
+                .hit_with(world, radius, rotate_offset, self.selection_corners_only())
                 .filter(|handle| *handle != Handle::Rotate || self.selection_rotatable())
         {
             let before = self.selected_states();
@@ -991,6 +1223,8 @@ impl Board {
                     moved: false,
                 }
             } else {
+                // Notes and text boxes resize freely: their text wraps to
+                // the new box instead of being stretched.
                 let has_note = before
                     .iter()
                     .any(|(id, _)| self.scene.item(*id).is_some_and(Item::is_note));
@@ -1000,6 +1234,7 @@ impl Board {
                     before,
                     single: self.selection.len() == 1,
                     has_note,
+                    has_text: self.selection_corners_only(),
                     start_screen: screen,
                     moved: false,
                 }
@@ -1104,6 +1339,7 @@ impl Board {
                 before,
                 single,
                 has_note,
+                has_text,
                 start_screen,
                 moved,
             } => {
@@ -1113,6 +1349,7 @@ impl Board {
                 if *moved {
                     let (keep_aspect, pivot) =
                         scale_rules(*handle, mods.alt, mods.shift, *has_note);
+                    let keep_aspect = keep_aspect || *has_text;
                     let states: Vec<(ItemId, ItemState)> = if *single {
                         before
                             .iter()
@@ -1180,13 +1417,13 @@ impl Board {
                     } else {
                         *accumulated
                     };
-                    // Notes are never rotated: in a mixed selection they
-                    // keep their exact state while the images turn.
+                    // Note cards are never rotated: in a mixed selection
+                    // they keep their exact state while images and text turn.
                     let states: Vec<(ItemId, ItemState)> = before
                         .iter()
                         .map(|(id, state)| {
-                            let note = self.scene.item(*id).is_some_and(Item::is_note);
-                            let transform = if note {
+                            let fixed = !self.scene.item(*id).is_some_and(Item::is_rotatable);
+                            let transform = if fixed {
                                 state.transform
                             } else {
                                 state.transform.rotated_about(*pivot, applied)
@@ -1236,7 +1473,18 @@ impl Board {
             }
             Gesture::Scale { moved, before, .. } if moved => {
                 let ids: BTreeSet<ItemId> = before.iter().map(|(id, _)| *id).collect();
-                Some(("Scale", before, self.current_states(&ids)))
+                let after = self.current_states(&ids);
+                let baked = self.baked_text_sizes(&before, &after);
+                if !baked.is_empty() {
+                    // Scaling text is one step: the boxes and the font sizes
+                    // they now show.
+                    let mut commands: Vec<Box<dyn rizref_core::Command>> =
+                        vec![Box::new(SetTransforms::new("Scale", before, after))];
+                    commands.extend(baked);
+                    self.run(Box::new(rizref_core::Compound::new("Scale text", commands)));
+                    return true;
+                }
+                Some(("Scale", before, after))
             }
             Gesture::Rotate { moved, before, .. } if moved => {
                 let ids: BTreeSet<ItemId> = before.iter().map(|(id, _)| *id).collect();
@@ -1250,6 +1498,50 @@ impl Board {
         } else {
             false
         }
+    }
+
+    /// For every text item a scale drag resized, the content command that
+    /// bakes the drag's factor into its font sizes, so after the drag the
+    /// item shows its text at its real sizes (scale 1) and the size the
+    /// format bar reports is the size on the board.
+    fn baked_text_sizes(
+        &self,
+        before: &[(ItemId, ItemState)],
+        after: &[(ItemId, ItemState)],
+    ) -> Vec<Box<dyn rizref_core::Command>> {
+        let mut commands: Vec<Box<dyn rizref_core::Command>> = Vec::new();
+        for (id, old) in before {
+            let Some(content) = self
+                .scene
+                .item(*id)
+                .filter(|item| item.is_rich_text())
+                .and_then(Item::note_content)
+            else {
+                continue;
+            };
+            let Some((_, new)) = after.iter().find(|(other, _)| other == id) else {
+                continue;
+            };
+            let (old, new) = (old.transform.size(), new.transform.size());
+            let factor = ((new.x * new.y) / (old.x * old.y).max(1.0e-6)).sqrt();
+            if !factor.is_finite() || (factor - 1.0).abs() < 1.0e-3 {
+                continue;
+            }
+            let mut scaled = content.clone();
+            scaled.spans = rizref_core::rich::scale_sizes(&content.text, &content.spans, factor);
+            if scaled != content {
+                commands.push(Box::new(SetNoteContent::new(*id, content, scaled)));
+            }
+        }
+        commands
+    }
+
+    /// Whether the selection shows only corner handles: it holds a text
+    /// item, whose box is its text and so is only ever scaled.
+    pub fn selection_corners_only(&self) -> bool {
+        self.selection
+            .iter()
+            .any(|id| self.scene.item(id).is_some_and(Item::is_rich_text))
     }
 
     /// Clears the hover highlight when the pointer leaves the window.
@@ -1276,7 +1568,7 @@ impl Board {
 
         if let Some(frame) = self.frame()
             && let Some(handle) = frame
-                .hit(world, radius, rotate_offset)
+                .hit_with(world, radius, rotate_offset, self.selection_corners_only())
                 .filter(|handle| *handle != Handle::Rotate || self.selection_rotatable())
         {
             return resize_cursor(handle, &frame, view);
@@ -1913,6 +2205,56 @@ mod tests {
     }
 
     #[test]
+    fn a_corner_drag_scales_text_and_bakes_its_sizes_in_one_undo_step() {
+        let mut board = Board::new(Scene::new(SceneId::from_bytes([7; 16])));
+        board.set_snap_enabled(false);
+        let id = board.create_provisional_text(Vec2::ZERO, Vec2::new(200.0, 50.0));
+        let mut content = NoteContent::rich("scale me");
+        content.spans = rizref_core::rich::apply_style(&content.text, &[], 0..5, |s| {
+            s.size = Some(48);
+        });
+        assert!(board.commit_new_note(id, &content));
+        board.select_only(id);
+        assert!(board.selection_corners_only(), "text shows corners only");
+        let camera = view();
+        let view = info(&camera);
+        let frame = board.frame().expect("selected");
+
+        // An edge handle is not there: pressing it starts no scale.
+        let east = frame.handle_position(rizref_core::Handle::E, 0.0);
+        let item_before = board.scene().item(id).expect("text").clone();
+        board.pointer_down(screen(&camera, east), view, Modifiers::default());
+        assert!(!board.is_gesture_active() || board.selection().contains(id));
+        board.pointer_up(screen(&camera, east), view, Modifiers::default());
+        assert_eq!(
+            board.scene().item(id).expect("text").size(),
+            item_before.size()
+        );
+
+        // Doubling from the south-east corner, askew: the ratio is kept and
+        // every font size doubles.
+        let se = frame.handle_position(rizref_core::Handle::Se, 0.0);
+        let target = se + Vec2::new(200.0, 10.0);
+        let undo_before = board.history().undo_len();
+        board.pointer_down(screen(&camera, se), view, Modifiers::default());
+        board.pointer_move(screen(&camera, target), view, Modifiers::default());
+        board.pointer_up(screen(&camera, target), view, Modifiers::default());
+        let item = board.scene().item(id).expect("text");
+        let size = item.size();
+        assert!((size.x / size.y - 4.0).abs() < 1e-3, "aspect kept: {size}");
+        assert!((size.x - 400.0).abs() < 1.0, "{size}");
+        let spans = item.note_content().expect("text").spans;
+        assert_eq!(rizref_core::rich::style_at(&spans, 0).size, Some(96));
+        assert_eq!(rizref_core::rich::style_at(&spans, 6).size, Some(48));
+        assert_eq!(board.history().undo_len(), undo_before + 1, "one step");
+
+        board.undo();
+        let item = board.scene().item(id).expect("text");
+        assert_eq!(item.size(), Vec2::new(200.0, 50.0));
+        assert_eq!(item.note_content().expect("text").spans, content.spans);
+    }
+
+    #[test]
     fn a_multi_selection_scales_around_its_frame_centre_with_alt() {
         let mut board = board(2);
         board.set_snap_enabled(false);
@@ -2090,6 +2432,42 @@ mod tests {
     }
 
     #[test]
+    fn a_text_item_rotates_and_still_scales_from_its_corners() {
+        let camera = view();
+        let info = info(&camera);
+        let mut board = Board::new(Scene::new(SceneId::from_bytes([16; 16])));
+        board.set_snap_enabled(false);
+        let id = board.create_provisional_text(Vec2::ZERO, Vec2::new(200.0, 50.0));
+        assert!(board.commit_new_note(id, &NoteContent::rich("turn me")));
+        board.select_only(id);
+        assert!(board.selection_rotatable(), "text has a rotate handle");
+
+        let frame = board.frame().expect("frame");
+        let handle =
+            frame.handle_position(rizref_core::Handle::Rotate, super::ROTATE_HANDLE_PIXELS);
+        assert!(board.handle_at(screen(&camera, handle), info));
+        // Drag the handle a quarter turn around the centre.
+        let quarter = Vec2::new(handle.length(), 0.0);
+        board.pointer_down(screen(&camera, handle), info, Modifiers::default());
+        board.pointer_move(screen(&camera, quarter), info, Modifiers::default());
+        board.pointer_up(screen(&camera, quarter), info, Modifiers::default());
+        let turned = board.scene().item(id).map(Item::rotation).expect("text");
+        assert!(
+            (turned - std::f32::consts::FRAC_PI_2).abs() < 0.05,
+            "turned {turned}"
+        );
+        assert_eq!(
+            board.scene().item(id).map(Item::size),
+            Some(Vec2::new(200.0, 50.0)),
+            "rotating keeps the box"
+        );
+
+        // Undo puts it upright again.
+        board.undo();
+        assert_eq!(board.scene().item(id).map(Item::rotation), Some(0.0));
+    }
+
+    #[test]
     fn notes_are_never_rotated_and_have_no_rotate_handle() {
         let camera = view();
         let info = info(&camera);
@@ -2150,6 +2528,112 @@ mod tests {
                 > 0.5
         );
         assert_eq!(board.scene().item(note).map(Item::state), Some(note_before));
+    }
+
+    #[test]
+    fn exact_size_and_angle_apply_as_single_undo_steps() {
+        let mut scene = Scene::new(SceneId::from_bytes([17; 16]));
+        let asset = image_asset(&mut scene);
+        let image = scene
+            .insert_image(asset, Vec2::new(10.0, 20.0), Vec2::new(400.0, 200.0))
+            .expect("image");
+        let mut board = Board::new(scene);
+        board.select_only(image);
+        let geometry = board.selection_geometry().expect("selected");
+        assert!(geometry.single && geometry.rotatable && !geometry.text);
+        assert_eq!(geometry.size, Vec2::new(400.0, 200.0));
+        assert_eq!(geometry.rotation, Some(0.0));
+
+        // A rotated item reports its own box, not its bounding box.
+        assert!(board.set_selection_rotation(30.0_f32.to_radians()));
+        let geometry = board.selection_geometry().expect("selected");
+        assert_eq!(geometry.size, Vec2::new(400.0, 200.0));
+        assert_eq!(geometry.rotation.map(super::angle_degrees), Some(30.0));
+
+        assert!(board.set_selection_size(Vec2::new(100.0, 300.0)));
+        let item = board.scene().item(image).expect("image");
+        assert_eq!(item.size(), Vec2::new(100.0, 300.0));
+        assert_eq!(
+            item.state().transform.center(),
+            Vec2::new(10.0, 20.0),
+            "resizing keeps the centre"
+        );
+        assert!(
+            !board.set_selection_size(Vec2::new(100.0, 300.0)),
+            "the same size is no step"
+        );
+        assert!(!board.set_selection_size(Vec2::new(0.0, 10.0)));
+
+        board.undo();
+        assert_eq!(
+            board.scene().item(image).map(Item::size),
+            Some(Vec2::new(400.0, 200.0))
+        );
+        board.undo();
+        assert_eq!(board.scene().item(image).map(Item::rotation), Some(0.0));
+    }
+
+    #[test]
+    fn exact_size_scales_text_type_and_several_items_about_their_centre() {
+        let mut board = Board::new(Scene::new(SceneId::from_bytes([18; 16])));
+        let text = board.create_provisional_text(Vec2::ZERO, Vec2::new(200.0, 50.0));
+        let mut content = NoteContent::rich("grow");
+        content.spans = rizref_core::rich::apply_style(&content.text, &[], 0..4, |s| {
+            s.size = Some(40);
+        });
+        assert!(board.commit_new_note(text, &content));
+        board.select_only(text);
+        assert!(board.selection_geometry().expect("text").text);
+        assert!(board.set_selection_size(Vec2::new(400.0, 100.0)));
+        let grown = board
+            .scene()
+            .item(text)
+            .and_then(Item::note_content)
+            .expect("text");
+        assert_eq!(grown.spans[0].style.size, Some(80), "the type doubles too");
+        board.undo();
+        assert_eq!(
+            board.scene().item(text).and_then(Item::note_content),
+            Some(content),
+            "box and type undo together"
+        );
+
+        // Two items: their bounding box is what the dialog edits.
+        let other =
+            board
+                .scene_mut()
+                .insert_note("n", Vec2::new(300.0, 0.0), Vec2::new(100.0, 50.0));
+        board.refresh_rects();
+        board.select_all();
+        let geometry = board.selection_geometry().expect("two");
+        assert!(!geometry.single);
+        let bounds = board.selection_bounds().expect("bounds");
+        assert!(board.set_selection_size(geometry.size * 2.0));
+        let after = board.selection_bounds().expect("bounds");
+        assert!((after.center() - bounds.center()).length() < 1e-3);
+        assert!((after.width() - bounds.width() * 2.0).abs() < 1e-2);
+        assert_eq!(
+            board.scene().item(other).map(Item::rotation),
+            Some(0.0),
+            "nothing turned"
+        );
+
+        // A note card has no angle to set.
+        board.select_only(other);
+        let geometry = board.selection_geometry().expect("note");
+        assert!(!geometry.rotatable && geometry.rotation.is_none());
+        assert!(!board.set_selection_rotation(1.0));
+    }
+
+    #[test]
+    fn angles_read_in_the_half_turn_range() {
+        use super::angle_degrees;
+        assert_eq!(angle_degrees(0.0), 0.0);
+        assert_eq!(angle_degrees(-0.0), 0.0);
+        assert_eq!(angle_degrees(270.0_f32.to_radians()), -90.0);
+        assert_eq!(angle_degrees(180.0_f32.to_radians()), 180.0);
+        assert_eq!(angle_degrees(-180.0_f32.to_radians()), 180.0);
+        assert_eq!(angle_degrees(12.34_f32.to_radians()), 12.3);
     }
 
     #[test]

@@ -155,7 +155,7 @@ fn fs_background(in: BgOut) -> @location(0) vec4f {
 
 struct ItemIn {
     @location(0) pos_size: vec4f, // center.xy, size.xy (world units)
-    @location(1) misc: vec4f,     // rotation (rad), -, -, -
+    @location(1) misc: vec4f,     // rotation (rad), checkerboard backdrop (0/1), -, -
     @location(2) uv: vec4f,       // uv rect (min.xy, max.xy)
     @location(3) tint: vec4f,
 }
@@ -165,6 +165,7 @@ struct ItemOut {
     @location(0) uv: vec2f,
     @location(1) world: vec2f,
     @location(2) tint: vec4f,
+    @location(3) backdrop: f32,
 }
 
 @group(1) @binding(0) var item_tex: texture_2d<f32>;
@@ -193,6 +194,7 @@ fn vs_items(item: ItemIn, @builtin(vertex_index) vi: u32) -> ItemOut {
     );
     out.world = world;
     out.tint = item.tint;
+    out.backdrop = item.misc.y;
     return out;
 }
 
@@ -201,7 +203,7 @@ fn fs_items(in: ItemOut) -> @location(0) vec4f {
     var color = textureSample(item_tex, item_samp, in.uv) * in.tint;
     // Checkerboard behind translucent pixels: world-space 16-unit cells, so
     // the checker sticks to the board rather than to the screen.
-    if color.a < 0.999 {
+    if color.a < 0.999 && in.backdrop > 0.5 {
         let cell = floor(in.world / vec2f(16.0));
         let parity = cell.x + cell.y;
         let even = parity - 2.0 * floor(parity / 2.0);

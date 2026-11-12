@@ -235,6 +235,48 @@ meaning, that is a `schema_version: 2` decision with a hard gate.
 note card in its stored `background` colour when the field is present; note text remains
 unrendered in thumbnails, as in phase 06.
 
+### Text items (v1.3)
+
+"Add text" creates a free-standing text item: a note with `text_format: "rich"`. It has
+no card; only its glyphs are drawn. One more optional member carries its styling:
+
+```jsonc
+{
+  "id": 7,
+  "kind": "note",
+  "text": "Bold and red",
+  "text_format": "rich",
+  "spans": [                    // optional, rich items only
+    { "start": 0, "end": 4, "bold": true },
+    { "start": 9, "end": 12, "italic": true, "underline": true, "color": "#e5534b", "size": 48 }
+  ],
+  "position": [x, y],
+  "size": [w, h]
+}
+```
+
+* `text` holds the plain words, with `\n` where the author pressed Enter. `wrap_width`
+  is not written for a text item: it wraps at its box.
+* `spans` are byte ranges of `text` (`start` inclusive, `end` exclusive, both UTF-8 char
+  boundaries). `bold`, `italic` and `underline` are booleans written only when `true`;
+  `color` is `#rrggbb` and absent means the default ink (`#f2eee8`); `size` is the font
+  size in world units, 4–1000, and absent means 24. On load, spans are clamped to the
+  text, snapped to char boundaries, de-overlapped (a later span wins) and merged, and a
+  size of 24 is dropped, so equal-looking items compare equal. A malformed `spans` list is
+  ignored with a load warning (the text shows unstyled); it never fails the board.
+* `size` is the item's box. The text is laid out at its font sizes (line height 1.3×
+  the size), breaking only at `\n`, plus 6 units of padding on each side: its *natural*
+  box. The renderer draws the text at `min(size / natural)` of that, so a box that
+  differs from the natural box scales the text to fit. RizRef keeps the two equal: the
+  editor sizes the box to the text, and a corner drag bakes its scale into the `size`
+  of every span when it ends.
+* Older readers see `text_format: "rich"` as unknown, read the item as a plain note
+  (with a warning), and keep `spans` in the item's `extra` map: the words survive, only
+  the styling is lost. `schema_version` stays 1.
+* `rotation` applies to text items: unlike note cards, they can be rotated with the
+  rotate handle, and the text is drawn and edited along the rotated box.
+* Thumbnails do not draw text items (a card would be a box the board never shows).
+
 ## Board index — `INDX` JSON
 
 ```jsonc
@@ -356,3 +398,4 @@ file; 2 means a bad command line.
 | 1.1 | 06a | Additive note members `text_format`, `background`, `wrap_width`. No container change; `schema_version` stays 1. |
 | 1.2 | 06b | No new members. `source_url` is populated for browser pastes/drags; `origin`/`source_path` semantics, untrusted-URL handling and the dedup merge are specified. `schema_version` stays 1. |
 | 1.2 | 07 | No format change. Documented the shell-thumbnail read path; saves retry a refused final rename briefly and refuse a read-only target before writing; autosave recovery copies are ordinary v1 boards. |
+| 1.3 | text | Additive: `text_format: "rich"` text items and their optional `spans` member. `schema_version` stays 1. |

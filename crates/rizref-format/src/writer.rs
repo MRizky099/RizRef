@@ -1650,6 +1650,7 @@ mod tests {
             format: rizref_core::NoteFormat::Markdown,
             background: Some([0xf5, 0xf0, 0xe1]),
             wrap_width: Some(240.0),
+            spans: Vec::new(),
         };
         scene.item_mut(note).expect("note").set_note(&styled);
         save(&path, &request(&scene, &camera, "Notes")).expect("fresh save");

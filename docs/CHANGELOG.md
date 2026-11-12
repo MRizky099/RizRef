@@ -2,6 +2,79 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Text items and a visible caret
+
+Format revision 1.3 (additive; see `docs/format.md`, "Text items").
+
+- **Add text** (`T`, the right-click menu, Note ▸ Add text) places a free-standing text
+  box with no card and no backdrop (only the glyphs are drawn; the item shader's
+  checkerboard is now per item and off for text), typed at a size that reads the same
+  at any zoom, and starts typing into it. A format bar above the item has **Bold**,
+  *Italic*, Underline (`Ctrl+B`, `Ctrl+I`, `Ctrl+U`), smaller/larger text (`Ctrl+[`,
+  `Ctrl+]`, through 6–256 and on in quarters, with a toast naming the size) and a
+  text-colour popover (12 presets, a hex field, pick from screen), then ✗/✓. With text
+  selected the buttons restyle the selection and show whether all of it is on; with
+  nothing selected they set the style of what is typed next. Typing continues the style
+  of the character before the caret.
+- **The box is the text.** While typing, the box hugs the words both ways (it grows
+  right as a line lengthens, down at Enter, and shrinks back as text is deleted or made
+  smaller); lines break only at Enter. A selected text item shows only its four corner
+  handles — the edge handles are not drawn and cannot be grabbed — and dragging a corner
+  scales the text itself, keeping its proportions. When the drag ends the scale is baked
+  into the font sizes (one "Scale text" undo step with the box), so the size the format
+  bar reports is the size on the board. Pressing a handle mid-edit commits the edit
+  first. An edit (text, styling and the box) is one undo step; emptying an existing item
+  deletes it.
+- **Zoomed-out typing fixes** (from a screen recording at 17–20 % zoom, each with a
+  regression test that fails without its fix): the editor now re-shapes a text item at
+  the texture density its growing box needs (at a fixed density, a box past 1,024 world
+  units hit the 2,048 px texture cap on one axis, so the typed line was clipped and
+  stretched until the edit ended); a new item's empty box no longer reads as a 3.25x
+  scale of the default size (new text at low zoom came out three times too big); and
+  deleting back to an empty item keeps the typing size and style instead of falling to
+  the default 24 (the rest came out tiny).
+- **Text items rotate.** A selected text item has the rotate handle (note cards still
+  stay upright, also in a mixed selection); the text is drawn, edited, scaled from its
+  corners and grows while typing along the rotated box, and the caret turns with it.
+- **Exact size and angle.** `Set size…` and `Set rotation…` (Image ▸ Transform, and the
+  right-click menu whenever something is selected) open a small dialog to type the
+  numbers: width and height in board units with "Keep aspect ratio" (always on for
+  text, whose type scales with the box), or the angle in degrees, clockwise. `Tab` moves
+  between fields, the arrow keys step by 1 (`Shift` 10), `Enter` applies as one undo
+  step, `Esc` closes. One item is resized about its centre in its own frame; several are
+  scaled about their bounding box. Note cards get no angle. The HUD readout now shows
+  one selected item's own size and angle (`item 30°`); its second number has always been
+  the view's rotation (`Alt` + wheel, `2` resets).
+- **Toggling across lines.** With several lines selected, Bold, Italic and Underline
+  turned on but never back off: line breaks carry no style, so the unstyled `\n` made
+  "is everything bold?" false every time. Line breaks are no longer judged.
+- **The caret follows the text size**: it is as tall as the line it is on (and, on an
+  empty line, as the size about to be typed), instead of always one default line.
+- **Typing lag.** Every keystroke into a note or text item re-made the texture's
+  low-resolution eviction copy, ~10 ms on a large note (more than the edit and render
+  together). The note being edited is never evicted, so it now skips the copy until the
+  edit ends. A text keystroke is ~5 ms in release
+  (`cargo test -p rizref --release -- --ignored --nocapture text_keystroke_budget`);
+  the format bar's state is cached instead of re-read on every pointer move.
+- **Blinking caret** for notes and text items: a 2 px bar over a dark halo, drawn by the
+  overlay in screen space (it was a 1-texture-pixel line, invisible at most zooms). It
+  blinks every 530 ms and shows solid again after each keystroke or caret move. Notes
+  use their accent caret colour, text items the colour being typed.
+- **Found by hand-testing the release build** (and fixed, with regression tests):
+  underlines and selection highlights never drew: cosmic-text reports them as
+  rectangles and the draw callbacks painted only their first pixel; the caret never
+  blinked, because its deadline is always the next flip so the event loop's "deadline
+  passed" check never fired (the loop now compares the drawn phase with the due one);
+  characters that arrive as `VK_PACKET` (emoji panel, some IMEs and on-screen keyboards)
+  were dropped by the note editor; a mouse release could leave a drag-selection armed.
+  The autosave kill test gained two later kill points so it still has a complete
+  autosave to check on a fully loaded test run. A second round found that a multi-line
+  selection in a text item highlighted only its last line (cosmic-text extends each
+  line's highlight to the buffer width, and the non-wrapping buffer had none).
+- **Selection while editing** (notes and text): `Shift`+arrows/Home/End extend it,
+  `Ctrl`+arrows move by word, `Ctrl+Home`/`End` go to the start or end, dragging selects,
+  double-click selects a word, `Ctrl+C`/`Ctrl+X` copy and cut.
+
 ## Phase 08a — Portability layer + Linux (in review)
 
 Branch `claude/phase-08a-portability-linux-6315f5`, part of issue #24 (phase 08:

@@ -216,12 +216,27 @@ impl SelectionFrame {
     /// The rotate handle wins ties by being tested first: it sits away from the
     /// frame, so nothing else is usually near it.
     pub fn hit(&self, point: Vec2, radius: f32, rotate_offset: f32) -> Option<Handle> {
+        self.hit_with(point, radius, rotate_offset, false)
+    }
+
+    /// [`Self::hit`], optionally with only the four corner handles: a text
+    /// item has no edge handles (its box is its text, so it only scales).
+    pub fn hit_with(
+        &self,
+        point: Vec2,
+        radius: f32,
+        rotate_offset: f32,
+        corners_only: bool,
+    ) -> Option<Handle> {
         let rotate = self.handle_position(Handle::Rotate, rotate_offset);
         if (point - rotate).length() <= radius {
             return Some(Handle::Rotate);
         }
         let mut best: Option<(f32, Handle)> = None;
         for handle in Handle::SCALE {
+            if corners_only && !handle.is_corner() {
+                continue;
+            }
             let distance = (point - self.handle_position(handle, rotate_offset)).length();
             if distance <= radius && best.is_none_or(|(closest, _)| distance < closest) {
                 best = Some((distance, handle));

@@ -54,7 +54,8 @@ use crate::location::{self, LocationPlan};
 use crate::memory::DecodeCache;
 use crate::note::{self, NoteRenderer, NoteSession};
 use crate::note_chrome::{
-    NoteChrome, PillButton, PillLayout, ScreenRect, ToolbarButton, ToolbarLayout,
+    NoteChrome, PillButton, PillLayout, ScreenRect, TextBarButton, TextBarLayout, ToolbarButton,
+    ToolbarLayout,
 };
 use crate::note_worker::{NOTE_TEXTURE_BUDGET, NoteJob, NoteRendered, NoteWorker, Resident};
 use crate::overlay::{self, OverlayState, OverlayVertex};
@@ -69,6 +70,7 @@ use crate::platform::{
 use crate::provenance;
 use crate::recents::{Recents, now_unix};
 use crate::renderer::{FrameError, FrameParams, GpuDevice, GpuSurface};
+use crate::rich_text::{self, StyleToggle};
 use crate::settings::Settings;
 use crate::shortcuts::{Key as ShortcutKey, KeyChord, ShortcutId, Shortcuts};
 use crate::text::TextEngine;
@@ -78,6 +80,7 @@ use crate::ui::note_color::{NoteColorPopover, PopoverResult};
 use crate::ui::panels::{self, CloseChoice, PanelResult, SettingId};
 use crate::ui::start::{self, StartLayout};
 use crate::ui::titlebar::{self, TitleBarButton};
+use crate::ui::transform_dialog::{DialogKind, DialogResult, TransformDialog};
 use crate::ui::{Mode, Shell, UiLayer};
 use crate::view::{FRAME_PADDING, ViewState};
 
@@ -537,6 +540,16 @@ struct App {
     note_hover: Option<ItemId>,
     /// The note the eyedropper was armed for from its popover.
     pick_for_note: Option<ItemId>,
+    /// Whether the eyedropper picks the colour of the edited text item.
+    pick_for_text: bool,
+    /// When the caret last moved or the text changed: the blink restarts,
+    /// solid, from here.
+    caret_epoch: Instant,
+    /// Whether the last frame drew the caret: the blink timer redraws when
+    /// the caret should flip from what is on screen.
+    caret_drawn: bool,
+    /// Whether a left drag inside the edited note is extending its selection.
+    note_drag: bool,
     /// Resident note textures.
     note_textures: HashMap<ItemId, NoteTexture>,
     /// The title-bar button whose tooltip is showing.
@@ -711,6 +724,10 @@ impl App {
             note_renderer: NoteRenderer::new(),
             note_hover: None,
             pick_for_note: None,
+            pick_for_text: false,
+            caret_epoch: Instant::now(),
+            note_drag: false,
+            caret_drawn: false,
             note_textures: HashMap::new(),
             title_hint: None,
             note_worker: Some(note_worker),
@@ -1522,7 +1539,7 @@ impl App {
     fn apply(&mut self, command: Command) {
         use Command::{
             AlignBottom, AlignLeft, AlignRight, AlignTop, ArrangeGrid, ArrangeHierarchy,
-            ArrangeSpread, ArrangeStack, CreateNote, DeleteSelection, Deselect,
+            ArrangeSpread, ArrangeStack, CreateNote, CreateText, DeleteSelection, Deselect,
             DistributeHorizontal, DistributeVertical, DuplicateSelection, FitContent,
             FlipHorizontal, FlipVertical, GroupSelection, LowerSelection, LowerToBottom,
             MatchHeight, MatchWidth, RaiseSelection, RaiseToTop, Redo, ResetRotation,
@@ -1632,6 +1649,29 @@ impl App {
                 self.begin_note_edit(id, true);
                 true
             }
+            CreateText => {
+                // A new text item reads at the default size on screen at any
+                // zoom: its type is the default over the zoom.
+                let zoom = (self.view.camera.zoom as f32).max(1.0e-3);
+                let size = (f32::from(rizref_core::DEFAULT_TEXT_SIZE) / zoom)
+                    .round()
+                    .clamp(
+                        f32::from(rizref_core::rich::MIN_TEXT_SIZE),
+                        f32::from(rizref_core::rich::MAX_TEXT_SIZE),
+                    ) as u16;
+                let id = self
+                    .board
+                    .create_provisional_text(self.drop_world(), rich_text::new_box(size));
+                self.after_board();
+                self.begin_note_edit(id, true);
+                if let Some(session) = self.note_session.as_mut() {
+                    session.set_typing(rizref_core::TextStyle {
+                        size: rizref_core::rich::normalize_size(Some(size)),
+                        ..rizref_core::TextStyle::default()
+                    });
+                }
+                true
+            }
             _ => false,
         };
 
@@ -1679,9 +1719,15 @@ impl App {
             capabilities: self.capabilities(),
             opacity_percent: self.window_modes.opacity_percent,
             note_selected: self.board.selected_note().is_some(),
+            text_selected: self
+                .board
+                .selected_note()
+                .is_some_and(|id| self.is_text_item(id)),
             selected_image: self
                 .selected_image()
                 .map(|(_, provenance)| provenance.and_then(location::location_kind)),
+            has_selection: !self.board.selection().is_empty(),
+            rotatable_selection: self.board.selection_rotatable(),
         }
     }
 
@@ -1883,6 +1929,8 @@ impl App {
         match action {
             Action::Command(command) => self.apply(command),
             Action::ShowImageInfo => self.show_image_info(),
+            Action::SetSize => self.open_transform_dialog(DialogKind::Size),
+            Action::SetRotation => self.open_transform_dialog(DialogKind::Rotation),
             Action::OpenImageLocation => self.open_image_location(),
             Action::CopyImageLocation | Action::CopyImageAssetId | Action::CloseImageInfo => {}
             Action::NewBoard => {
@@ -2101,7 +2149,11 @@ impl App {
             }
             Action::NoteBackground => {
                 self.commit_note_edit();
-                if let Some(id) = self.board.selected_note() {
+                if let Some(id) = self
+                    .board
+                    .selected_note()
+                    .filter(|id| !self.is_text_item(*id))
+                {
                     let anchor = self.note_color_anchor(id);
                     self.open_note_color(id, anchor);
                 }
@@ -2132,8 +2184,15 @@ impl App {
             }
             Action::ConfirmNoteEdit => self.commit_note_edit(),
             Action::CancelNoteEdit => self.cancel_note_edit(),
+            Action::TextBold => self.text_toggle(StyleToggle::Bold),
+            Action::TextItalic => self.text_toggle(StyleToggle::Italic),
+            Action::TextUnderline => self.text_toggle(StyleToggle::Underline),
+            Action::TextColour => self.open_text_colour(),
+            Action::TextSmaller => self.text_size_step(false),
+            Action::TextLarger => self.text_size_step(true),
             Action::ColorPicker => {
                 self.pick_for_note = None;
+                self.pick_for_text = false;
                 self.shell.picker = true;
                 self.shell.title_bar.hide();
                 self.shell
@@ -2314,6 +2373,14 @@ impl App {
         let hex = format!("#{r:02X}{g:02X}{b:02X}");
         self.shell.picker = false;
         self.pending_pick = None;
+        if std::mem::take(&mut self.pick_for_text) {
+            self.apply_text_colour([r, g, b]);
+            self.shell
+                .toast(format!("Text colour set to {hex}"), Instant::now());
+            self.shell.touch();
+            self.redraw();
+            return;
+        }
         if let Some(id) = self.pick_for_note.take() {
             self.apply_note_background(id, [r, g, b]);
             self.shell
@@ -2446,7 +2513,21 @@ impl App {
             notes.push(note);
         }
         let selection = self.board.selection();
-        if !selection.is_empty() {
+        let single = (selection.len() == 1)
+            .then(|| self.board.selection_geometry())
+            .flatten();
+        if let Some(one) = single {
+            // One item: its own box and, when it turns, its own angle (the
+            // view's angle is the second number of the readout).
+            let mut note = format!("1 selected · {:.0} × {:.0}", one.size.x, one.size.y);
+            if let Some(angle) = one.rotation.filter(|_| one.rotatable) {
+                note.push_str(&format!(
+                    " · item {}°",
+                    crate::ui::transform_dialog::format_number(crate::board::angle_degrees(angle))
+                ));
+            }
+            notes.push(note);
+        } else if !selection.is_empty() {
             match self.board.selection_bounds() {
                 Some(bounds) => notes.push(format!(
                     "{} selected · {:.0} × {:.0}",
@@ -2942,8 +3023,18 @@ impl App {
     /// and selection change every keystroke, and the editor lives here), or
     /// any note when the worker could not start.
     fn render_note_now(&mut self, id: ItemId, content: &rizref_core::NoteContent, size: Vec2) {
-        let density = match self.note_session.as_ref().filter(|s| s.item() == id) {
-            Some(session) => session.pixels_per_world(),
+        // The edited item first follows its box (a text item re-shapes at
+        // the density its grown box needs), so the texture id below names
+        // the density the render really uses.
+        let density = match self
+            .note_session
+            .as_mut()
+            .filter(|session| session.item() == id)
+        {
+            Some(session) => {
+                session.resize(size);
+                session.pixels_per_world()
+            }
             None => note::pixels_per_world(size),
         };
         let wanted = note::texture_id(content, size, density);
@@ -2977,8 +3068,13 @@ impl App {
         };
         self.dirty_notes.remove(&id);
         self.pending_notes.remove(&id);
-        let low = Arc::new(note::low_resolution(&image));
-        self.install_note_texture(id, wanted, size, &image, Some(low));
+        // The low-resolution copy only serves an evicted off-screen note.
+        // Building it costs ~10 ms for a large note, which on every keystroke
+        // was most of the typing lag; the note being edited is never
+        // evicted, and the render after the edit ends makes the copy.
+        let editing = self.note_session.as_ref().is_some_and(|s| s.item() == id);
+        let low = (!editing).then(|| Arc::new(note::low_resolution(&image)));
+        self.install_note_texture(id, wanted, size, &image, low);
     }
 
     /// Uploads a full note render and makes it the note's texture.
@@ -3165,6 +3261,9 @@ impl App {
                 let size = item.size();
                 let mut instance =
                     QuadInstance::new([center.x, center.y], [size.x, size.y], item.rotation());
+                // Text items are glyphs on nothing: no checkerboard behind
+                // their transparent pixels.
+                instance.backdrop = !item.is_rich_text();
                 instance.uv = match (item.flip_x(), item.flip_y()) {
                     (false, false) => [0.0, 0.0, 1.0, 1.0],
                     (true, false) => [1.0, 0.0, 0.0, 1.0],
@@ -3228,9 +3327,81 @@ impl App {
             marquee: self.board.marquee(),
             guides: self.board.guides(),
             rotatable: self.board.selection_rotatable(),
+            corners_only: self.board.selection_corners_only(),
             chrome: self.note_chrome(),
+            caret: self.caret_overlay(Instant::now()),
         };
         overlay::build(&state)
+    }
+
+    /// How long the caret stays on, then off.
+    const CARET_BLINK: Duration = Duration::from_millis(530);
+
+    /// Whether the caret is in the visible half of its blink at `now`.
+    fn caret_visible(&self, now: Instant) -> bool {
+        let phase = now.saturating_duration_since(self.caret_epoch).as_millis()
+            / Self::CARET_BLINK.as_millis();
+        phase.is_multiple_of(2)
+    }
+
+    /// When the caret next turns on or off, while a note is being edited.
+    fn caret_deadline(&self, now: Instant) -> Option<Instant> {
+        self.note_session.as_ref()?;
+        if self.shell.mode() != Mode::Canvas {
+            return None;
+        }
+        let blink = Self::CARET_BLINK.as_millis();
+        let elapsed = now.saturating_duration_since(self.caret_epoch).as_millis();
+        let next = (elapsed / blink + 1) * blink;
+        Some(self.caret_epoch + Duration::from_millis(u64::try_from(next).unwrap_or(u64::MAX)))
+    }
+
+    /// Restarts the caret blink: it shows solid right after any edit or
+    /// caret move, so it never vanishes under the user's typing.
+    fn wake_caret(&mut self) {
+        self.caret_epoch = Instant::now();
+    }
+
+    /// The caret of the note or text item being edited, as screen geometry.
+    fn caret_overlay(&self, now: Instant) -> Option<overlay::OverlayCaret> {
+        let session = self.note_session.as_ref()?;
+        if self.shell.mode() != Mode::Canvas || !self.caret_visible(now) {
+            return None;
+        }
+        let item = self.board.scene().item(session.item())?;
+        let size = item.size();
+        let (top, height) = session.caret_local(size)?;
+        // A caret scrolled out of the note's box is not drawn.
+        if top.y < -size.y * 0.5 - 0.5 || top.y + height > size.y * 0.5 + 0.5 {
+            return None;
+        }
+        // The texture is mirrored with the item; so is the caret.
+        let mirror = |p: Vec2| {
+            Vec2::new(
+                if item.flip_x() { -p.x } else { p.x },
+                if item.flip_y() { -p.y } else { p.y },
+            )
+        };
+        let viewport = self.view.viewport();
+        let screen = |local: Vec2| {
+            self.view
+                .camera
+                .world_to_screen(
+                    item.transform().from_local(mirror(local)).as_dvec2(),
+                    viewport,
+                )
+                .as_vec2()
+        };
+        let rgb = session.caret_colour().unwrap_or_else(|| {
+            item.note_content()
+                .map_or([0xff, 0xce, 0x6e], |content| note::palette(&content).caret)
+        });
+        let rgb = rgb.map(|v| f32::from(v) / 255.0);
+        Some(overlay::OverlayCaret {
+            top: screen(top),
+            bottom: screen(top + Vec2::new(0.0, height)),
+            color: [rgb[0], rgb[1], rgb[2], 1.0],
+        })
     }
 
     /// Advances every playing animation to `now`, returning when the next frame
@@ -3299,6 +3470,8 @@ impl App {
         };
         self.note_session = NoteSession::begin(&mut self.text, item, provisional, was_clean);
         if self.note_session.is_some() {
+            self.wake_caret();
+            self.note_drag = false;
             // The space bar types a space while editing; make sure a pan
             // armed before the double-click does not stay held.
             self.view.set_space_held(false);
@@ -3320,12 +3493,41 @@ impl App {
         };
         let id = session.item();
         let after = session.content();
+        self.note_drag = false;
+        self.pick_for_text = false;
+        if self.shell.note_color.as_ref().is_some_and(|p| p.text) {
+            self.shell.note_color = None;
+        }
         if session.is_provisional() {
             let added = self.board.commit_new_note(id, &after);
             self.after_board();
             if !added && session.was_clean() {
                 self.restore_clean_title();
             }
+        } else if session.is_rich() {
+            let original_state = session.original_state();
+            let state = self
+                .board
+                .scene()
+                .item(id)
+                .map_or(original_state, Item::state);
+            if after.text.trim().is_empty() {
+                // An emptied text item would be an invisible box: it is
+                // removed instead, one undo step back to the old text.
+                self.board.restore_note(id, session.original());
+                self.board.restore_state(id, original_state);
+                self.board.select_only(id);
+                self.board.delete_selection();
+                self.note_hover = None;
+            } else if !self.board.commit_text(
+                id,
+                (session.original(), original_state),
+                (&after, state),
+            ) && session.was_clean()
+            {
+                self.restore_clean_title();
+            }
+            self.after_board();
         } else if after.text == session.original().text {
             // Nothing was typed (or it was typed and undone): a legacy plain
             // note stays plain, and the board keeps its saved state.
@@ -3351,10 +3553,18 @@ impl App {
             return;
         };
         let id = session.item();
+        self.note_drag = false;
+        self.pick_for_text = false;
+        if self.shell.note_color.as_ref().is_some_and(|p| p.text) {
+            self.shell.note_color = None;
+        }
         if session.is_provisional() {
             self.board.discard_provisional_note(id);
         } else {
             self.board.restore_note(id, session.original());
+            if session.is_rich() {
+                self.board.restore_state(id, session.original_state());
+            }
             self.dirty_notes.insert(id);
         }
         self.after_board();
@@ -3388,14 +3598,147 @@ impl App {
 
     /// Copies the editor's text into the scene so the live preview updates.
     fn sync_note_text(&mut self) {
-        let Some(session) = self.note_session.as_ref() else {
+        let Some(session) = self.note_session.as_mut() else {
             return;
         };
         let id = session.item();
         let content = session.live_content();
+        // A text box hugs its text while it is typed: it grows and shrinks
+        // with every line and every size change.
+        let size = session.rich_size(&mut self.text);
         self.board.set_note_live(id, &content);
+        if let Some(size) = size {
+            self.board.set_box_live(id, size);
+        }
         self.dirty_notes.insert(id);
+        self.wake_caret();
         self.after_board();
+    }
+
+    /// Steps the font size of the edited text item's selection (or of what
+    /// is typed next) and says the new size.
+    fn text_size_step(&mut self, larger: bool) {
+        let Some(session) = self.note_session.as_mut().filter(|s| s.is_rich()) else {
+            return;
+        };
+        let Some(size) = session.step_size(larger) else {
+            return;
+        };
+        self.sync_note_text();
+        self.shell
+            .toast(format!("Text size {size}"), Instant::now());
+        self.shell.touch();
+        self.redraw();
+    }
+
+    /// Whether `id` is a free-standing text item.
+    fn is_text_item(&self, id: ItemId) -> bool {
+        self.board.scene().item(id).is_some_and(Item::is_rich_text)
+    }
+
+    /// Moves the caret, extending the selection while shift is held; ctrl
+    /// moves by word (and to the start or end of the text with Home/End).
+    fn note_motion(&mut self, motion: cosmic_text::Motion) {
+        use cosmic_text::Motion;
+        let shift = self.modifiers.shift_key();
+        let motion = match (self.modifiers.control_key(), motion) {
+            (true, Motion::Left) => Motion::LeftWord,
+            (true, Motion::Right) => Motion::RightWord,
+            (true, Motion::Home) => Motion::BufferStart,
+            (true, Motion::End) => Motion::BufferEnd,
+            (_, motion) => motion,
+        };
+        let Some(session) = self.note_session.as_mut() else {
+            return;
+        };
+        session.motion(&mut self.text, motion, shift);
+        self.sync_note_text();
+    }
+
+    /// Toggles bold, italic or underline in the edited text item.
+    fn text_toggle(&mut self, toggle: StyleToggle) {
+        let Some(session) = self.note_session.as_mut().filter(|s| s.is_rich()) else {
+            return;
+        };
+        session.toggle(toggle);
+        self.sync_note_text();
+        self.shell.touch();
+        self.redraw();
+    }
+
+    /// Sets the colour of the edited text item's selection (or of what is
+    /// typed next).
+    fn apply_text_colour(&mut self, rgb: [u8; 3]) {
+        let Some(session) = self.note_session.as_mut().filter(|s| s.is_rich()) else {
+            return;
+        };
+        session.set_colour(rgb);
+        self.sync_note_text();
+        self.shell.touch();
+        self.redraw();
+    }
+
+    /// Opens the text colour popover under the format bar's swatch.
+    fn open_text_colour(&mut self) {
+        let Some(session) = self.note_session.as_ref().filter(|s| s.is_rich()) else {
+            return;
+        };
+        let id = session.item();
+        let current = session
+            .display_style()
+            .and_then(|style| style.color)
+            .unwrap_or(rich_text::DEFAULT_TEXT_INK);
+        let Some(rect) = self.note_screen_rect(id) else {
+            return;
+        };
+        let swatch =
+            TextBarLayout::new(rect, 0.0, self.chrome_bottom()).button(TextBarButton::Colour);
+        self.shell.menu = None;
+        self.shell.tooltip = None;
+        self.shell.note_color = Some(NoteColorPopover::open_text(
+            id,
+            current,
+            DVec2::new(f64::from(swatch.min.x), f64::from(swatch.max.y)),
+            self.viewport(),
+        ));
+        self.shell.touch();
+        self.redraw();
+    }
+
+    /// The edited note's local point for a world point, in editor pixels.
+    fn note_editor_point(&self, world: Vec2) -> Option<(f32, f32)> {
+        let session = self.note_session.as_ref()?;
+        let item = self.board.scene().item(session.item())?;
+        let local = item.transform().to_local(world);
+        // A mirrored note shows mirrored text, so the point is mirrored back
+        // into the texture.
+        let local = Vec2::new(
+            if item.flip_x() { -local.x } else { local.x },
+            if item.flip_y() { -local.y } else { local.y },
+        );
+        Some(session.local_to_editor(local, item.size()))
+    }
+
+    /// Extends the selection to a world point while dragging in the note.
+    fn note_drag_to(&mut self, world: Vec2) {
+        let Some((x, y)) = self.note_editor_point(world) else {
+            return;
+        };
+        if let Some(session) = self.note_session.as_mut() {
+            session.drag(&mut self.text, x, y);
+        }
+        self.sync_note_text();
+    }
+
+    /// Selects the word under a world point (a double-click while editing).
+    fn note_select_word(&mut self, world: Vec2) {
+        let Some((x, y)) = self.note_editor_point(world) else {
+            return;
+        };
+        if let Some(session) = self.note_session.as_mut() {
+            session.select_word(&mut self.text, x, y);
+        }
+        self.sync_note_text();
     }
 
     /// Applies one editor action and redraws.
@@ -3418,23 +3761,12 @@ impl App {
 
     /// Places the caret at a world point inside the edited note.
     fn note_click(&mut self, world: Vec2) {
-        let Some(session) = self.note_session.as_mut() else {
+        let Some((x, y)) = self.note_editor_point(world) else {
             return;
         };
-        let Some(item) = self.board.scene().item(session.item()) else {
-            return;
-        };
-        let local = item.transform().to_local(world);
-        // A mirrored note shows mirrored text, so the caret's horizontal and
-        // vertical position has to be mirrored back into the texture.
-        let local = Vec2::new(
-            if item.flip_x() { -local.x } else { local.x },
-            if item.flip_y() { -local.y } else { local.y },
-        );
-        let pixels_per_world = session.pixels_per_world();
-        let x = (local.x + item.size().x * 0.5 - note::NOTE_PADDING) * pixels_per_world;
-        let y = (local.y + item.size().y * 0.5 - note::NOTE_PADDING) * pixels_per_world;
-        session.click(&mut self.text, x, y);
+        if let Some(session) = self.note_session.as_mut() {
+            session.click(&mut self.text, x, y);
+        }
         self.sync_note_text();
     }
 
@@ -3471,36 +3803,38 @@ impl App {
                 true
             }
             Key::Named(NamedKey::ArrowLeft) => {
-                self.note_action(Action::Motion(Motion::Left));
+                self.note_motion(Motion::Left);
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
-                self.note_action(Action::Motion(Motion::Right));
+                self.note_motion(Motion::Right);
                 true
             }
             Key::Named(NamedKey::ArrowUp) => {
-                self.note_action(Action::Motion(Motion::Up));
+                self.note_motion(Motion::Up);
                 true
             }
             Key::Named(NamedKey::ArrowDown) => {
-                self.note_action(Action::Motion(Motion::Down));
+                self.note_motion(Motion::Down);
                 true
             }
             Key::Named(NamedKey::Home) => {
-                self.note_action(Action::Motion(Motion::Home));
+                self.note_motion(Motion::Home);
                 true
             }
             Key::Named(NamedKey::End) => {
-                self.note_action(Action::Motion(Motion::End));
+                self.note_motion(Motion::End);
                 true
             }
             Key::Character(text) if ctrl => {
+                let rich = self.note_session.as_ref().is_some_and(NoteSession::is_rich);
                 match text.to_ascii_lowercase().as_str() {
                     "a" => {
                         if let Some(session) = self.note_session.as_mut() {
                             session.select_all();
                             let id = session.item();
                             self.dirty_notes.insert(id);
+                            self.wake_caret();
                             self.redraw();
                         }
                     }
@@ -3509,6 +3843,28 @@ impl App {
                             self.note_insert(&text);
                         }
                     }
+                    "c" | "x" => {
+                        let selected = self
+                            .note_session
+                            .as_ref()
+                            .and_then(NoteSession::selected_text);
+                        if let Some(selected) = selected {
+                            if let Err(error) = clipboard::write_text(&selected) {
+                                tracing::warn!(%error, "cannot copy the selected text");
+                            }
+                            if text.eq_ignore_ascii_case("x")
+                                && let Some(session) = self.note_session.as_mut()
+                            {
+                                session.delete_selection();
+                                self.sync_note_text();
+                            }
+                        }
+                    }
+                    "[" if rich => self.text_size_step(false),
+                    "]" if rich => self.text_size_step(true),
+                    "b" if rich => self.text_toggle(StyleToggle::Bold),
+                    "i" if rich => self.text_toggle(StyleToggle::Italic),
+                    "u" if rich => self.text_toggle(StyleToggle::Underline),
                     _ => {}
                 }
                 true
@@ -3518,6 +3874,24 @@ impl App {
                     self.note_insert(text);
                 }
                 true
+            }
+            // Characters that arrive without a key of their own — the
+            // Windows emoji panel, some IMEs and on-screen keyboards send
+            // them as `VK_PACKET`, which winit reports as an unidentified key
+            // carrying the text — are typed too, not dropped.
+            Key::Unidentified(_) | Key::Dead(_) if !ctrl => {
+                let typed = event
+                    .text
+                    .as_deref()
+                    .filter(|text| text.chars().any(|c| !c.is_control()));
+                match typed {
+                    Some(text) => {
+                        let text = text.to_owned();
+                        self.note_insert(&text);
+                        true
+                    }
+                    None => false,
+                }
             }
             _ => false,
         }
@@ -3552,7 +3926,7 @@ impl App {
             return None;
         }
         // While its popover is open the toolbar stays pinned to that note.
-        if let Some(popover) = &self.shell.note_color {
+        if let Some(popover) = self.shell.note_color.as_ref().filter(|p| !p.text) {
             return Some(popover.note);
         }
         if self.shell.has_overlay() || self.shell.picker || self.board.is_gesture_active() {
@@ -3567,12 +3941,38 @@ impl App {
         Some(id)
     }
 
+    /// The hover toolbar of `id` placed at `rect`: a text item has no
+    /// background swatch.
+    fn toolbar_layout(&self, id: ItemId, rect: ScreenRect) -> ToolbarLayout {
+        if self.is_text_item(id) {
+            ToolbarLayout::for_text(rect, 0.0, self.chrome_bottom())
+        } else {
+            ToolbarLayout::new(rect, 0.0, self.chrome_bottom())
+        }
+    }
+
     /// What the overlay draws for notes this frame.
     fn note_chrome(&self) -> Option<NoteChrome> {
         let cursor = self.view.cursor_position().map(|c| c.as_vec2());
         if let Some(session) = &self.note_session {
             if self.shell.mode() != Mode::Canvas {
                 return None;
+            }
+            if let Some(style) = session.display_style() {
+                let layout = TextBarLayout::new(
+                    self.note_screen_rect(session.item())?,
+                    0.0,
+                    self.chrome_bottom(),
+                );
+                let hovered = cursor.and_then(|c| layout.hit(c));
+                return Some(NoteChrome::TextBar {
+                    layout,
+                    bold: style.bold,
+                    italic: style.italic,
+                    underline: style.underline,
+                    colour: style.color.unwrap_or(rich_text::DEFAULT_TEXT_INK),
+                    hovered,
+                });
             }
             let layout = PillLayout::new(
                 self.note_screen_rect(session.item())?,
@@ -3583,7 +3983,7 @@ impl App {
             return Some(NoteChrome::Pill { layout, hovered });
         }
         let id = self.toolbar_note()?;
-        let layout = ToolbarLayout::new(self.note_screen_rect(id)?, 0.0, self.chrome_bottom());
+        let layout = self.toolbar_layout(id, self.note_screen_rect(id)?);
         let background = self
             .board
             .scene()
@@ -3603,12 +4003,36 @@ impl App {
     /// hovered note.
     fn note_controls(&self) -> crate::accessibility::NoteControls {
         if let Some(session) = &self.note_session {
+            let mut buttons = Vec::new();
+            if session.is_rich() {
+                buttons.extend([
+                    (TextBarButton::Bold.label(), Action::TextBold),
+                    (TextBarButton::Italic.label(), Action::TextItalic),
+                    (TextBarButton::Underline.label(), Action::TextUnderline),
+                    (TextBarButton::Smaller.label(), Action::TextSmaller),
+                    (TextBarButton::Larger.label(), Action::TextLarger),
+                    (TextBarButton::Colour.label(), Action::TextColour),
+                ]);
+            }
+            buttons.extend([
+                (PillButton::Cancel.label(), Action::CancelNoteEdit),
+                (PillButton::Confirm.label(), Action::ConfirmNoteEdit),
+            ]);
+            return crate::accessibility::NoteControls {
+                buttons,
+                source: Some(session.text()),
+            };
+        }
+        if self.shell.mode() == Mode::Canvas
+            && let Some(id) = self.board.selected_note()
+            && self.is_text_item(id)
+        {
             return crate::accessibility::NoteControls {
                 buttons: vec![
-                    (PillButton::Cancel.label(), Action::CancelNoteEdit),
-                    (PillButton::Confirm.label(), Action::ConfirmNoteEdit),
+                    (ToolbarButton::Edit.label(), Action::EditNote),
+                    (ToolbarButton::Delete.label(), Action::DeleteNote),
                 ],
-                source: Some(session.text()),
+                source: None,
             };
         }
         if self.shell.mode() == Mode::Canvas && self.board.selected_note().is_some() {
@@ -3630,6 +4054,7 @@ impl App {
         match self.note_chrome() {
             Some(NoteChrome::Pill { layout, .. }) => layout.hit(point).is_some(),
             Some(NoteChrome::Toolbar { layout, .. }) => layout.hit(point).is_some(),
+            Some(NoteChrome::TextBar { layout, .. }) => layout.hit(point).is_some(),
             None => false,
         }
     }
@@ -3649,9 +4074,8 @@ impl App {
             .filter(|id| self.board.scene().item(*id).is_some_and(Item::is_note));
         // Moving from the note onto its toolbar keeps the toolbar.
         let on_toolbar = self.note_hover.filter(|id| {
-            self.note_screen_rect(*id).is_some_and(|rect| {
-                ToolbarLayout::new(rect, 0.0, self.chrome_bottom()).contains(point)
-            })
+            self.note_screen_rect(*id)
+                .is_some_and(|rect| self.toolbar_layout(*id, rect).contains(point))
         });
         let hover = on_toolbar.or(under);
         let mut changed = hover != self.note_hover;
@@ -3677,6 +4101,15 @@ impl App {
                     DVec2::new(f64::from(rect.min.x), f64::from(rect.max.y)),
                 )
             }),
+            Some(NoteChrome::TextBar { layout, .. }) if self.shell.note_color.is_none() => {
+                layout.hit(point).map(|button| {
+                    let rect = layout.button(button);
+                    (
+                        button.label().to_owned(),
+                        DVec2::new(f64::from(rect.min.x), f64::from(rect.max.y)),
+                    )
+                })
+            }
             _ => None,
         };
         // The title bar's own tooltip wins while a bar button is hovered.
@@ -3705,6 +4138,26 @@ impl App {
                 }
                 None => false,
             },
+            Some(NoteChrome::TextBar { layout, .. }) => {
+                let Some(button) = layout.hit(point) else {
+                    return false;
+                };
+                self.shell.tooltip = None;
+                let action = match button {
+                    TextBarButton::Bold => Action::TextBold,
+                    TextBarButton::Italic => Action::TextItalic,
+                    TextBarButton::Underline => Action::TextUnderline,
+                    TextBarButton::Smaller => Action::TextSmaller,
+                    TextBarButton::Larger => Action::TextLarger,
+                    TextBarButton::Colour => Action::TextColour,
+                    TextBarButton::Cancel => Action::CancelNoteEdit,
+                    TextBarButton::Confirm => Action::ConfirmNoteEdit,
+                };
+                self.execute(action, event_loop);
+                self.shell.touch();
+                self.redraw();
+                true
+            }
             Some(NoteChrome::Toolbar { layout, .. }) => {
                 let Some(button) = layout.hit(point) else {
                     return false;
@@ -3763,6 +4216,53 @@ impl App {
             })
     }
 
+    /// Opens the size or rotation dialog on the selection's numbers.
+    fn open_transform_dialog(&mut self, kind: DialogKind) {
+        if self.shell.locked {
+            self.shell
+                .toast("Canvas is locked (L to unlock)", Instant::now());
+            self.redraw();
+            return;
+        }
+        self.commit_note_edit();
+        let Some(geometry) = self.board.selection_geometry() else {
+            return;
+        };
+        if kind == DialogKind::Rotation && !geometry.rotatable {
+            return;
+        }
+        let dialog = TransformDialog::open(kind, &geometry, self.viewport());
+        self.shell.open_transform(dialog);
+        self.redraw();
+    }
+
+    /// Runs a size or rotation dialog result.
+    fn apply_transform_result(&mut self, result: DialogResult) {
+        match result {
+            DialogResult::None => return,
+            DialogResult::Changed => self.shell.touch(),
+            DialogResult::Closed => {
+                self.shell.transform = None;
+                self.shell.touch();
+            }
+            DialogResult::ApplySize(size) => {
+                self.shell.transform = None;
+                self.shell.touch();
+                if self.board.set_selection_size(size) {
+                    self.after_board();
+                }
+            }
+            DialogResult::ApplyRotation(radians) => {
+                self.shell.transform = None;
+                self.shell.touch();
+                if self.board.set_selection_rotation(radians) {
+                    self.after_board();
+                }
+            }
+        }
+        self.redraw();
+    }
+
     /// Runs a popover result.
     fn apply_popover_result(&mut self, result: PopoverResult) {
         match result {
@@ -3774,19 +4274,26 @@ impl App {
             }
             PopoverResult::Apply(rgb) => {
                 if let Some(popover) = self.shell.note_color.take() {
-                    self.apply_note_background(popover.note, rgb);
+                    if popover.text {
+                        self.apply_text_colour(rgb);
+                    } else {
+                        self.apply_note_background(popover.note, rgb);
+                    }
                 }
                 self.shell.touch();
             }
             PopoverResult::Pick => {
                 if let Some(popover) = self.shell.note_color.take() {
-                    self.pick_for_note = Some(popover.note);
+                    let hint = if popover.text {
+                        self.pick_for_text = true;
+                        "Click a pixel to use it as the text colour"
+                    } else {
+                        self.pick_for_note = Some(popover.note);
+                        "Click a pixel to use it as the note background"
+                    };
                     self.shell.picker = true;
                     self.shell.title_bar.hide();
-                    self.shell.toast(
-                        "Click a pixel to use it as the note background",
-                        Instant::now(),
-                    );
+                    self.shell.toast(hint, Instant::now());
                 }
                 self.shell.touch();
             }
@@ -3811,6 +4318,10 @@ impl App {
         let Some(id) = self.board.selected_note() else {
             return;
         };
+        if self.is_text_item(id) {
+            // A text item's box is always its text.
+            return;
+        }
         let Some(item) = self.board.scene().item(id) else {
             return;
         };
@@ -3919,7 +4430,25 @@ impl App {
         });
         self.last_click = Some((now, item));
 
-        if self.note_session.is_some() && self.board.handle_at(screen, self.view_info()) {
+        let on_handle =
+            self.note_session.is_some() && self.board.handle_at(screen, self.view_info());
+        if on_handle && self.note_session.as_ref().is_some_and(NoteSession::is_rich) {
+            // A text item keeps its scale while it is typed into: a handle
+            // press commits the edit, then scales the finished text.
+            self.commit_note_edit();
+            let mods = self.current_mods();
+            let view = ViewInfo {
+                camera: &self.view.camera,
+                viewport: self.view.viewport(),
+            };
+            if self.board.pointer_down(screen, view, mods) {
+                self.after_board();
+            }
+            self.update_cursor_icon(window, screen);
+            self.redraw();
+            return;
+        }
+        if on_handle {
             // The box stays resizable while editing; a handle press scales
             // the frame and never moves the caret or ends the edit.
             let mods = self.current_mods();
@@ -3935,7 +4464,12 @@ impl App {
         }
         if let Some(session_item) = self.note_session.as_ref().map(NoteSession::item) {
             if item == Some(session_item) {
-                self.note_click(world);
+                if double_click {
+                    self.note_select_word(world);
+                } else {
+                    self.note_click(world);
+                    self.note_drag = true;
+                }
                 return;
             }
             self.commit_note_edit();
@@ -4325,6 +4859,11 @@ impl ApplicationHandler<AppEvent> for App {
                 {
                     self.shell.touch();
                 }
+                if let Some(dialog) = self.shell.transform.as_mut()
+                    && dialog.pointer_moved(logical)
+                {
+                    self.shell.touch();
+                }
                 if self.shell.mode() == Mode::Canvas
                     && self.shell.menu.is_none()
                     && self.update_note_hover(logical)
@@ -4348,6 +4887,13 @@ impl ApplicationHandler<AppEvent> for App {
                     if let Some(previous) = previous {
                         self.view.drag_pan(logical - previous);
                     }
+                } else if self.note_drag && self.note_session.is_some() {
+                    let world = self
+                        .view
+                        .camera
+                        .screen_to_world(logical, self.view.viewport())
+                        .as_vec2();
+                    self.note_drag_to(world);
                 } else {
                     let view = ViewInfo {
                         camera: &self.view.camera,
@@ -4461,6 +5007,15 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     return;
                 }
+                if let Some(dialog) = self.shell.transform.as_mut() {
+                    if pressed && button == MouseButton::Left {
+                        let result = dialog.click(position);
+                        self.apply_transform_result(result);
+                    } else if pressed {
+                        self.apply_transform_result(DialogResult::Closed);
+                    }
+                    return;
+                }
                 if self.shell.shortcuts.is_some() || self.shell.settings.is_some() {
                     if pressed
                         && !panels::shortcuts_contains(viewport, position)
@@ -4527,6 +5082,9 @@ impl ApplicationHandler<AppEvent> for App {
                     pressed,
                     space_held: self.view.space_held(),
                 };
+                if button == InputButton::Left && !pressed {
+                    self.note_drag = false;
+                }
                 if let Some(command) = input::resolve(&trigger) {
                     self.apply(command);
                     // A left release ends a pan *and* the board gesture its
@@ -4692,7 +5250,9 @@ impl ApplicationHandler<AppEvent> for App {
                     if pressed {
                         let ctrl = self.modifiers.control_key();
                         let result = match (&event.logical_key, chord) {
-                            (Key::Character(_), _) if !ctrl => {
+                            (Key::Character(_) | Key::Unidentified(_) | Key::Dead(_), _)
+                                if !ctrl =>
+                            {
                                 let typed = event.text.as_deref().unwrap_or_default();
                                 let changed = self
                                     .shell
@@ -4713,6 +5273,36 @@ impl ApplicationHandler<AppEvent> for App {
                             _ => PopoverResult::None,
                         };
                         self.apply_popover_result(result);
+                    }
+                    return;
+                }
+                if self.shell.transform.is_some() {
+                    if pressed {
+                        let ctrl = self.modifiers.control_key();
+                        let result = match (&event.logical_key, chord) {
+                            (Key::Character(_) | Key::Unidentified(_) | Key::Dead(_), _)
+                                if !ctrl =>
+                            {
+                                let typed = event.text.as_deref().unwrap_or_default();
+                                let changed = self
+                                    .shell
+                                    .transform
+                                    .as_mut()
+                                    .is_some_and(|dialog| dialog.type_text(typed));
+                                if changed {
+                                    DialogResult::Changed
+                                } else {
+                                    DialogResult::None
+                                }
+                            }
+                            (_, Some(chord)) => self
+                                .shell
+                                .transform
+                                .as_mut()
+                                .map_or(DialogResult::None, |dialog| dialog.key(chord)),
+                            _ => DialogResult::None,
+                        };
+                        self.apply_transform_result(result);
                     }
                     return;
                 }
@@ -4808,6 +5398,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if canvas_mode {
                     self.ensure_textures(&items);
                 }
+                self.caret_drawn = canvas_mode
+                    && self.note_session.is_some()
+                    && self.caret_visible(Instant::now());
                 let overlay = if canvas_mode {
                     self.build_overlay()
                 } else {
@@ -5035,6 +5628,15 @@ impl ApplicationHandler<AppEvent> for App {
             poll_deadline = Some(now + Duration::from_millis(50));
         }
 
+        // The caret blink: its deadline is always the next flip after now, so
+        // the generic "deadline passed" check below never fires for it;
+        // compare what is on screen with what should be instead.
+        if self.note_session.is_some()
+            && self.shell.mode() == Mode::Canvas
+            && self.caret_visible(now) != self.caret_drawn
+        {
+            self.redraw();
+        }
         if self.autosave.is_due(self.autosave_policy, now) {
             self.autosave_now();
         }
@@ -5042,6 +5644,7 @@ impl ApplicationHandler<AppEvent> for App {
 
         let deadline = [
             self.next_frame_at,
+            self.caret_deadline(now),
             self.shell.next_wake(),
             poll_deadline,
             autosave_deadline,
@@ -5098,10 +5701,10 @@ fn shortcut_key(key: &Key) -> Option<ShortcutKey> {
 fn command_mutates_items(command: Command) -> bool {
     use Command::{
         AlignBottom, AlignLeft, AlignRight, AlignTop, ArrangeGrid, ArrangeHierarchy, ArrangeSpread,
-        ArrangeStack, CreateNote, DeleteSelection, DistributeHorizontal, DistributeVertical,
-        DuplicateSelection, FlipHorizontal, FlipVertical, GroupSelection, LowerSelection,
-        LowerToBottom, MatchHeight, MatchWidth, Nudge, RaiseSelection, RaiseToTop, Redo,
-        ResetTransform, Undo, UngroupSelection,
+        ArrangeStack, CreateNote, CreateText, DeleteSelection, DistributeHorizontal,
+        DistributeVertical, DuplicateSelection, FlipHorizontal, FlipVertical, GroupSelection,
+        LowerSelection, LowerToBottom, MatchHeight, MatchWidth, Nudge, RaiseSelection, RaiseToTop,
+        Redo, ResetTransform, Undo, UngroupSelection,
     };
     matches!(
         command,
@@ -5125,6 +5728,7 @@ fn command_mutates_items(command: Command) -> bool {
             | ArrangeSpread
             | ArrangeStack
             | CreateNote
+            | CreateText
             | AlignLeft
             | AlignRight
             | AlignTop
