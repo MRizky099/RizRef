@@ -144,15 +144,19 @@ jobs:
       # testing on real Macs; it is not a release.
       - name: Build and check RizRef.app
         run: packaging/macos/build-app.sh dist/macos
-      # ditto keeps the executable bit and the signature, which a plain
-      # artifact upload of the .app folder would lose.
-      - name: Zip the bundle
-        run: ditto -c -k --keepParent dist/macos/RizRef.app dist/macos/RizRef-macos-universal-unsigned.zip
-      - name: Keep the bundle
+      # The two downloads from that bundle (phase 08c): the drag-to-Applications
+      # .dmg and the portable .zip, with SHA-256 sums. The script mounts the
+      # image and starts the app from it. Ad-hoc signed, not notarized.
+      - name: Package the .dmg and .zip
+        run: packaging/macos/build-dmg.sh dist/macos/RizRef.app dist/macos
+      - name: Keep the macOS downloads
         uses: actions/upload-artifact@v4
         with:
-          name: RizRef-macos-universal-unsigned
-          path: dist/macos/RizRef-macos-universal-unsigned.zip
+          name: RizRef-macos-universal
+          path: |
+            dist/macos/*.dmg
+            dist/macos/*.zip
+            dist/macos/*.sha256
           if-no-files-found: error
 
   # Intel is linted from Linux on every run; its tests run on a full run only

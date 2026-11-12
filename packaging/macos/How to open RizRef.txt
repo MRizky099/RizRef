@@ -1,0 +1,29 @@
+RizRef for macOS — first launch
+================================
+
+1. Drag RizRef onto the Applications folder in this window.
+
+2. Open it once with the steps for your macOS version. After that it opens
+   normally, from Launchpad, the Dock or a double-clicked .rizref board.
+
+   RizRef is free and open source, and it is not signed with a paid Apple
+   Developer ID, so macOS cannot check who made it and asks you to confirm
+   the first time. Nothing is changed on your Mac apart from allowing
+   RizRef.
+
+   macOS 15 Sequoia and later:
+     - Double-click RizRef. macOS says it "cannot verify" the app: click Done.
+     - Open System Settings > Privacy & Security, scroll down to
+       "RizRef was blocked", click Open Anyway and confirm.
+
+   macOS 10.13 High Sierra to macOS 14 Sonoma:
+     - Control-click (or right-click) RizRef in Applications, choose Open,
+       then click Open in the dialog.
+
+   Or, in Terminal (any version):
+       xattr -dr com.apple.quarantine /Applications/RizRef.app
+
+Requirements: macOS 10.13 or later on Intel, macOS 11 or later on Apple
+Silicon. One app runs natively on both.
+
+Source code, checksums and issues: https://github.com/MRizky099/RizRef

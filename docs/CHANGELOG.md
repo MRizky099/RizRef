@@ -84,6 +84,21 @@ Format revision 1.3 (additive; see `docs/format.md`, "Text items").
   `Ctrl`+arrows move by word, `Ctrl+Home`/`End` go to the start or end, dragging selects,
   double-click selects a word, `Ctrl+C`/`Ctrl+X` copy and cut.
 
+## Phase 08c (part) — macOS downloads
+
+Part of issue #24. Owner decisions: a drag-to-Applications **`.dmg`**, and **no paid
+Apple Developer account** (none could be created), so the app is ad-hoc signed (Apple
+Silicon requires a signature to run) and not notarized.
+
+- `packaging/macos/build-dmg.sh` turns the checked `RizRef.app` into
+  `RizRef-<version>-macos-universal.dmg` (the app, an `Applications` link and
+  *How to open RizRef.txt*; compressed read-only HFS+ so it mounts on 10.13) and the
+  portable `RizRef-<version>-macos-universal.zip`, with SHA-256 sums. It verifies the
+  image, mounts it, and checks the app inside verifies and starts.
+- The macOS CI job runs it after the bundle build and keeps both files as artifacts.
+- README → Installation → macOS documents the one-time Gatekeeper confirmation
+  (*Open Anyway* on macOS 15+, Control-click → Open on 10.13–14, or `xattr`).
+
 ## Phase 08b — macOS (in review)
 
 Branch `feat/phase-08b-macos`, part of issue #24. No format change; Windows and Linux

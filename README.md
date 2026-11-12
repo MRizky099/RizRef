@@ -96,8 +96,8 @@ uses DLLs that ship with Windows.
 
 Linux (x86_64, X11 or Wayland, glibc 2.35 / Ubuntu 22.04 or newer, a **Vulkan**
 driver) builds from source as a preview; packages arrive with phase 08c. macOS (10.13+
-on Intel, 11.0+ on Apple Silicon, **Metal**) builds as one universal `RizRef.app`
-from source as a preview; the signed download arrives with phase 08c. v1.0.0 will
+on Intel, 11.0+ on Apple Silicon, **Metal**) ships as one universal app in a `.dmg`
+(see [Installation](#installation)); it is not notarized. v1.0.0 will
 be released for all three platforms together.
 
 ## Installation
@@ -133,6 +133,26 @@ Uninstall from *Settings → Apps*. It removes the file association too. Silent 
 If Explorer keeps showing old icons or thumbnails, run `ie4uinit -show`. If that isn't
 enough, delete `%LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache_*.db` and
 `thumbcache_*.db`, then restart Explorer.
+
+### macOS
+
+One universal app runs natively on Intel (macOS 10.13 or later) and Apple Silicon
+(macOS 11 or later).
+
+**Installer** (`RizRef-<version>-macos-universal.dmg`): open it and drag **RizRef** onto
+**Applications**. `.rizref` boards get their icon and open with RizRef as soon as the
+app is in Applications; there is no separate registration step.
+
+**Portable** (`RizRef-<version>-macos-universal.zip`): unzip and run `RizRef.app` from
+any folder.
+
+> **First launch:** RizRef is not signed with a paid Apple Developer ID, so macOS asks you
+> to confirm it once. On **macOS 15 and later**, open RizRef, click *Done*, then go to
+> *System Settings → Privacy & Security* and click **Open Anyway** next to "RizRef was
+> blocked". On **macOS 10.13–14**, Control-click RizRef in Applications and choose
+> **Open**. Or, in Terminal: `xattr -dr com.apple.quarantine /Applications/RizRef.app`.
+> The same steps are in *How to open RizRef.txt* inside the `.dmg`. Check the download
+> against the published `.sha256` if you want to be sure it is the release build.
 
 ## Quick start
 
@@ -229,6 +249,7 @@ and linked libraries with `otool`):
 ```bash
 rustup target add x86_64-apple-darwin aarch64-apple-darwin
 packaging/macos/build-app.sh            # dist/macos/RizRef.app
+packaging/macos/build-dmg.sh            # the .dmg, the portable .zip and SHA-256 sums
 ```
 
 ## For developers
