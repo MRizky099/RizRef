@@ -148,16 +148,19 @@ impl ShortcutsPanel {
 
     /// The filtered action list.
     pub fn filtered(&self, shortcuts: &Shortcuts) -> Vec<ShortcutId> {
-        let needle = self.filter.trim().to_ascii_lowercase();
+        let needle = search_key(self.filter.trim());
         ShortcutId::ALL
             .into_iter()
             .filter(|id| {
                 if needle.is_empty() {
                     return true;
                 }
+                // The settings spelling and the shown label (`⌘Y` on macOS),
+                // with Ctrl and Cmd treated as one primary modifier: either
+                // spelling finds the chord on every OS.
                 let chord = shortcuts
                     .chord_for(*id)
-                    .map(|chord| chord.to_string().to_ascii_lowercase())
+                    .map(|chord| search_key(&format!("{chord} {}", chord.label())))
                     .unwrap_or_default();
                 id.label().to_ascii_lowercase().contains(&needle) || chord.contains(&needle)
             })
@@ -818,6 +821,14 @@ pub fn cycle_percent(current: u8, direction: i32, min: u8, max: u8, step: u8) ->
     }
 }
 
+/// Lowercased text for the shortcut search, with the primary modifier's
+/// spellings (`ctrl`, `cmd`, `command`) folded into one.
+fn search_key(text: &str) -> String {
+    text.to_lowercase()
+        .replace("command", "ctrl")
+        .replace("cmd", "ctrl")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -841,8 +852,14 @@ mod tests {
         assert!(filtered.contains(&ShortcutId::ZoomHundred));
         assert!(!filtered.contains(&ShortcutId::Undo));
 
-        panel.filter = "ctrl+y".to_owned();
-        assert_eq!(panel.filtered(&shortcuts), vec![ShortcutId::Redo]);
+        for spelling in ["ctrl+y", "Cmd+Y", "command+y"] {
+            panel.filter = spelling.to_owned();
+            assert_eq!(
+                panel.filtered(&shortcuts),
+                vec![ShortcutId::Redo],
+                "{spelling}"
+            );
+        }
     }
 
     #[test]
