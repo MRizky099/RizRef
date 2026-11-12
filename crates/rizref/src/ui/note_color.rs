@@ -87,6 +87,10 @@ pub struct NoteColorPopover {
     pub focus: Option<usize>,
     /// What the pointer is over.
     pub hovered: Option<PopoverHit>,
+    /// Whether this picks the colour of a text item's characters rather
+    /// than a note's background.
+    pub text: bool,
+    presets: &'static [[u8; 3]; 12],
     bounds: UiRect,
 }
 
@@ -94,6 +98,29 @@ impl NoteColorPopover {
     /// Opens under `anchor` (the swatch's bottom-left), clamped into the
     /// viewport.
     pub fn open(note: ItemId, current: [u8; 3], anchor: DVec2, viewport: DVec2) -> Self {
+        Self::open_with(note, current, anchor, viewport, &PRESETS, false)
+    }
+
+    /// Opens the text colour picker of the text item being edited.
+    pub fn open_text(note: ItemId, current: [u8; 3], anchor: DVec2, viewport: DVec2) -> Self {
+        Self::open_with(
+            note,
+            current,
+            anchor,
+            viewport,
+            &crate::rich_text::TEXT_PRESETS,
+            true,
+        )
+    }
+
+    fn open_with(
+        note: ItemId,
+        current: [u8; 3],
+        anchor: DVec2,
+        viewport: DVec2,
+        presets: &'static [[u8; 3]; 12],
+        text: bool,
+    ) -> Self {
         let height = Self::height();
         let x = (anchor.x as f32).clamp(4.0, (viewport.x as f32 - WIDTH - 4.0).max(4.0));
         let mut y = anchor.y as f32 + 4.0;
@@ -104,8 +131,10 @@ impl NoteColorPopover {
             note,
             current,
             field: rizref_format::document::format_background(current),
-            focus: PRESETS.iter().position(|preset| *preset == current),
+            focus: presets.iter().position(|preset| *preset == current),
             hovered: None,
+            text,
+            presets,
             bounds: UiRect::new(x, y, WIDTH, height),
         }
     }
@@ -163,7 +192,7 @@ impl NoteColorPopover {
             return None;
         }
         if let Some(index) =
-            (0..PRESETS.len()).find(|index| self.swatch_rect(*index).contains(x, y))
+            (0..self.presets.len()).find(|index| self.swatch_rect(*index).contains(x, y))
         {
             return Some(PopoverHit::Swatch(index));
         }
@@ -188,7 +217,7 @@ impl NoteColorPopover {
     pub fn click(&mut self, point: DVec2) -> PopoverResult {
         match self.hit(point) {
             None => PopoverResult::Closed,
-            Some(PopoverHit::Swatch(index)) => PopoverResult::Apply(PRESETS[index]),
+            Some(PopoverHit::Swatch(index)) => PopoverResult::Apply(self.presets[index]),
             Some(PopoverHit::Pick) => PopoverResult::Pick,
             Some(PopoverHit::Field | PopoverHit::Panel) => PopoverResult::None,
         }
@@ -196,7 +225,7 @@ impl NoteColorPopover {
 
     /// A navigation or editing key.
     pub fn key(&mut self, key: Key) -> PopoverResult {
-        let count = PRESETS.len();
+        let count = self.presets.len();
         let step = |focus: Option<usize>, delta: isize| {
             let base = focus.unwrap_or(0) as isize;
             Some((base + delta).rem_euclid(count as isize) as usize)
@@ -206,7 +235,7 @@ impl NoteColorPopover {
             Key::Enter => {
                 return match (self.field_colour(), self.focus) {
                     (Some(colour), _) => PopoverResult::Apply(colour),
-                    (None, Some(index)) => PopoverResult::Apply(PRESETS[index]),
+                    (None, Some(index)) => PopoverResult::Apply(self.presets[index]),
                     (None, None) => PopoverResult::None,
                 };
             }
@@ -222,7 +251,7 @@ impl NoteColorPopover {
         };
         self.focus = moved;
         if let Some(index) = moved {
-            self.field = rizref_format::document::format_background(PRESETS[index]);
+            self.field = rizref_format::document::format_background(self.presets[index]);
         }
         PopoverResult::Changed
     }
@@ -241,7 +270,7 @@ impl NoteColorPopover {
         if changed {
             self.focus = self
                 .field_colour()
-                .and_then(|colour| PRESETS.iter().position(|preset| *preset == colour));
+                .and_then(|colour| self.presets.iter().position(|preset| *preset == colour));
         }
         changed
     }
@@ -249,7 +278,7 @@ impl NoteColorPopover {
     /// Paints the popover.
     pub fn paint(&self, painter: &mut Painter) {
         painter.panel(self.bounds, 8.0);
-        for (index, preset) in PRESETS.iter().enumerate() {
+        for (index, preset) in self.presets.iter().enumerate() {
             let rect = self.swatch_rect(index);
             if self.hovered == Some(PopoverHit::Swatch(index)) {
                 painter.fill_round_rect(rect.inset(-3.0), 6.0, HOVER_BG);

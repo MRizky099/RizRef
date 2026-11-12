@@ -456,7 +456,13 @@ mod tests {
 
         let exe = std::env::current_exe().expect("test binary");
         let mut loaded_rounds = Vec::new();
-        for (attempt, delay_ms) in [180_u64, 260, 330, 410, 520, 640].into_iter().enumerate() {
+        // The later kills keep the test meaningful under a loaded machine (a full
+        // parallel `cargo test`), where the child can take longer than the
+        // early delays just to start and finish its first autosave.
+        for (attempt, delay_ms) in [180_u64, 260, 330, 410, 520, 640, 1500, 3000]
+            .into_iter()
+            .enumerate()
+        {
             let dir = temp_dir(&format!("kill{attempt}"));
             let mut child = std::process::Command::new(&exe)
                 .args([

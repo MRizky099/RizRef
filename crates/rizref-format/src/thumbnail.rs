@@ -162,6 +162,9 @@ fn draw_item(pixmap: &mut Pixmap, scene: &Scene, item: &Item, origin: Vec2, scal
             quality: FilterQuality::Bilinear,
         };
         pixmap.draw_pixmap(0, 0, preview_pixmap.as_ref(), &paint, transform, None);
+    } else if item.is_rich_text() {
+        // A text item has no card, and the thumbnail draws no glyphs: a
+        // card here would be a box the board never shows.
     } else {
         // A note: a card without its text, rotated with the item.
         let Some(rect) = tiny_skia::Rect::from_xywh(-size.x * 0.5, -size.y * 0.5, size.x, size.y)

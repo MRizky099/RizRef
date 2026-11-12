@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::asset::AssetId;
 use crate::geometry::Rect;
+use crate::rich::{TextSpan, normalize};
 use crate::scene::ItemId;
 use crate::transform::Transform;
 
@@ -27,6 +28,10 @@ pub const NOTE_PADDING: f32 = 14.0;
 
 /// The default note card colour, `#302c25`.
 pub const DEFAULT_NOTE_BACKGROUND: [u8; 3] = [0x30, 0x2c, 0x25];
+
+/// Inner padding between a text item's box and its glyphs, in unscaled
+/// text units (the box scales with the text, so this scales too).
+pub const TEXT_PADDING: f32 = 6.0;
 
 /// Smallest stored note wrap width, in world units.
 pub const MIN_WRAP_WIDTH: f32 = 16.0;
@@ -52,6 +57,10 @@ pub enum NoteFormat {
     Plain,
     /// The markdown subset rendered by the application.
     Markdown,
+    /// A free-standing text item: plain `text` styled by `spans` (bold,
+    /// italic, underline, colour), with no card behind it. Its box scales
+    /// the text: resizing the item resizes the glyphs.
+    Rich,
 }
 
 /// Everything that describes a note's content, as one before/after unit.
@@ -69,9 +78,27 @@ pub struct NoteContent {
     /// The width the content is laid out at, in world units; `None` uses the
     /// note's inner box width.
     pub wrap_width: Option<f32>,
+    /// Styled runs over `text`, for [`NoteFormat::Rich`]; empty otherwise.
+    pub spans: Vec<TextSpan>,
 }
 
 impl NoteContent {
+    /// An unstyled text item.
+    pub fn rich(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            format: NoteFormat::Rich,
+            background: None,
+            wrap_width: None,
+            spans: Vec::new(),
+        }
+    }
+
+    /// Whether this is a free-standing text item rather than a note card.
+    pub fn is_rich(&self) -> bool {
+        self.format == NoteFormat::Rich
+    }
+
     /// A markdown note with the given source and no overrides.
     pub fn markdown(text: impl Into<String>) -> Self {
         Self {
@@ -79,6 +106,7 @@ impl NoteContent {
             format: NoteFormat::Markdown,
             background: None,
             wrap_width: None,
+            spans: Vec::new(),
         }
     }
 
@@ -116,6 +144,9 @@ pub enum ItemBody {
         /// The content wrap width in world units.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wrap_width: Option<f32>,
+        /// Styled runs over `text` (rich text items only).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        spans: Vec<TextSpan>,
     },
 }
 
@@ -171,7 +202,9 @@ impl Item {
             format,
             background,
             wrap_width,
+            spans,
         } = content;
+        let spans = normalize(&text, spans);
         Self {
             id,
             transform: Transform::new(center, size),
@@ -183,6 +216,7 @@ impl Item {
                 format,
                 background,
                 wrap_width: wrap_width.and_then(clamp_wrap_width),
+                spans,
             },
         }
     }
@@ -226,11 +260,13 @@ impl Item {
                 format,
                 background,
                 wrap_width,
+                spans,
             } => Some(NoteContent {
                 text: text.clone(),
                 format: *format,
                 background: *background,
                 wrap_width: *wrap_width,
+                spans: spans.clone(),
             }),
             ItemBody::Image { .. } => None,
         }
@@ -266,17 +302,21 @@ impl Item {
                 format,
                 background,
                 wrap_width,
+                spans,
             } => {
                 let new_wrap = content.wrap_width.and_then(clamp_wrap_width);
+                let new_spans = normalize(&content.text, content.spans.clone());
                 let changed = *text != content.text
                     || *format != content.format
                     || *background != content.background
-                    || *wrap_width != new_wrap;
+                    || *wrap_width != new_wrap
+                    || *spans != new_spans;
                 if changed {
                     text.clone_from(&content.text);
                     *format = content.format;
                     *background = content.background;
                     *wrap_width = new_wrap;
+                    *spans = new_spans;
                 }
                 changed
             }
@@ -287,12 +327,13 @@ impl Item {
     /// Replaces the note text, returning whether it changed.
     pub fn set_text(&mut self, new_text: &str) -> bool {
         match &mut self.body {
-            ItemBody::Note { text, .. } => {
+            ItemBody::Note { text, spans, .. } => {
                 if text == new_text {
                     false
                 } else {
                     text.clear();
                     text.push_str(new_text);
+                    *spans = normalize(text, std::mem::take(spans));
                     true
                 }
             }
@@ -303,6 +344,24 @@ impl Item {
     /// Whether the item is a note.
     pub fn is_note(&self) -> bool {
         matches!(self.body, ItemBody::Note { .. })
+    }
+
+    /// Whether the rotate gesture may turn the item: images and text items
+    /// yes, note cards no (a note is a card of reading text and stays
+    /// upright).
+    pub fn is_rotatable(&self) -> bool {
+        !self.is_note() || self.is_rich_text()
+    }
+
+    /// Whether the item is a free-standing rich text item.
+    pub fn is_rich_text(&self) -> bool {
+        matches!(
+            self.body,
+            ItemBody::Note {
+                format: NoteFormat::Rich,
+                ..
+            }
+        )
     }
 
     /// The item's placement and quad flags.
@@ -563,6 +622,7 @@ mod tests {
                 format: NoteFormat::Plain,
                 background: None,
                 wrap_width: None,
+                spans: Vec::new(),
             }
         );
         let json = serde_json::to_string(&ItemBody::Note {
@@ -570,8 +630,31 @@ mod tests {
             format: NoteFormat::Markdown,
             background: None,
             wrap_width: None,
+            spans: Vec::new(),
         })
         .expect("serialises");
         assert_eq!(json, r#"{"kind":"note","text":"new","format":"markdown"}"#);
+    }
+
+    #[test]
+    fn a_rich_item_keeps_normalised_spans() {
+        use crate::rich::{TextSpan, TextStyle};
+        let bold = TextStyle {
+            bold: true,
+            ..TextStyle::default()
+        };
+        let span = |start, end| TextSpan {
+            start,
+            end,
+            style: bold,
+        };
+        let mut content = NoteContent::rich("hello");
+        content.spans = vec![span(0, 2), span(2, 99)];
+        let mut item = Item::note_with(ItemId::from_raw(9), content.clone(), Vec2::ZERO, Vec2::ONE);
+        assert!(item.is_rich_text() && item.is_note());
+        assert_eq!(item.note_content().expect("note").spans, vec![span(0, 5)]);
+        assert!(!item.set_note(&content), "normalises to the same spans");
+        assert!(item.set_text("hi"));
+        assert_eq!(item.note_content().expect("note").spans, vec![span(0, 2)]);
     }
 }

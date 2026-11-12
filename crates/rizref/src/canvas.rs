@@ -165,6 +165,9 @@ pub struct QuadInstance {
     pub uv: [f32; 4],
     /// RGBA tint, straight alpha, 1.0 = unmodified.
     pub tint: [f32; 4],
+    /// Whether translucent pixels get the checkerboard backdrop (images);
+    /// off for text items, whose transparency is the canvas showing through.
+    pub backdrop: bool,
 }
 
 impl QuadInstance {
@@ -176,6 +179,7 @@ impl QuadInstance {
             rotation,
             uv: [0.0, 0.0, 1.0, 1.0],
             tint: [1.0, 1.0, 1.0, 1.0],
+            backdrop: true,
         }
     }
 
@@ -188,7 +192,7 @@ impl QuadInstance {
             self.size[0],
             self.size[1],
             self.rotation,
-            0.0,
+            if self.backdrop { 1.0 } else { 0.0 },
             0.0,
             0.0,
             self.uv[0],

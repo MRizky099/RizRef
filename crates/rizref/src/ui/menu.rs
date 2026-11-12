@@ -137,6 +137,18 @@ pub enum Action {
     ConfirmNoteEdit,
     /// Cancel the note being edited (✗).
     CancelNoteEdit,
+    /// Toggle bold in the text item being edited.
+    TextBold,
+    /// Toggle italic in the text item being edited.
+    TextItalic,
+    /// Toggle underline in the text item being edited.
+    TextUnderline,
+    /// Open the text colour popover of the text item being edited.
+    TextColour,
+    /// Step the font size down in the text item being edited.
+    TextSmaller,
+    /// Step the font size up in the text item being edited.
+    TextLarger,
     /// Open the information dialog for the one selected image.
     ShowImageInfo,
     /// Open the selected image's file location or URL.
@@ -147,6 +159,10 @@ pub enum Action {
     CopyImageAssetId,
     /// Close the image information dialog.
     CloseImageInfo,
+    /// Open the size dialog for the selection.
+    SetSize,
+    /// Open the rotation dialog for the selection.
+    SetRotation,
 }
 
 impl Action {
@@ -330,9 +346,17 @@ pub struct MenuContext<'a> {
     pub opacity_percent: u8,
     /// Whether exactly one note is selected (enables the note commands).
     pub note_selected: bool,
+    /// Whether that note is a free-standing text item (no card to colour,
+    /// nothing to reflow or fit).
+    pub text_selected: bool,
     /// The one selected image, when the selection is exactly one image:
     /// `Some(None)` for an image without a launchable location.
     pub selected_image: Option<Option<LocationKind>>,
+    /// Whether anything is selected (enables `Set size…`).
+    pub has_selection: bool,
+    /// Whether the selection holds something that turns (enables
+    /// `Set rotation…`; note cards stay upright).
+    pub rotatable_selection: bool,
 }
 
 /// The image provenance commands, in menu order: `Image info…` and the
@@ -360,8 +384,29 @@ pub fn image_actions(selected_image: Option<Option<LocationKind>>) -> Vec<MenuEn
     ]
 }
 
+/// The exact size and angle commands, disabled when nothing applies.
+pub fn transform_actions(has_selection: bool, rotatable: bool) -> Vec<MenuEntry> {
+    let size = MenuEntry::item("Set size…", Action::SetSize);
+    let rotation = MenuEntry::item("Set rotation…", Action::SetRotation);
+    vec![
+        if has_selection { size } else { size.disabled() },
+        if rotatable {
+            rotation
+        } else {
+            rotation.disabled()
+        },
+    ]
+}
+
 /// The note commands for one selected note, in menu order.
-pub fn note_actions() -> Vec<MenuEntry> {
+pub fn note_actions(text: bool) -> Vec<MenuEntry> {
+    if text {
+        return vec![
+            MenuEntry::item("Edit text", Action::EditNote),
+            MenuEntry::separator(),
+            MenuEntry::item("Delete text", Action::DeleteNote),
+        ];
+    }
     vec![
         MenuEntry::item("Edit note", Action::EditNote),
         MenuEntry::item("Background colour…", Action::NoteBackground),
@@ -376,19 +421,34 @@ pub fn note_actions() -> Vec<MenuEntry> {
 /// then the full command tree.
 pub fn build_context(context: &MenuContext) -> Vec<MenuEntry> {
     let mut entries = if context.note_selected {
-        note_actions()
+        note_actions(context.text_selected)
     } else if context.selected_image.is_some() {
         image_actions(context.selected_image)
+    } else if context.has_selection {
+        Vec::new()
     } else {
         accelerate(
-            vec![MenuEntry::shortcut(
-                "New note",
-                ShortcutId::CreateNote,
-                Action::from_shortcut(ShortcutId::CreateNote),
-            )],
+            vec![
+                MenuEntry::shortcut(
+                    "New note",
+                    ShortcutId::CreateNote,
+                    Action::from_shortcut(ShortcutId::CreateNote),
+                ),
+                MenuEntry::shortcut(
+                    "Add text",
+                    ShortcutId::CreateText,
+                    Action::from_shortcut(ShortcutId::CreateText),
+                ),
+            ],
             context.shortcuts,
         )
     };
+    if context.has_selection {
+        if !entries.is_empty() {
+            entries.push(MenuEntry::separator());
+        }
+        entries.extend(transform_actions(true, context.rotatable_selection));
+    }
     entries.push(MenuEntry::separator());
     entries.extend(build(context));
     entries
@@ -471,7 +531,7 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
             Action::from_shortcut(S::ArrangeStack),
         ),
     ];
-    let transform = vec![
+    let mut transform = vec![
         MenuEntry::shortcut(
             "Flip horizontal",
             S::FlipHorizontal,
@@ -482,6 +542,13 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
             S::FlipVertical,
             Action::from_shortcut(S::FlipVertical),
         ),
+        MenuEntry::separator(),
+    ];
+    transform.extend(transform_actions(
+        context.has_selection,
+        context.rotatable_selection,
+    ));
+    transform.extend(vec![
         MenuEntry::separator(),
         MenuEntry::shortcut(
             "Reset transform",
@@ -498,7 +565,7 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
             S::MatchHeight,
             Action::from_shortcut(S::MatchHeight),
         ),
-    ];
+    ]);
     let order = vec![
         MenuEntry::shortcut(
             "Raise",
@@ -683,14 +750,21 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
         MenuEntry::item("About RizRef", Action::About),
     ];
 
-    let mut note = vec![MenuEntry::shortcut(
-        "New note",
-        S::CreateNote,
-        Action::from_shortcut(S::CreateNote),
-    )];
+    let mut note = vec![
+        MenuEntry::shortcut(
+            "New note",
+            S::CreateNote,
+            Action::from_shortcut(S::CreateNote),
+        ),
+        MenuEntry::shortcut(
+            "Add text",
+            S::CreateText,
+            Action::from_shortcut(S::CreateText),
+        ),
+    ];
     if context.note_selected {
         note.push(MenuEntry::separator());
-        note.extend(note_actions());
+        note.extend(note_actions(context.text_selected));
     }
 
     let root = vec![
@@ -1181,7 +1255,10 @@ mod tests {
             capabilities: crate::platform::capabilities::Capabilities::WIN32,
             opacity_percent: 100,
             note_selected: false,
+            text_selected: false,
             selected_image: None,
+            has_selection: false,
+            rotatable_selection: false,
         }
     }
 
@@ -1285,7 +1362,7 @@ mod tests {
             .iter()
             .find(|entry| entry.label == "Note")
             .expect("Note menu");
-        assert_eq!(labels(&note.children), ["New note"]);
+        assert_eq!(labels(&note.children), ["New note", "Add text"]);
         let image = root
             .iter()
             .find(|entry| entry.label == "Image")
@@ -1312,6 +1389,18 @@ mod tests {
         ] {
             assert!(names.contains(&wanted), "{wanted} in {names:?}");
         }
+
+        // A selected text item offers only what applies to it.
+        ctx.text_selected = true;
+        let root = build(&ctx);
+        let note = root
+            .iter()
+            .find(|entry| entry.label == "Note")
+            .expect("Note menu");
+        let names = labels(&note.children);
+        assert!(names.contains(&"Edit text") && names.contains(&"Delete text"));
+        assert!(!names.contains(&"Background colour…"), "{names:?}");
+        assert!(!names.contains(&"Reflow to box width"), "{names:?}");
     }
 
     #[test]
@@ -1333,6 +1422,48 @@ mod tests {
                 .any(|entry| entry.action == Some(Action::ReflowNote))
         );
         assert!(menu.iter().any(|entry| entry.label == "File"));
+    }
+
+    #[test]
+    fn exact_size_and_rotation_are_offered_for_a_selection() {
+        let settings = Settings::default();
+        let shortcuts = Shortcuts::new();
+        let recents = Recents::default();
+        let mut ctx = context(&settings, &shortcuts, &recents);
+        let find = |entries: &[MenuEntry], action: Action| {
+            entries
+                .iter()
+                .find(|entry| entry.action == Some(action.clone()))
+                .map(|entry| entry.enabled)
+        };
+        let transform = |ctx: &MenuContext| {
+            image_menu(&build(ctx))
+                .iter()
+                .find(|entry| entry.label == "Transform")
+                .expect("Transform")
+                .children
+                .clone()
+        };
+        // Nothing selected: in the Transform menu, greyed out; not on the
+        // right-click top group.
+        assert_eq!(find(&transform(&ctx), Action::SetSize), Some(false));
+        assert_eq!(find(&build_context(&ctx)[..3], Action::SetSize), None);
+
+        // A note card: size yes, rotation no.
+        ctx.has_selection = true;
+        ctx.note_selected = true;
+        let menu = build_context(&ctx);
+        assert_eq!(find(&menu, Action::SetSize), Some(true));
+        assert_eq!(find(&menu, Action::SetRotation), Some(false));
+
+        // Several images: both, first in the right-click menu.
+        ctx.note_selected = false;
+        ctx.rotatable_selection = true;
+        let menu = build_context(&ctx);
+        assert_eq!(menu[0].action, Some(Action::SetSize));
+        assert_eq!(menu[1].action, Some(Action::SetRotation));
+        assert!(menu[1].enabled);
+        assert_eq!(find(&transform(&ctx), Action::SetRotation), Some(true));
     }
 
     fn viewport() -> DVec2 {

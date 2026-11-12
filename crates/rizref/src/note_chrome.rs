@@ -1,5 +1,6 @@
 //! Layout and hit-testing for the note chrome: the rendered-mode hover
-//! toolbar (background · edit · delete) and the edit-mode ✗/✓ pill.
+//! toolbar (background · edit · delete), the edit-mode ✗/✓ pill, and the
+//! text item's format bar (bold · italic · underline · colour · ✗ · ✓).
 //!
 //! Everything is in logical viewport pixels and screen-constant: the chrome
 //! never scales with the note or the zoom. The geometry is pure so the app can
@@ -153,8 +154,9 @@ impl PillButton {
 pub struct ToolbarLayout {
     /// The translucent pill behind the buttons.
     pub pill: ScreenRect,
-    /// The buttons, left to right.
-    pub buttons: [(ToolbarButton, ScreenRect); 3],
+    /// The buttons, left to right; only the first `count` are shown.
+    buttons: [(ToolbarButton, ScreenRect); 3],
+    count: usize,
 }
 
 impl ToolbarLayout {
@@ -162,25 +164,50 @@ impl ToolbarLayout {
     /// its bottom-left when there is no room above): drawn over the card it
     /// covered the note's first line (phase 07 manual test).
     pub fn new(note: ScreenRect, top: f32, bottom: f32) -> Self {
-        let width = 3.0 * TOOLBAR_BUTTON + 2.0 * TOOLBAR_GAP + 2.0 * PILL_PAD;
+        Self::with_buttons(note, top, bottom, &ToolbarButton::ORDER)
+    }
+
+    /// The toolbar of a text item: it has no card, so no background swatch.
+    pub fn for_text(note: ScreenRect, top: f32, bottom: f32) -> Self {
+        Self::with_buttons(
+            note,
+            top,
+            bottom,
+            &[ToolbarButton::Edit, ToolbarButton::Delete],
+        )
+    }
+
+    fn with_buttons(note: ScreenRect, top: f32, bottom: f32, order: &[ToolbarButton]) -> Self {
+        let count = order.len().min(3);
+        let n = count as f32;
+        let width = n * TOOLBAR_BUTTON + (n - 1.0) * TOOLBAR_GAP + 2.0 * PILL_PAD;
         let height = TOOLBAR_BUTTON + 2.0 * PILL_PAD;
         let origin = outside(note, Vec2::new(width, height), true, top, bottom);
         let pill = ScreenRect::new(origin, Vec2::new(width, height));
-        let buttons = ToolbarButton::ORDER.map(|button| {
-            let index = ToolbarButton::ORDER
-                .iter()
-                .position(|b| *b == button)
-                .unwrap_or(0) as f32;
-            let min =
-                origin + Vec2::new(PILL_PAD + index * (TOOLBAR_BUTTON + TOOLBAR_GAP), PILL_PAD);
-            (button, ScreenRect::new(min, Vec2::splat(TOOLBAR_BUTTON)))
-        });
-        Self { pill, buttons }
+        let mut buttons = [(ToolbarButton::Delete, ScreenRect::new(origin, Vec2::ZERO)); 3];
+        for (index, button) in order.iter().take(3).enumerate() {
+            let min = origin
+                + Vec2::new(
+                    PILL_PAD + index as f32 * (TOOLBAR_BUTTON + TOOLBAR_GAP),
+                    PILL_PAD,
+                );
+            buttons[index] = (*button, ScreenRect::new(min, Vec2::splat(TOOLBAR_BUTTON)));
+        }
+        Self {
+            pill,
+            buttons,
+            count,
+        }
+    }
+
+    /// The shown buttons, left to right.
+    pub fn buttons(&self) -> &[(ToolbarButton, ScreenRect)] {
+        &self.buttons[..self.count]
     }
 
     /// The button under `point`.
     pub fn hit(&self, point: Vec2) -> Option<ToolbarButton> {
-        self.buttons
+        self.buttons()
             .iter()
             .find(|(_, rect)| rect.contains(point))
             .map(|(button, _)| *button)
@@ -200,7 +227,7 @@ impl ToolbarLayout {
 
     /// The rectangle of one button.
     pub fn button(&self, button: ToolbarButton) -> ScreenRect {
-        self.buttons
+        self.buttons()
             .iter()
             .find(|(b, _)| *b == button)
             .map_or(self.pill, |(_, rect)| *rect)
@@ -250,6 +277,112 @@ impl PillLayout {
     }
 }
 
+/// One button of a text item's format bar, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextBarButton {
+    /// **B**: toggle bold.
+    Bold,
+    /// *I*: toggle italic.
+    Italic,
+    /// U̲: toggle underline.
+    Underline,
+    /// A−: step the font size down.
+    Smaller,
+    /// A+: step the font size up.
+    Larger,
+    /// The colour swatch; opens the text colour popover.
+    Colour,
+    /// ✗: cancel the edit.
+    Cancel,
+    /// ✓: commit the edit.
+    Confirm,
+}
+
+impl TextBarButton {
+    /// Left-to-right order.
+    pub const ORDER: [Self; 8] = [
+        Self::Bold,
+        Self::Italic,
+        Self::Underline,
+        Self::Smaller,
+        Self::Larger,
+        Self::Colour,
+        Self::Cancel,
+        Self::Confirm,
+    ];
+
+    /// Tooltip and accessible name.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Bold => "Bold (Ctrl+B)",
+            Self::Italic => "Italic (Ctrl+I)",
+            Self::Underline => "Underline (Ctrl+U)",
+            Self::Smaller => "Smaller text (Ctrl+[)",
+            Self::Larger => "Larger text (Ctrl+])",
+            Self::Colour => "Text colour",
+            Self::Cancel => "Cancel text edit (Esc)",
+            Self::Confirm => "Confirm text edit (Ctrl+Enter)",
+        }
+    }
+}
+
+/// Extra space between the format buttons and the ✗/✓ pair.
+const TEXT_BAR_DIVIDER: f32 = 10.0;
+
+/// The format bar placed for one text item.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextBarLayout {
+    /// The pill behind the buttons.
+    pub pill: ScreenRect,
+    /// The buttons, left to right.
+    pub buttons: [(TextBarButton, ScreenRect); 8],
+    /// Where the divider between the format and edit buttons is drawn.
+    pub divider_x: f32,
+}
+
+impl TextBarLayout {
+    /// Places the bar outside the item, above its top-left corner (below it
+    /// when there is no room above), clear of the text being typed.
+    pub fn new(note: ScreenRect, top: f32, bottom: f32) -> Self {
+        let width = 8.0 * PILL_BUTTON + 7.0 * TOOLBAR_GAP + TEXT_BAR_DIVIDER + 2.0 * PILL_PAD;
+        let height = PILL_BUTTON + 2.0 * PILL_PAD;
+        let origin = outside(note, Vec2::new(width, height), true, top, bottom);
+        let pill = ScreenRect::new(origin, Vec2::new(width, height));
+        let mut x = origin.x + PILL_PAD;
+        let mut divider_x = x;
+        let buttons = TextBarButton::ORDER.map(|button| {
+            if button == TextBarButton::Cancel {
+                divider_x = x + TEXT_BAR_DIVIDER * 0.5 - TOOLBAR_GAP * 0.5;
+                x += TEXT_BAR_DIVIDER;
+            }
+            let rect = ScreenRect::new(Vec2::new(x, origin.y + PILL_PAD), Vec2::splat(PILL_BUTTON));
+            x += PILL_BUTTON + TOOLBAR_GAP;
+            (button, rect)
+        });
+        Self {
+            pill,
+            buttons,
+            divider_x,
+        }
+    }
+
+    /// The button under `point`.
+    pub fn hit(&self, point: Vec2) -> Option<TextBarButton> {
+        self.buttons
+            .iter()
+            .find(|(_, rect)| rect.contains(point))
+            .map(|(button, _)| *button)
+    }
+
+    /// The rectangle of one button.
+    pub fn button(&self, button: TextBarButton) -> ScreenRect {
+        self.buttons
+            .iter()
+            .find(|(b, _)| *b == button)
+            .map_or(self.pill, |(_, rect)| *rect)
+    }
+}
+
 /// What the overlay should draw for notes this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NoteChrome {
@@ -269,6 +402,21 @@ pub enum NoteChrome {
         /// The button under the pointer.
         hovered: Option<PillButton>,
     },
+    /// A text item's format bar while it is edited.
+    TextBar {
+        /// Placement.
+        layout: TextBarLayout,
+        /// What the toggles show as on, and the colour swatch.
+        bold: bool,
+        /// Italic is on.
+        italic: bool,
+        /// Underline is on.
+        underline: bool,
+        /// The colour swatch.
+        colour: [u8; 3],
+        /// The button under the pointer.
+        hovered: Option<TextBarButton>,
+    },
 }
 
 #[cfg(test)]
@@ -286,7 +434,7 @@ mod tests {
     #[test]
     fn the_toolbar_is_swatch_pencil_trash_above_the_top_left() {
         let layout = ToolbarLayout::new(note(), 0.0, 10_000.0);
-        let order: Vec<ToolbarButton> = layout.buttons.iter().map(|(b, _)| *b).collect();
+        let order: Vec<ToolbarButton> = layout.buttons().iter().map(|(b, _)| *b).collect();
         assert_eq!(
             order,
             [
@@ -297,9 +445,9 @@ mod tests {
         );
         assert_eq!(layout.pill.min.x, 100.0);
         assert_eq!(layout.pill.max.y, 100.0 - CHROME_INSET, "above the card");
-        let xs: Vec<f32> = layout.buttons.iter().map(|(_, r)| r.min.x).collect();
+        let xs: Vec<f32> = layout.buttons().iter().map(|(_, r)| r.min.x).collect();
         assert!(xs[0] < xs[1] && xs[1] < xs[2]);
-        for (button, rect) in layout.buttons {
+        for &(button, rect) in layout.buttons() {
             assert_eq!(rect.size(), Vec2::splat(TOOLBAR_BUTTON));
             let centre = (rect.min + rect.max) * 0.5;
             assert_eq!(layout.hit(centre), Some(button));
@@ -357,7 +505,7 @@ mod tests {
         let note = note();
         let layout = ToolbarLayout::new(note, 0.0, 10_000.0);
         // A point in the gap, straight below the first button.
-        let gap = Vec2::new(layout.buttons[0].1.min.x + 2.0, note.min.y - 2.0);
+        let gap = Vec2::new(layout.buttons()[0].1.min.x + 2.0, note.min.y - 2.0);
         assert!(layout.contains(gap));
     }
 
@@ -390,6 +538,29 @@ mod tests {
             0.0,
             10_000.0,
         );
-        assert_eq!(near.buttons[0].1.size(), far.buttons[0].1.size());
+        assert_eq!(near.buttons()[0].1.size(), far.buttons()[0].1.size());
+    }
+
+    #[test]
+    fn a_text_toolbar_has_no_background_swatch() {
+        let layout = ToolbarLayout::for_text(note(), 0.0, 10_000.0);
+        let order: Vec<ToolbarButton> = layout.buttons().iter().map(|(b, _)| *b).collect();
+        assert_eq!(order, [ToolbarButton::Edit, ToolbarButton::Delete]);
+        assert!(layout.pill.size().x < ToolbarLayout::new(note(), 0.0, 10_000.0).pill.size().x);
+    }
+
+    #[test]
+    fn the_text_bar_is_format_buttons_then_cancel_and_confirm_outside_the_item() {
+        use super::{TextBarButton, TextBarLayout};
+        let layout = TextBarLayout::new(note(), 0.0, 10_000.0);
+        assert!(!overlaps(layout.pill, note()));
+        let xs: Vec<f32> = layout.buttons.iter().map(|(_, r)| r.min.x).collect();
+        assert!(xs.windows(2).all(|pair| pair[0] < pair[1]));
+        for (button, rect) in layout.buttons {
+            assert_eq!(layout.hit((rect.min + rect.max) * 0.5), Some(button));
+        }
+        let cancel = layout.button(TextBarButton::Cancel);
+        let colour = layout.button(TextBarButton::Colour);
+        assert!(layout.divider_x > colour.max.x && layout.divider_x < cancel.min.x);
     }
 }

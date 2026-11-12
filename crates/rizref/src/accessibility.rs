@@ -534,7 +534,10 @@ mod tests {
             capabilities: crate::platform::capabilities::Capabilities::WIN32,
             opacity_percent: 100,
             note_selected: false,
+            text_selected: false,
             selected_image: None,
+            has_selection: false,
+            rotatable_selection: false,
         });
         let mut nodes = Vec::new();
         let mut actions = HashMap::new();

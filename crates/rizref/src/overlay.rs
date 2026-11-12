@@ -11,7 +11,7 @@
 
 use glam::{DVec2, Vec2};
 
-use crate::note_chrome::{NoteChrome, PillButton, ScreenRect, ToolbarButton};
+use crate::note_chrome::{NoteChrome, PillButton, ScreenRect, TextBarButton, ToolbarButton};
 use rizref_core::{
     Camera, Guide, Handle as SelectionHandle, Item, Rect, Scene, Selection, SelectionFrame,
     SnapAxis,
@@ -93,9 +93,32 @@ pub struct OverlayState<'a> {
     /// Whether the selection may be rotated (false for note-only
     /// selections: notes are never rotated, so they get no rotate handle).
     pub rotatable: bool,
+    /// Whether only the four corner handles are drawn (a selection with a
+    /// text item, which is only ever scaled, never stretched).
+    pub corners_only: bool,
     /// The note toolbar or edit pill, drawn on top of everything.
     pub chrome: Option<NoteChrome>,
+    /// The text caret of the note or text item being edited, while it is
+    /// in the visible half of its blink.
+    pub caret: Option<OverlayCaret>,
 }
+
+/// A text caret as a screen-space segment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlayCaret {
+    /// The caret's top, in logical pixels.
+    pub top: Vec2,
+    /// The caret's bottom, in logical pixels.
+    pub bottom: Vec2,
+    /// Straight-alpha RGBA.
+    pub color: [f32; 4],
+}
+
+/// Width of the caret, in logical pixels: wide enough to find at a glance at
+/// any zoom, where the old in-texture caret was one texture pixel.
+pub const CARET_WIDTH: f32 = 2.0;
+/// The dark halo behind the caret, so it reads on light and dark text alike.
+const CARET_HALO: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
 
 impl OverlayState<'_> {
     fn screen(&self, world: Vec2) -> Vec2 {
@@ -154,6 +177,9 @@ pub fn build(state: &OverlayState) -> Vec<OverlayVertex> {
             line(&mut vertices, north, rotate, 1.0, ACCENT);
         }
         for handle in SelectionHandle::SCALE {
+            if state.corners_only && !handle.is_corner() {
+                continue;
+            }
             let center = state.screen(frame.handle_position(handle, 0.0));
             square(&mut vertices, center, HANDLE_HALF, HANDLE_BODY);
             square(&mut vertices, center, HANDLE_ACCENT_HALF, ACCENT);
@@ -198,6 +224,23 @@ pub fn build(state: &OverlayState) -> Vec<OverlayVertex> {
         line(&mut vertices, a - extend, b + extend, 1.0, GUIDE);
     }
 
+    if let Some(caret) = &state.caret {
+        line(
+            &mut vertices,
+            caret.top,
+            caret.bottom,
+            CARET_WIDTH + 2.0,
+            CARET_HALO,
+        );
+        line(
+            &mut vertices,
+            caret.top,
+            caret.bottom,
+            CARET_WIDTH,
+            caret.color,
+        );
+    }
+
     if let Some(chrome) = &state.chrome {
         note_chrome(&mut vertices, chrome);
     }
@@ -213,6 +256,209 @@ const CHROME_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 0.16];
 const CHROME_ICON: [f32; 4] = [0.95, 0.93, 0.90, 1.0];
 /// The confirm tick.
 const CHROME_CONFIRM: [f32; 4] = [0.45, 0.85, 0.50, 1.0];
+/// A format toggle that is on.
+const CHROME_ACTIVE: [f32; 4] = [0.30, 0.62, 1.0, 0.45];
+
+/// A polyline of `width` logical pixels through `points` around `c`.
+fn polyline(vertices: &mut Vec<OverlayVertex>, c: Vec2, points: &[(f32, f32)], width: f32) {
+    for pair in points.windows(2) {
+        let a = c + Vec2::new(pair[0].0, pair[0].1);
+        let b = c + Vec2::new(pair[1].0, pair[1].1);
+        line(vertices, a, b, width, CHROME_ICON);
+        // A square joint so corners do not notch.
+        square(vertices, b, width * 0.5, CHROME_ICON);
+    }
+}
+
+/// The ✗ icon.
+fn cancel_icon(vertices: &mut Vec<OverlayVertex>, c: Vec2) {
+    line(
+        vertices,
+        c - Vec2::splat(6.0),
+        c + Vec2::splat(6.0),
+        2.0,
+        CHROME_ICON,
+    );
+    line(
+        vertices,
+        c + Vec2::new(-6.0, 6.0),
+        c + Vec2::new(6.0, -6.0),
+        2.0,
+        CHROME_ICON,
+    );
+}
+
+/// The ✓ icon.
+fn confirm_icon(vertices: &mut Vec<OverlayVertex>, c: Vec2) {
+    line(
+        vertices,
+        c + Vec2::new(-7.0, 0.0),
+        c + Vec2::new(-2.0, 5.0),
+        2.5,
+        CHROME_CONFIRM,
+    );
+    line(
+        vertices,
+        c + Vec2::new(-2.0, 5.0),
+        c + Vec2::new(7.0, -6.0),
+        2.5,
+        CHROME_CONFIRM,
+    );
+}
+
+/// Draws one format-bar button's icon centred on `c`.
+fn text_bar_icon(
+    vertices: &mut Vec<OverlayVertex>,
+    button: TextBarButton,
+    c: Vec2,
+    colour: [u8; 3],
+) {
+    match button {
+        TextBarButton::Bold => {
+            // A heavy "B": a stem and two bowls.
+            line(
+                vertices,
+                c + Vec2::new(-4.0, -7.0),
+                c + Vec2::new(-4.0, 7.0),
+                3.0,
+                CHROME_ICON,
+            );
+            polyline(
+                vertices,
+                c,
+                &[
+                    (-4.0, -7.0),
+                    (1.5, -7.0),
+                    (4.0, -5.0),
+                    (4.0, -2.0),
+                    (1.5, 0.0),
+                    (-4.0, 0.0),
+                ],
+                2.5,
+            );
+            polyline(
+                vertices,
+                c,
+                &[
+                    (-4.0, 0.0),
+                    (2.5, 0.0),
+                    (5.0, 2.5),
+                    (5.0, 4.5),
+                    (2.5, 7.0),
+                    (-4.0, 7.0),
+                ],
+                2.5,
+            );
+        }
+        TextBarButton::Italic => {
+            // A slanted "I" with serifs.
+            line(
+                vertices,
+                c + Vec2::new(3.0, -7.0),
+                c + Vec2::new(-3.0, 7.0),
+                2.0,
+                CHROME_ICON,
+            );
+            line(
+                vertices,
+                c + Vec2::new(0.0, -7.0),
+                c + Vec2::new(6.0, -7.0),
+                1.5,
+                CHROME_ICON,
+            );
+            line(
+                vertices,
+                c + Vec2::new(-6.0, 7.0),
+                c + Vec2::new(0.0, 7.0),
+                1.5,
+                CHROME_ICON,
+            );
+        }
+        TextBarButton::Underline => {
+            // A "U" over a bar.
+            polyline(
+                vertices,
+                c,
+                &[
+                    (-5.0, -8.0),
+                    (-5.0, 0.5),
+                    (-3.0, 3.5),
+                    (3.0, 3.5),
+                    (5.0, 0.5),
+                    (5.0, -8.0),
+                ],
+                2.0,
+            );
+            line(
+                vertices,
+                c + Vec2::new(-6.5, 7.5),
+                c + Vec2::new(6.5, 7.5),
+                1.5,
+                CHROME_ICON,
+            );
+        }
+        TextBarButton::Smaller | TextBarButton::Larger => {
+            // An "A" with a minus or a plus beside it; the smaller button's
+            // letter is smaller.
+            let (scale, offset) = if button == TextBarButton::Smaller {
+                (0.7, Vec2::new(-3.0, 1.5))
+            } else {
+                (1.0, Vec2::new(-3.0, 0.0))
+            };
+            let a = c + offset;
+            let points =
+                [(-5.0, 7.0), (0.0, -7.0), (5.0, 7.0)].map(|(x, y)| (x * scale, y * scale));
+            polyline(vertices, a, &points, 2.0);
+            line(
+                vertices,
+                a + Vec2::new(-2.6, 2.0) * scale,
+                a + Vec2::new(2.6, 2.0) * scale,
+                1.5,
+                CHROME_ICON,
+            );
+            let sign = c + Vec2::new(6.5, -4.0);
+            line(
+                vertices,
+                sign - Vec2::new(3.0, 0.0),
+                sign + Vec2::new(3.0, 0.0),
+                1.5,
+                CHROME_ICON,
+            );
+            if button == TextBarButton::Larger {
+                line(
+                    vertices,
+                    sign - Vec2::new(0.0, 3.0),
+                    sign + Vec2::new(0.0, 3.0),
+                    1.5,
+                    CHROME_ICON,
+                );
+            }
+        }
+        TextBarButton::Colour => {
+            // An "A" over a bar in the current colour.
+            polyline(vertices, c, &[(-5.0, 3.0), (0.0, -8.0), (5.0, 3.0)], 2.0);
+            line(
+                vertices,
+                c + Vec2::new(-2.6, -1.5),
+                c + Vec2::new(2.6, -1.5),
+                1.5,
+                CHROME_ICON,
+            );
+            let rgb = colour.map(|v| f32::from(v) / 255.0);
+            let min = c + Vec2::new(-7.0, 5.5);
+            let max = c + Vec2::new(7.0, 9.5);
+            fill_rect(vertices, min, max, [rgb[0], rgb[1], rgb[2], 1.0]);
+            rect_outline(
+                vertices,
+                [min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)],
+                1.0,
+                CHROME_ICON,
+            );
+        }
+        TextBarButton::Cancel => cancel_icon(vertices, c),
+        TextBarButton::Confirm => confirm_icon(vertices, c),
+    }
+}
 
 /// Draws the note toolbar or the edit pill as screen-space geometry.
 fn note_chrome(vertices: &mut Vec<OverlayVertex>, chrome: &NoteChrome) {
@@ -226,7 +472,7 @@ fn note_chrome(vertices: &mut Vec<OverlayVertex>, chrome: &NoteChrome) {
             hovered,
         } => {
             fill(vertices, layout.pill, CHROME_PILL);
-            for (button, rect) in layout.buttons {
+            for &(button, rect) in layout.buttons() {
                 if *hovered == Some(button) {
                     fill(vertices, rect, CHROME_HOVER);
                 }
@@ -303,39 +549,41 @@ fn note_chrome(vertices: &mut Vec<OverlayVertex>, chrome: &NoteChrome) {
                 }
                 let c = (rect.min + rect.max) * 0.5;
                 match button {
-                    PillButton::Cancel => {
-                        line(
-                            vertices,
-                            c - Vec2::splat(6.0),
-                            c + Vec2::splat(6.0),
-                            2.0,
-                            CHROME_ICON,
-                        );
-                        line(
-                            vertices,
-                            c + Vec2::new(-6.0, 6.0),
-                            c + Vec2::new(6.0, -6.0),
-                            2.0,
-                            CHROME_ICON,
-                        );
-                    }
-                    PillButton::Confirm => {
-                        line(
-                            vertices,
-                            c + Vec2::new(-7.0, 0.0),
-                            c + Vec2::new(-2.0, 5.0),
-                            2.5,
-                            CHROME_CONFIRM,
-                        );
-                        line(
-                            vertices,
-                            c + Vec2::new(-2.0, 5.0),
-                            c + Vec2::new(7.0, -6.0),
-                            2.5,
-                            CHROME_CONFIRM,
-                        );
-                    }
+                    PillButton::Cancel => cancel_icon(vertices, c),
+                    PillButton::Confirm => confirm_icon(vertices, c),
                 }
+            }
+        }
+        NoteChrome::TextBar {
+            layout,
+            bold,
+            italic,
+            underline,
+            colour,
+            hovered,
+        } => {
+            fill(vertices, layout.pill, CHROME_PILL);
+            line(
+                vertices,
+                Vec2::new(layout.divider_x, layout.pill.min.y + 7.0),
+                Vec2::new(layout.divider_x, layout.pill.max.y - 7.0),
+                1.0,
+                CHROME_HOVER,
+            );
+            for (button, rect) in layout.buttons {
+                let active = match button {
+                    TextBarButton::Bold => *bold,
+                    TextBarButton::Italic => *italic,
+                    TextBarButton::Underline => *underline,
+                    _ => false,
+                };
+                if active {
+                    fill(vertices, rect, CHROME_ACTIVE);
+                }
+                if *hovered == Some(button) {
+                    fill(vertices, rect, CHROME_HOVER);
+                }
+                text_bar_icon(vertices, button, (rect.min + rect.max) * 0.5, *colour);
             }
         }
     }
@@ -460,7 +708,9 @@ mod tests {
             marquee: None,
             guides: &[],
             rotatable: true,
+            corners_only: false,
             chrome: None,
+            caret: None,
         }
     }
 
@@ -590,5 +840,56 @@ mod tests {
             .collect();
         assert!(!vertical.is_empty(), "the vertical guide is drawn");
         assert!(vertical.iter().all(|v| (v.pos[0] - 500.0).abs() <= 0.6));
+    }
+
+    #[test]
+    fn a_text_selection_draws_only_corner_handles() {
+        let (scene, id) = scene();
+        let selection: Selection = [id].into_iter().collect();
+        let camera = Camera::default();
+        let frame = rizref_core::SelectionFrame::for_selection(&scene, &selection).expect("frame");
+        let mut overlay = state(&scene, &selection, &camera);
+        overlay.corners_only = true;
+        let vertices = build(&overlay);
+        for handle in rizref_core::Handle::SCALE {
+            let center = camera
+                .world_to_screen(
+                    frame.handle_position(handle, 0.0).as_dvec2(),
+                    DVec2::new(800.0, 600.0),
+                )
+                .as_vec2();
+            let body = vertices.iter().any(|v| {
+                v.color == super::HANDLE_BODY
+                    && (Vec2::new(v.pos[0], v.pos[1]) - center).length() < 7.0
+            });
+            assert_eq!(body, handle.is_corner(), "{handle:?}");
+        }
+    }
+
+    #[test]
+    fn the_caret_is_a_two_pixel_bar_over_a_halo() {
+        let (scene, _) = scene();
+        let selection = Selection::new();
+        let camera = Camera::default();
+        let mut overlay = state(&scene, &selection, &camera);
+        let color = [1.0, 0.8, 0.4, 1.0];
+        overlay.caret = Some(super::OverlayCaret {
+            top: Vec2::new(100.0, 50.0),
+            bottom: Vec2::new(100.0, 80.0),
+            color,
+        });
+
+        let vertices = build(&overlay);
+
+        let bar: Vec<f32> = vertices
+            .iter()
+            .filter(|v| v.color == color)
+            .map(|v| v.pos[0])
+            .collect();
+        assert!(!bar.is_empty());
+        let width = bar.iter().copied().fold(f32::MIN, f32::max)
+            - bar.iter().copied().fold(f32::MAX, f32::min);
+        assert!((width - super::CARET_WIDTH).abs() < 0.01, "{width}");
+        assert!(vertices.iter().any(|v| v.color == super::CARET_HALO));
     }
 }

@@ -14,6 +14,7 @@ pub mod paint;
 pub mod panels;
 pub mod start;
 pub mod titlebar;
+pub mod transform_dialog;
 
 use std::time::{Duration, Instant};
 
@@ -68,6 +69,8 @@ pub struct Shell {
     pub toast: Option<Toast>,
     /// The note background popover, if open.
     pub note_color: Option<note_color::NoteColorPopover>,
+    /// The size or rotation dialog, if open.
+    pub transform: Option<transform_dialog::TransformDialog>,
     /// The hover-toolbar tooltip: its text and logical anchor.
     pub tooltip: Option<(String, DVec2)>,
     /// Whether the colour picker is armed.
@@ -92,6 +95,7 @@ impl Shell {
             image_info: None,
             toast: None,
             note_color: None,
+            transform: None,
             tooltip: None,
             picker: false,
             locked: false,
@@ -113,6 +117,7 @@ impl Shell {
         self.settings = None;
         self.image_info = None;
         self.note_color = None;
+        self.transform = None;
         self.tooltip = None;
         self.picker = false;
         self.title_bar.hide();
@@ -133,6 +138,7 @@ impl Shell {
     pub fn has_overlay(&self) -> bool {
         self.menu.is_some()
             || self.note_color.is_some()
+            || self.transform.is_some()
             || self.shortcuts.is_some()
             || self.settings.is_some()
             || self.confirm_close.is_some()
@@ -163,6 +169,19 @@ impl Shell {
         self.tooltip = None;
         self.picker = false;
         self.image_info = Some(panel);
+        self.touch();
+    }
+
+    /// Opens the size or rotation dialog, closing the other overlays.
+    pub fn open_transform(&mut self, dialog: transform_dialog::TransformDialog) {
+        self.menu = None;
+        self.note_color = None;
+        self.shortcuts = None;
+        self.settings = None;
+        self.image_info = None;
+        self.tooltip = None;
+        self.picker = false;
+        self.transform = Some(dialog);
         self.touch();
     }
 
@@ -225,6 +244,7 @@ impl Shell {
     pub fn open_menu(&mut self, entries: Vec<menu::MenuEntry>, position: DVec2, viewport: DVec2) {
         self.menu = Some(menu::MenuState::open(entries, position, viewport));
         self.note_color = None;
+        self.transform = None;
         self.shortcuts = None;
         self.settings = None;
         self.touch();
@@ -296,6 +316,7 @@ impl Shell {
             || self.image_info.take().is_some()
             || self.menu.take().is_some()
             || self.note_color.take().is_some()
+            || self.transform.take().is_some()
             || self.shortcuts.take().is_some()
             || self.settings.take().is_some();
         if closed {
@@ -420,6 +441,9 @@ impl UiLayer {
         }
         if let Some(popover) = &shell.note_color {
             popover.paint(&mut painter);
+        }
+        if let Some(dialog) = &shell.transform {
+            dialog.paint(&mut painter, viewport);
         }
         if let Some(menu) = &shell.menu {
             menu.paint(&mut painter);

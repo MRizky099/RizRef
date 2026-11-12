@@ -52,10 +52,13 @@ your notes and a thumbnail, all in one file you can copy anywhere.
 **Arrange**
 - Infinite canvas with smooth pan, zoom (0.5 %–3200 %) and view rotation.
 - Move, scale from the opposite corner (`Alt` scales from the centre), rotate, flip,
-  group, align, distribute, and arrange as grid, stack, spread or hierarchy.
+  group, align, distribute, and arrange as grid, stack, spread or hierarchy. Type an
+  exact size or angle with `Set size…` / `Set rotation…` in the right-click menu.
 - Snapping with smart guides, z-order, duplicate, and a full undo/redo history.
 - **Markdown notes** with headings, lists, task lists, tables, code, coloured
   `<span style>` text and LaTeX math (`$…$`, `$$…$$`), on any background colour.
+- **Text** you style as you type: bold, italic, underline, size and colour from a small
+  format bar, with no markup and no background. Drag a corner to scale the text.
 
 **Stay out of the way**
 - Frameless window with an auto-hiding title bar and button hints.
@@ -163,6 +166,7 @@ Right-click anywhere (or click **☰** in the title bar) for every command.
 | `Shift+H` / `Shift+V` | Flip | `Ctrl+G` / `Ctrl+Shift+U` | Group / ungroup |
 | `3` `4` `5` `6` | Arrange: grid, hierarchy, spread, stack | `Ctrl+Shift+Arrows` | Align |
 | `N` | New note | `I` | Colour picker |
+| `T` | Add text | `Ctrl+B` `Ctrl+I` `Ctrl+U` `Ctrl+[` `Ctrl+]` | Bold / italic / underline / smaller / larger (while typing text) |
 | `G` / `Ctrl+B` | Grid / scene boundary | `U` | Grayscale |
 | `Ctrl+Shift+T` | Always on top | `Ctrl+Shift+O` | Cycle canvas transparency |
 | `Ctrl+Shift+X` | Click-through | `Ctrl+Shift+G` | Ghost mode (works unfocused) |
@@ -280,8 +284,7 @@ cargo clippy --workspace --all-targets -- -D warnings # lint policy, as CI runs 
 ```
 
 Fuzzing lives in the workspace-excluded `fuzz/` crate and needs nightly. CI runs one
-matrix job per codec family: 60 s per target on a pull request, 600 s per target on the
-nightly schedule. Locally:
+matrix job per codec family, 600 s per target, on a manual full run only. Locally:
 
 ```bash
 cargo install cargo-fuzz
@@ -294,9 +297,23 @@ Lints are workspace-wide (`[workspace.lints]`):
 - `todo!()` and `unimplemented!()` are denied.
 - OS calls are confined to `rizref::platform` (`windows/`, `unix/`, `linux/`, `macos/`).
 
-CI runs `fmt`, `clippy`, `test` and the dependency audit on `windows-latest`,
-`ubuntu-22.04`, `macos-15` and `macos-15-intel` (plus an `x86_64-apple-darwin` cross-check from arm64), plus the fuzz
-matrix.
+CI is built to spend as few Actions minutes as possible (a private repository pays
+double for Windows minutes and ten times for macOS):
+- One `ubuntu-22.04` job runs `fmt`, `clippy -D warnings` for Linux, Windows and both
+  macOS architectures (pure Rust lints any target without its SDK), the Linux tests and
+  the native-code audit for every target.
+- The `windows-latest` and `macos-15` test jobs run only when a change touches the
+  platform layer, the files with OS-specific branches, dependencies or the workflow.
+- `macos-15-intel` tests and the fuzz soak run only on a manual run with **full**
+  checked (Actions > CI > Run workflow); do one before a release.
+- Markdown-only changes run nothing.
+
+The same checks run locally on Windows, including the other targets' lints:
+
+```bash
+rustup target add x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin
+cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+```
 
 Release builds use fat LTO at `opt-level = "s"` and link the C runtime statically
 (`.cargo/config.toml`), so `rizref.exe` imports operating-system DLLs only.
