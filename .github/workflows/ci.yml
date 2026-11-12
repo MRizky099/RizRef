@@ -1,16 +1,33 @@
 name: CI
 
+# Minute budget first. The repository is private, so Actions minutes come out
+# of a monthly quota where a Windows minute counts double and a macOS minute
+# ten times. So:
+#
+# - One Linux job does everything that does not need the target OS: rustfmt,
+#   clippy for Linux, Windows and both macOS architectures (the workspace is
+#   pure Rust, so `cargo clippy --target` lints another OS without its SDK),
+#   the native-code audit for every target, and the Linux tests.
+# - The Windows and macOS test jobs run only when a pull request or push
+#   touches code that behaves differently there (the platform layer, the
+#   files with OS-specific branches, dependencies, this workflow), or on a
+#   manual run with "full".
+# - Intel macOS tests and the ten-minute fuzz soak run only on a manual
+#   "full" run (before a release). There is no nightly schedule.
+# - Documentation-only changes run nothing.
 on:
   push:
-    # Feature branches are covered by their pull request; running both would
-    # double every check and the fuzz matrix with it.
+    # Feature branches are covered by their pull request.
     branches: [main]
+    paths-ignore: ["**.md", "LICENSE*", ".claude/**"]
   pull_request:
-  # The phase-03 acceptance soak: ten minutes of fuzzing per codec family.
-  # Pull requests get a short run so review stays fast.
-  schedule:
-    - cron: "0 3 * * *"
+    paths-ignore: ["**.md", "LICENSE*", ".claude/**"]
   workflow_dispatch:
+    inputs:
+      full:
+        description: "Full run: Windows, both macOS and the 10-minute fuzz soak"
+        type: boolean
+        default: false
 
 # A push that fixes a lint failure should not queue behind the run it fixes.
 concurrency:
@@ -21,91 +38,120 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Phase 08: every check runs on the three release platforms. Ubuntu 22.04
-  # is the glibc baseline the Linux build documents (2.35); macOS 15 is an
-  # Apple Silicon runner (GitHub retired the macOS 14 image), and the Intel
-  # half of the universal build is tested on macos-15-intel and
-  # cross-checked from the arm64 runner (see the test job).
-  fmt:
-    name: rustfmt (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-22.04, macos-15]
+  # Which OS-specific jobs this change needs. A few seconds on Linux.
+  changes:
+    name: changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      windows: ${{ steps.filter.outputs.windows }}
+      macos: ${{ steps.filter.outputs.macos }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            shared: &shared
+              - "Cargo.lock"
+              - "**/Cargo.toml"
+              - "rust-toolchain.toml"
+              - ".github/workflows/ci.yml"
+              - "crates/rizref/src/platform/**"
+              - "crates/rizref/src/paths.rs"
+              - "crates/rizref/src/recents.rs"
+              - "crates/rizref/src/renderer.rs"
+              - "crates/rizref/src/shortcuts.rs"
+            windows:
+              - *shared
+              - "crates/rizref/build.rs"
+              - "crates/rizref/resources.rs"
+              - "packaging/**"
+            macos:
+              - *shared
+              - "packaging/macos/**"
+
+  # Everything a Linux runner can check, for every target.
+  linux:
+    name: lint, audit and test (Linux)
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc, aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all --check
-
-  clippy:
-    name: clippy (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-22.04, macos-15]
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
       # Workspace lints live in the root Cargo.toml, so a lint failure here is a
-      # policy failure, not a matter of taste. Each OS lints its own platform
-      # half (`crates/rizref/src/platform/{windows,unix,linux,macos}`).
-      - name: Lint every target
+      # policy failure, not a matter of taste. Each target lints its own
+      # platform half (`crates/rizref/src/platform/{windows,unix,linux,macos}`).
+      - name: Lint Linux
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            triple: x86_64-pc-windows-msvc
-          - os: ubuntu-22.04
-            triple: x86_64-unknown-linux-gnu
-          - os: macos-15
-            triple: aarch64-apple-darwin
-            # The Intel half of the universal macOS build (10.13+), also
-            # checked by cross-compilation from the arm64 runner.
-            cross: x86_64-apple-darwin
-          - os: macos-15-intel
-            triple: x86_64-apple-darwin
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.cross || matrix.triple }}
-      - uses: Swatinem/rust-cache@v2
+      - name: Lint Windows
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: Lint macOS (Apple Silicon)
+        run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+      - name: Lint macOS (Intel)
+        run: cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings
       - name: Build the workspace
         run: cargo build --workspace
       - name: Run the tests
         run: cargo test --workspace
       # The pure-Rust rule is the one constraint that is easy to break by adding
-      # a feature flag, and impossible to notice in review. Catching it here is
-      # cheaper than catching it in a released binary. The script checks the
+      # a feature flag, and impossible to notice in review. The script checks the
       # `-sys` crates per target, the features that keep C out, and that no
       # build script left an object file behind.
-      - name: Audit the dependency tree for native code
+      - name: Audit native code (all targets)
         shell: bash
-        run: scripts/audit-native.sh ${{ matrix.triple }} target/debug/build
-      - name: Cross-check ${{ matrix.cross }}
-        if: matrix.cross
-        run: cargo check --workspace --all-targets --target ${{ matrix.cross }}
-      - name: Audit ${{ matrix.cross }}
-        if: matrix.cross
-        shell: bash
-        run: scripts/audit-native.sh ${{ matrix.cross }} target/${{ matrix.cross }}/debug/build
+        run: |
+          scripts/audit-native.sh x86_64-unknown-linux-gnu target/debug/build
+          for triple in x86_64-pc-windows-msvc aarch64-apple-darwin x86_64-apple-darwin; do
+            scripts/audit-native.sh "$triple" "target/$triple/debug/build"
+          done
+
+  windows:
+    name: test (Windows)
+    needs: changes
+    if: needs.changes.outputs.windows == 'true' || inputs.full
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the tests
+        run: cargo test --workspace
+
+  macos:
+    name: test (macOS, Apple Silicon)
+    needs: changes
+    if: needs.changes.outputs.macos == 'true' || inputs.full
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the tests
+        run: cargo test --workspace
+
+  # Intel is linted from Linux on every run; its tests run on a full run only
+  # (a job-level condition, so no macOS runner starts otherwise).
+  macos-intel:
+    name: test (macOS, Intel)
+    if: inputs.full
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the tests
+        run: cargo test --workspace
 
   fuzz:
     name: fuzz (${{ matrix.target }})
+    # The phase-03 soak: ten minutes per codec family, on a manual full run
+    # (before a release) only.
+    if: github.event_name == 'workflow_dispatch' && inputs.full
     runs-on: ubuntu-latest
     strategy:
       # One crashing target must not hide the state of the others.
@@ -129,10 +175,6 @@ jobs:
       # inherited by the `cargo build` child process cargo-fuzz spawns.
       RUSTUP_TOOLCHAIN: nightly
       RUST_BACKTRACE: "1"
-      # Ten minutes per target on the schedule and on a manual dispatch (both are
-      # the phase-03 soak, and a dispatch is how it gets re-run before a release);
-      # one minute on a pull request.
-      FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '60' || '600' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
@@ -143,7 +185,7 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Fuzz ${{ matrix.target }}
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_SECONDS }} -print_final_stats=1
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=600 -print_final_stats=1
       # A crash writes its reproducer here; without the upload the only copy is
       # in the runner that gets torn down.
       - name: Keep crash reproducers

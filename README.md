@@ -275,8 +275,7 @@ cargo clippy --workspace --all-targets -- -D warnings # lint policy, as CI runs 
 ```
 
 Fuzzing lives in the workspace-excluded `fuzz/` crate and needs nightly. CI runs one
-matrix job per codec family: 60 s per target on a pull request, 600 s per target on the
-nightly schedule. Locally:
+matrix job per codec family, 600 s per target, on a manual full run only. Locally:
 
 ```bash
 cargo install cargo-fuzz
@@ -289,9 +288,23 @@ Lints are workspace-wide (`[workspace.lints]`):
 - `todo!()` and `unimplemented!()` are denied.
 - OS calls are confined to `rizref::platform` (`windows/`, `unix/`, `linux/`, `macos/`).
 
-CI runs `fmt`, `clippy`, `test` and the dependency audit on `windows-latest`,
-`ubuntu-22.04`, `macos-15` and `macos-15-intel` (plus an `x86_64-apple-darwin` cross-check from arm64), plus the fuzz
-matrix.
+CI is built to spend as few Actions minutes as possible (a private repository pays
+double for Windows minutes and ten times for macOS):
+- One `ubuntu-22.04` job runs `fmt`, `clippy -D warnings` for Linux, Windows and both
+  macOS architectures (pure Rust lints any target without its SDK), the Linux tests and
+  the native-code audit for every target.
+- The `windows-latest` and `macos-15` test jobs run only when a change touches the
+  platform layer, the files with OS-specific branches, dependencies or the workflow.
+- `macos-15-intel` tests and the fuzz soak run only on a manual run with **full**
+  checked (Actions > CI > Run workflow); do one before a release.
+- Markdown-only changes run nothing.
+
+The same checks run locally on Windows, including the other targets' lints:
+
+```bash
+rustup target add x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin
+cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+```
 
 Release builds use fat LTO at `opt-level = "s"` and link the C runtime statically
 (`.cargo/config.toml`), so `rizref.exe` imports operating-system DLLs only.

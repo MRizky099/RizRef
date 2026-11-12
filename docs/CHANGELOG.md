@@ -2,6 +2,15 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## CI on a minute budget
+
+- One Linux job now runs rustfmt, clippy for Linux, Windows and both macOS
+  architectures, the Linux tests and the native-code audit for every target. Windows
+  and Apple Silicon macOS tests run only when a change touches OS-specific code,
+  dependencies or the workflow; Intel macOS tests and the ten-minute fuzz soak run on
+  a manual "full" run only. The nightly fuzz schedule (about 90 runner minutes a day)
+  is gone, and Markdown-only changes run nothing.
+
 ## Text items and a visible caret
 
 Format revision 1.3 (additive; see `docs/format.md`, "Text items").
