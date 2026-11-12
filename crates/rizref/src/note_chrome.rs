@@ -311,8 +311,21 @@ impl TextBarButton {
         Self::Confirm,
     ];
 
-    /// Tooltip and accessible name.
+    /// Tooltip and accessible name, with the platform's primary modifier
+    /// (Command on macOS, Control elsewhere).
     pub const fn label(self) -> &'static str {
+        if cfg!(target_os = "macos") {
+            return match self {
+                Self::Bold => "Bold (⌘B)",
+                Self::Italic => "Italic (⌘I)",
+                Self::Underline => "Underline (⌘U)",
+                Self::Smaller => "Smaller text (⌘[)",
+                Self::Larger => "Larger text (⌘])",
+                Self::Colour => "Text colour",
+                Self::Cancel => "Cancel text edit (Esc)",
+                Self::Confirm => "Confirm text edit (⌘↩)",
+            };
+        }
         match self {
             Self::Bold => "Bold (Ctrl+B)",
             Self::Italic => "Italic (Ctrl+I)",

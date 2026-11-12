@@ -69,6 +69,8 @@ jobs:
             macos:
               - *shared
               - "packaging/macos/**"
+              - "crates/rizref/assets/*.icns"
+              - "crates/rizref/examples/make_icon.rs"
 
   # Everything a Linux runner can check, for every target.
   linux:
@@ -123,16 +125,35 @@ jobs:
         run: cargo test --workspace
 
   macos:
-    name: test (macOS, Apple Silicon)
+    name: test and bundle (macOS, Apple Silicon)
     needs: changes
     if: needs.changes.outputs.macos == 'true' || inputs.full
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Run the tests
         run: cargo test --workspace
+      # The universal bundle (phase 08b), on the same runner so it costs no
+      # second macOS start: Intel built for 10.13, Apple Silicon for 11.0,
+      # merged with lipo and checked with otool (minimum OS per slice, system
+      # libraries only), plutil and an ad-hoc codesign. Kept as an artifact for
+      # testing on real Macs; it is not a release.
+      - name: Build and check RizRef.app
+        run: packaging/macos/build-app.sh dist/macos
+      # ditto keeps the executable bit and the signature, which a plain
+      # artifact upload of the .app folder would lose.
+      - name: Zip the bundle
+        run: ditto -c -k --keepParent dist/macos/RizRef.app dist/macos/RizRef-macos-universal-unsigned.zip
+      - name: Keep the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: RizRef-macos-universal-unsigned
+          path: dist/macos/RizRef-macos-universal-unsigned.zip
+          if-no-files-found: error
 
   # Intel is linted from Linux on every run; its tests run on a full run only
   # (a job-level condition, so no macOS runner starts otherwise).
@@ -146,32 +167,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run the tests
         run: cargo test --workspace
-
-  # The universal macOS bundle (phase 08b): Intel built for 10.13, Apple
-  # Silicon for 11.0, merged with lipo and checked with otool (minimum OS per
-  # slice, system libraries only), plutil and an ad-hoc codesign. The bundle
-  # is kept as an artifact for testing on real Macs; it is not a release.
-  macos-app:
-    name: macOS app bundle (universal)
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - name: Build and check RizRef.app
-        run: packaging/macos/build-app.sh dist/macos
-      # ditto keeps the executable bit and the signature, which a plain
-      # artifact upload of the .app folder would lose.
-      - name: Zip the bundle
-        run: ditto -c -k --keepParent dist/macos/RizRef.app dist/macos/RizRef-macos-universal-unsigned.zip
-      - name: Keep the bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: RizRef-macos-universal-unsigned
-          path: dist/macos/RizRef-macos-universal-unsigned.zip
-          if-no-files-found: error
 
   fuzz:
     name: fuzz (${{ matrix.target }})

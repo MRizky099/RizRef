@@ -3647,18 +3647,11 @@ impl App {
         self.board.scene().item(id).is_some_and(Item::is_rich_text)
     }
 
-    /// Moves the caret, extending the selection while shift is held; ctrl
-    /// moves by word (and to the start or end of the text with Home/End).
+    /// Moves the caret, extending the selection while shift is held, with
+    /// the platform's word and line keys (see [`platform_motion`]).
     fn note_motion(&mut self, motion: cosmic_text::Motion) {
-        use cosmic_text::Motion;
         let shift = self.modifiers.shift_key();
-        let motion = match (self.modifiers.control_key(), motion) {
-            (true, Motion::Left) => Motion::LeftWord,
-            (true, Motion::Right) => Motion::RightWord,
-            (true, Motion::Home) => Motion::BufferStart,
-            (true, Motion::End) => Motion::BufferEnd,
-            (_, motion) => motion,
-        };
+        let motion = platform_motion(self.modifiers, motion);
         let Some(session) = self.note_session.as_mut() else {
             return;
         };
@@ -5289,7 +5282,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 if self.shell.transform.is_some() {
                     if pressed {
-                        let ctrl = self.modifiers.control_key();
+                        let ctrl = crate::shortcuts::primary_held(self.modifiers);
                         let result = match (&event.logical_key, chord) {
                             (Key::Character(_) | Key::Unidentified(_) | Key::Dead(_), _)
                                 if !ctrl =>
@@ -6021,6 +6014,38 @@ fn check_dialogs() {
     }
 }
 
+/// A caret key with its modifiers, as the platform's text fields read it.
+///
+/// Windows and Linux: Ctrl+Left/Right moves by word, Ctrl+Home/End to the
+/// start or end of the text. macOS: Option+Left/Right moves by word,
+/// Command+Left/Right to the start or end of the line and Command+Up/Down to
+/// the start or end of the text.
+fn platform_motion(
+    modifiers: winit::keyboard::ModifiersState,
+    motion: cosmic_text::Motion,
+) -> cosmic_text::Motion {
+    use cosmic_text::Motion;
+    if cfg!(target_os = "macos") {
+        match (modifiers.alt_key(), modifiers.super_key(), motion) {
+            (true, false, Motion::Left) => Motion::LeftWord,
+            (true, false, Motion::Right) => Motion::RightWord,
+            (_, true, Motion::Left) => Motion::Home,
+            (_, true, Motion::Right) => Motion::End,
+            (_, true, Motion::Up) => Motion::BufferStart,
+            (_, true, Motion::Down) => Motion::BufferEnd,
+            (_, _, motion) => motion,
+        }
+    } else {
+        match (modifiers.control_key(), motion) {
+            (true, Motion::Left) => Motion::LeftWord,
+            (true, Motion::Right) => Motion::RightWord,
+            (true, Motion::Home) => Motion::BufferStart,
+            (true, Motion::End) => Motion::BufferEnd,
+            (_, motion) => motion,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -6034,6 +6059,37 @@ mod tests {
         Animation, AnimationFrame, Asset, AssetId, Item, ItemId, Rect, Scene, SceneId, Selection,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn caret_keys_follow_the_platform_text_conventions() {
+        use super::platform_motion;
+        use cosmic_text::Motion;
+        use winit::keyboard::ModifiersState;
+        let none = ModifiersState::empty();
+        assert_eq!(platform_motion(none, Motion::Left), Motion::Left);
+        if cfg!(target_os = "macos") {
+            let option = ModifiersState::ALT;
+            let command = ModifiersState::SUPER;
+            assert_eq!(platform_motion(option, Motion::Left), Motion::LeftWord);
+            assert_eq!(platform_motion(option, Motion::Right), Motion::RightWord);
+            assert_eq!(platform_motion(command, Motion::Left), Motion::Home);
+            assert_eq!(platform_motion(command, Motion::Right), Motion::End);
+            assert_eq!(platform_motion(command, Motion::Up), Motion::BufferStart);
+            assert_eq!(platform_motion(command, Motion::Down), Motion::BufferEnd);
+            assert_eq!(
+                platform_motion(ModifiersState::CONTROL, Motion::Left),
+                Motion::Left,
+                "Control is not a text-motion modifier on macOS"
+            );
+        } else {
+            let ctrl = ModifiersState::CONTROL;
+            assert_eq!(platform_motion(ctrl, Motion::Left), Motion::LeftWord);
+            assert_eq!(platform_motion(ctrl, Motion::Right), Motion::RightWord);
+            assert_eq!(platform_motion(ctrl, Motion::Home), Motion::BufferStart);
+            assert_eq!(platform_motion(ctrl, Motion::End), Motion::BufferEnd);
+            assert_eq!(platform_motion(ctrl, Motion::Up), Motion::Up);
+        }
+    }
     use std::path::Path;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
