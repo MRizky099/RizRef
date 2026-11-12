@@ -1,14 +1,21 @@
 name: Release
 
-# Pushing a version tag (`v1.2.3`) builds, tests and packages RizRef, then
-# creates a DRAFT GitHub release with the artifacts and notes generated from
-# the conventional commits since the previous tag. Nothing is published until
-# a maintainer reviews the draft and presses "Publish release".
+# Pushing a version tag (`v1.2.3`) is the only thing that builds RizRef's
+# downloads. The workflow tests and packages every platform, then creates ONE
+# DRAFT GitHub release with all the files, their SHA-256 sums and notes
+# generated from the conventional commits since the previous tag. Nothing is
+# published until a maintainer reviews the draft and presses "Publish release".
+# The packages live only on that release: they are never committed, and the
+# hand-over between jobs expires after a day.
 #
-# Code signing is a hook: when the repository has the secrets
-# `RIZREF_SIGN_PFX_BASE64` (a base64-encoded .pfx) and `RIZREF_SIGN_PASSWORD`,
-# the binaries and the installer are signed; without them the job builds
-# unsigned artifacts and says so in the log. No certificate exists yet.
+#   Windows  RizRef-<v>-x64-portable.zip, RizRef-<v>-x64-setup.exe (Inno Setup)
+#   macOS    RizRef-<v>-macos-universal.zip (portable), RizRef-<v>-macos-universal.dmg
+#
+# Windows code signing is a hook: with the secrets `RIZREF_SIGN_PFX_BASE64`
+# (a base64-encoded .pfx) and `RIZREF_SIGN_PASSWORD` the binaries and the
+# installer are signed; without them they are not, and the log says so. The
+# macOS app is ad-hoc signed and not notarized (no Apple Developer account);
+# README → Installation → macOS explains the first-launch confirmation.
 on:
   push:
     tags: ["v*"]
@@ -23,26 +30,17 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
-  release:
-    name: build, test, package
-    runs-on: windows-latest
-    env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-      # `if:` cannot read secrets directly; this flag can.
-      HAS_CERT: ${{ secrets.RIZREF_SIGN_PFX_BASE64 != '' }}
+  version:
+    name: check the tag
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
-          # Release notes walk the history back to the previous tag.
-          fetch-depth: 0
           ref: ${{ env.TAG }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
       - name: Check the tag matches the workspace version
-        shell: bash
         run: |
           version=$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
           if [ "v${version}" != "${TAG}" ]; then
@@ -50,9 +48,21 @@ jobs:
             exit 1
           fi
 
+  windows:
+    name: Windows (test, package)
+    needs: version
+    runs-on: windows-latest
+    env:
+      # `if:` cannot read secrets directly; this flag can.
+      HAS_CERT: ${{ secrets.RIZREF_SIGN_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace
-
       - name: Restore the signing certificate
         if: ${{ env.HAS_CERT == 'true' }}
         shell: pwsh
@@ -62,36 +72,83 @@ jobs:
           $path = Join-Path $env:RUNNER_TEMP 'rizref-sign.pfx'
           [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($env:PFX_BASE64))
           "RIZREF_SIGN_PFX=$path" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-
       - name: Package (portable zip + installer)
         shell: pwsh
         env:
           RIZREF_SIGN_PASSWORD: ${{ secrets.RIZREF_SIGN_PASSWORD }}
         # Inno Setup 6 is preinstalled on the windows-latest image.
         run: ./packaging/package.ps1 -Sign
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*-portable.zip
+            dist/*-setup.exe
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Release notes
-        shell: bash
-        run: scripts/release-notes.sh "${TAG}" > dist/RELEASE_NOTES.md
+  macos:
+    name: macOS (test, package)
+    needs: version
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      # Intel built for 10.13, Apple Silicon for 11.0, merged with lipo and
+      # checked with otool (minimum OS per slice, system libraries only),
+      # plutil and an ad-hoc codesign.
+      - name: Build and check RizRef.app
+        run: packaging/macos/build-app.sh dist/macos
+      # The .dmg (mounted and started as a check) and the portable .zip.
+      - name: Package the .dmg and .zip
+        run: packaging/macos/build-dmg.sh dist/macos/RizRef.app dist/macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/macos/*.dmg
+            dist/macos/*.zip
+          if-no-files-found: error
+          retention-days: 1
 
+  publish:
+    name: create the draft release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Release notes walk the history back to the previous tag.
+          fetch-depth: 0
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and notes
+        run: |
+          cd dist
+          ls -l
+          sha256sum RizRef-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+          scripts/release-notes.sh "${TAG}" > dist/RELEASE_NOTES.md
       - name: Create the draft release
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          files=(dist/*-portable.zip dist/*-setup.exe)
+          files=(dist/RizRef-* dist/SHA256SUMS.txt)
           if gh release view "${TAG}" > /dev/null 2>&1; then
             gh release upload "${TAG}" "${files[@]}" --clobber
           else
             gh release create "${TAG}" "${files[@]}" --draft --title "RizRef ${TAG#v}" \
               --notes-file dist/RELEASE_NOTES.md
           fi
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rizref-${{ env.TAG }}
-          path: |
-            dist/*-portable.zip
-            dist/*-setup.exe
-            dist/RELEASE_NOTES.md

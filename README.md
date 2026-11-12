@@ -343,11 +343,21 @@ Release builds use fat LTO at `opt-level = "s"` and link the C runtime staticall
 ### Releasing
 
 Pushing a tag `vX.Y.Z` that matches the workspace version runs
-`.github/workflows/release.yml`. It tests, packages, signs when a certificate is
-configured, and creates a **draft** GitHub release with notes generated from the
-conventional commits (`scripts/release-notes.sh`). A maintainer reviews and publishes
-the draft by hand; the workflow never publishes. Signing activates once the secrets
-`RIZREF_SIGN_PFX_BASE64` and `RIZREF_SIGN_PASSWORD` exist.
+`.github/workflows/release.yml`, the only place the downloads are built. Windows and
+macOS test and package in parallel; one last job creates a **draft** GitHub release
+with every file, `SHA256SUMS.txt` and notes generated from the conventional commits
+(`scripts/release-notes.sh`):
+
+| | Installer | Portable |
+|---|---|---|
+| Windows | `RizRef-<v>-x64-setup.exe` | `RizRef-<v>-x64-portable.zip` |
+| macOS | `RizRef-<v>-macos-universal.dmg` | `RizRef-<v>-macos-universal.zip` |
+
+Packages are never committed; CI does not build them, and the hand-over between
+release jobs expires after a day. A maintainer reviews and publishes the draft by
+hand; the workflow never publishes. Windows signing activates once the secrets
+`RIZREF_SIGN_PFX_BASE64` and `RIZREF_SIGN_PASSWORD` exist; the macOS app is ad-hoc
+signed and not notarized.
 
 ### Dependencies
 

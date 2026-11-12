@@ -16,8 +16,9 @@
 #   - the bundled binary starts (`--version`).
 #
 # The ad-hoc signature is not a Developer ID: Gatekeeper still asks on first
-# open. Signing and notarization wait on the owner's Apple Developer decision
-# (phase 08c), as does the .dmg.
+# open (there is no Apple Developer account, so no notarization either).
+# packaging/macos/build-dmg.sh turns the bundle into the .dmg and the portable
+# .zip; .github/workflows/release.yml runs both, on a version tag only.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)

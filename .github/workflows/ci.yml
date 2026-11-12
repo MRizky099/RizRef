@@ -69,8 +69,6 @@ jobs:
             macos:
               - *shared
               - "packaging/macos/**"
-              - "crates/rizref/assets/*.icns"
-              - "crates/rizref/examples/make_icon.rs"
 
   # Everything a Linux runner can check, for every target.
   linux:
@@ -125,39 +123,17 @@ jobs:
         run: cargo test --workspace
 
   macos:
-    name: test and bundle (macOS, Apple Silicon)
+    name: test (macOS, Apple Silicon)
     needs: changes
     if: needs.changes.outputs.macos == 'true' || inputs.full
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
+      # The app bundle, .dmg and .zip are built by the release workflow only.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Run the tests
         run: cargo test --workspace
-      # The universal bundle (phase 08b), on the same runner so it costs no
-      # second macOS start: Intel built for 10.13, Apple Silicon for 11.0,
-      # merged with lipo and checked with otool (minimum OS per slice, system
-      # libraries only), plutil and an ad-hoc codesign. Kept as an artifact for
-      # testing on real Macs; it is not a release.
-      - name: Build and check RizRef.app
-        run: packaging/macos/build-app.sh dist/macos
-      # The two downloads from that bundle (phase 08c): the drag-to-Applications
-      # .dmg and the portable .zip, with SHA-256 sums. The script mounts the
-      # image and starts the app from it. Ad-hoc signed, not notarized.
-      - name: Package the .dmg and .zip
-        run: packaging/macos/build-dmg.sh dist/macos/RizRef.app dist/macos
-      - name: Keep the macOS downloads
-        uses: actions/upload-artifact@v4
-        with:
-          name: RizRef-macos-universal
-          path: |
-            dist/macos/*.dmg
-            dist/macos/*.zip
-            dist/macos/*.sha256
-          if-no-files-found: error
 
   # Intel is linted from Linux on every run; its tests run on a full run only
   # (a job-level condition, so no macOS runner starts otherwise).

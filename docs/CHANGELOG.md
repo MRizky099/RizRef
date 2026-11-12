@@ -95,11 +95,14 @@ Silicon requires a signature to run) and not notarized.
   *How to open RizRef.txt*; compressed read-only HFS+ so it mounts on 10.13) and the
   portable `RizRef-<version>-macos-universal.zip`, with SHA-256 sums. It verifies the
   image, mounts it, and checks the app inside verifies and starts.
-- The macOS CI job runs it after the bundle build and keeps both files as artifacts.
+- Packages are built by the release workflow only, never by CI and never committed:
+  `release.yml` now tests and packages Windows and macOS in parallel and one final job
+  creates the single draft release with all four files and `SHA256SUMS.txt` (job
+  hand-over artifacts expire after a day). The macOS CI job is back to tests only.
 - README → Installation → macOS documents the one-time Gatekeeper confirmation
   (*Open Anyway* on macOS 15+, Control-click → Open on 10.13–14, or `xattr`).
 
-## Phase 08b — macOS (in review)
+## Phase 08b — macOS (done)
 
 Branch `feat/phase-08b-macos`, part of issue #24. No format change; Windows and Linux
 behaviour unchanged.
@@ -122,8 +125,7 @@ behaviour unchanged.
   Alternate handler); `assets/rizref.icns` / `rizref_document.icns` from `make_icon`
   (16–1024 px PNG chunks); `packaging/macos/build-app.sh` builds x86_64 at 10.13 and
   arm64 at 11.0, merges them with `lipo`, and fails unless `otool` shows the right
-  minimum OS per slice and only system libraries. The macOS CI job runs it after the
-  tests and keeps the unsigned bundle as an artifact.
+  minimum OS per slice and only system libraries. The release workflow runs it (08c).
 - The colour picker samples RizRef's own board, so it needs no screen-recording
   permission and works unchanged.
 
