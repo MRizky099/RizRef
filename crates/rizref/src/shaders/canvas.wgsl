@@ -201,9 +201,11 @@ fn vs_items(item: ItemIn, @builtin(vertex_index) vi: u32) -> ItemOut {
 @fragment
 fn fs_items(in: ItemOut) -> @location(0) vec4f {
     var color = textureSample(item_tex, item_samp, in.uv) * in.tint;
-    // Checkerboard behind translucent pixels: world-space 16-unit cells, so
-    // the checker sticks to the board rather than to the screen.
-    if color.a < 0.999 && in.backdrop > 0.5 {
+    // Checkerboard behind translucent pixels, only when View → Checkerboard is
+    // on (g.flags.z): otherwise a transparent PNG shows the canvas through its
+    // transparent areas. World-space 16-unit cells, so the checker sticks to
+    // the board rather than to the screen.
+    if color.a < 0.999 && in.backdrop > 0.5 && g.flags.z > 0.5 {
         let cell = floor(in.world / vec2f(16.0));
         let parity = cell.x + cell.y;
         let even = parity - 2.0 * floor(parity / 2.0);

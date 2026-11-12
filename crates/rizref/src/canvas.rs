@@ -1215,4 +1215,157 @@ mod tests {
         // Pipeline creation validates the shader and layouts synchronously;
         // submission exercises the draw calls without waiting on the GPU.
     }
+
+    /// Draws one fully transparent image over a known canvas colour and reads
+    /// back the pixel at the image's centre. `None` when there is no GPU.
+    fn transparent_image_centre_pixel(checkerboard: bool) -> Option<[u8; 4]> {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = crate::renderer::preferred_backends();
+        let instance = wgpu::Instance::new(descriptor);
+        let adapter =
+            pollster::block_on(instance.enumerate_adapters(crate::renderer::preferred_backends()))
+                .into_iter()
+                .next()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("rizref-transparency-test-device"),
+            ..Default::default()
+        }))
+        .ok()?;
+
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut canvas = Canvas::new(&device, format);
+        canvas.set_globals(
+            &queue,
+            &Camera::default(),
+            DVec2::new(64.0, 64.0),
+            1.0,
+            None,
+            (0.0, 0.0),
+            super::FrameFlags {
+                checkerboard,
+                ..super::FrameFlags::default()
+            },
+        );
+        let asset = rizref_core::AssetId::from_checksum([9; 32]);
+        let mut textures = crate::textures::TextureCache::new(
+            &device,
+            canvas.item_texture_layout(),
+            crate::textures::MAX_TEXTURE_SIDE,
+        );
+        // Every pixel fully transparent, like the background of a cut-out PNG.
+        textures.upload(
+            &device,
+            &queue,
+            asset,
+            &rizref_codecs::ImageBuffer::filled(16, 16, [255, 255, 255, 0]),
+            false,
+        );
+        canvas.set_items(
+            &device,
+            &queue,
+            &[ItemQuad {
+                instance: QuadInstance::new([0.0, 0.0], [48.0, 48.0], 0.0),
+                asset,
+            }],
+        );
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rizref-transparency-test-target"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        // 64 px × 4 bytes is exactly the 256-byte row alignment wgpu requires.
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rizref-transparency-test-readback"),
+            size: 64 * 64 * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rizref-transparency-test-encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rizref-transparency-test-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // The canvas colour the image should let through.
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.2,
+                            g: 0.4,
+                            b: 0.6,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                ..Default::default()
+            });
+            canvas.draw_items(&mut pass, &[textures.bind_group(asset)]);
+        }
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(64 * 4),
+                    rows_per_image: Some(64),
+                },
+            },
+            wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("the readback completes");
+        let bytes = slice.get_mapped_range().expect("the buffer is mapped");
+        let at = (32 * 64 + 32) * 4;
+        Some([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    }
+
+    /// A transparent PNG shows the canvas through its transparent pixels unless
+    /// View → Checkerboard is on (the default is off).
+    #[test]
+    fn transparent_image_pixels_show_the_canvas_unless_the_checkerboard_is_on() {
+        let Some(off) = transparent_image_centre_pixel(false) else {
+            eprintln!("skipping: no GPU adapter in this environment");
+            return;
+        };
+        let canvas = [51u8, 102, 153, 255];
+        let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 2);
+        assert!(
+            close(off, canvas),
+            "checkerboard off: expected the canvas {canvas:?}, got {off:?}"
+        );
+
+        let on = transparent_image_centre_pixel(true).expect("the adapter is still there");
+        assert!(
+            !close(on, canvas),
+            "checkerboard on: expected the backdrop, got the canvas {on:?}"
+        );
+        assert!(
+            on[0] < 40 && on[0] == on[1] && on[1] == on[2],
+            "a dark grey checker cell, got {on:?}"
+        );
+    }
 }
