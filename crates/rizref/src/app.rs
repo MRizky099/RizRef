@@ -3272,9 +3272,6 @@ impl App {
                 let size = item.size();
                 let mut instance =
                     QuadInstance::new([center.x, center.y], [size.x, size.y], item.rotation());
-                // Text items are glyphs on nothing: no checkerboard behind
-                // their transparent pixels.
-                instance.backdrop = !item.is_rich_text();
                 instance.uv = match (item.flip_x(), item.flip_y()) {
                     (false, false) => [0.0, 0.0, 1.0, 1.0],
                     (true, false) => [1.0, 0.0, 0.0, 1.0],

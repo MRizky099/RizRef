@@ -165,9 +165,6 @@ pub struct QuadInstance {
     pub uv: [f32; 4],
     /// RGBA tint, straight alpha, 1.0 = unmodified.
     pub tint: [f32; 4],
-    /// Whether translucent pixels get the checkerboard backdrop (images);
-    /// off for text items, whose transparency is the canvas showing through.
-    pub backdrop: bool,
 }
 
 impl QuadInstance {
@@ -179,7 +176,6 @@ impl QuadInstance {
             rotation,
             uv: [0.0, 0.0, 1.0, 1.0],
             tint: [1.0, 1.0, 1.0, 1.0],
-            backdrop: true,
         }
     }
 
@@ -192,7 +188,7 @@ impl QuadInstance {
             self.size[0],
             self.size[1],
             self.rotation,
-            if self.backdrop { 1.0 } else { 0.0 },
+            0.0,
             0.0,
             0.0,
             self.uv[0],
@@ -1216,9 +1212,11 @@ mod tests {
         // submission exercises the draw calls without waiting on the GPU.
     }
 
-    /// Draws one fully transparent image over a known canvas colour and reads
-    /// back the pixel at the image's centre. `None` when there is no GPU.
-    fn transparent_image_centre_pixel(checkerboard: bool) -> Option<[u8; 4]> {
+    /// Draws the canvas background (with or without View → Checkerboard) and
+    /// then one 48 × 48 image per entry of `fills`, stacked in order at the
+    /// origin, and reads back the pixel at their centre. Each entry is the
+    /// RGBA every pixel of that image has. `None` when there is no GPU.
+    fn centre_pixel(checkerboard: bool, fills: &[[u8; 4]]) -> Option<[u8; 4]> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = crate::renderer::preferred_backends();
         let instance = wgpu::Instance::new(descriptor);
@@ -1232,7 +1230,9 @@ mod tests {
         }))
         .ok()?;
 
-        let format = wgpu::TextureFormat::Rgba8Unorm;
+        // The app presents to an sRGB surface (Bgra8UnormSrgb); match it so
+        // sRGB image texels come back as the same bytes.
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let mut canvas = Canvas::new(&device, format);
         canvas.set_globals(
             &queue,
@@ -1246,28 +1246,31 @@ mod tests {
                 ..super::FrameFlags::default()
             },
         );
-        let asset = rizref_core::AssetId::from_checksum([9; 32]);
         let mut textures = crate::textures::TextureCache::new(
             &device,
             canvas.item_texture_layout(),
             crate::textures::MAX_TEXTURE_SIDE,
         );
-        // Every pixel fully transparent, like the background of a cut-out PNG.
-        textures.upload(
-            &device,
-            &queue,
-            asset,
-            &rizref_codecs::ImageBuffer::filled(16, 16, [255, 255, 255, 0]),
-            false,
-        );
-        canvas.set_items(
-            &device,
-            &queue,
-            &[ItemQuad {
+        let mut items = Vec::new();
+        for (index, fill) in fills.iter().enumerate() {
+            let asset = rizref_core::AssetId::from_checksum([index as u8 + 1; 32]);
+            textures.upload(
+                &device,
+                &queue,
+                asset,
+                &rizref_codecs::ImageBuffer::filled(16, 16, *fill),
+                false,
+            );
+            items.push(ItemQuad {
                 instance: QuadInstance::new([0.0, 0.0], [48.0, 48.0], 0.0),
                 asset,
-            }],
-        );
+            });
+        }
+        canvas.set_items(&device, &queue, &items);
+        let bind_groups: Vec<_> = items
+            .iter()
+            .map(|item| textures.bind_group(item.asset))
+            .collect();
 
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rizref-transparency-test-target"),
@@ -1301,7 +1304,7 @@ mod tests {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // The canvas colour the image should let through.
+                        // The canvas fill colour.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.2,
                             g: 0.4,
@@ -1314,7 +1317,8 @@ mod tests {
                 })],
                 ..Default::default()
             });
-            canvas.draw_items(&mut pass, &[textures.bind_group(asset)]);
+            canvas.draw_background(&mut pass);
+            canvas.draw_items(&mut pass, &bind_groups);
         }
         encoder.copy_texture_to_buffer(
             target.as_image_copy(),
@@ -1343,29 +1347,42 @@ mod tests {
         Some([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
     }
 
-    /// A transparent PNG shows the canvas through its transparent pixels unless
-    /// View → Checkerboard is on (the default is off).
+    /// Whether two pixels match within rounding.
+    fn close(a: [u8; 4], b: [u8; 4]) -> bool {
+        a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 2)
+    }
+
+    /// A transparent PNG never draws as a box: with View → Checkerboard off or
+    /// on, its transparent pixels show exactly what the canvas shows there.
     #[test]
-    fn transparent_image_pixels_show_the_canvas_unless_the_checkerboard_is_on() {
-        let Some(off) = transparent_image_centre_pixel(false) else {
+    fn transparent_image_pixels_show_the_canvas_with_or_without_the_checkerboard() {
+        for checkerboard in [false, true] {
+            let Some(canvas_only) = centre_pixel(checkerboard, &[]) else {
+                eprintln!("skipping: no GPU adapter in this environment");
+                return;
+            };
+            let with_image = centre_pixel(checkerboard, &[[255, 255, 255, 0]])
+                .expect("the adapter is still there");
+            assert!(
+                close(with_image, canvas_only),
+                "checkerboard {checkerboard}: a transparent image changed the canvas \
+                 {canvas_only:?} to {with_image:?}"
+            );
+        }
+    }
+
+    /// Stacked images see each other through transparent pixels, also with the
+    /// checkerboard on.
+    #[test]
+    fn a_transparent_image_on_top_shows_the_image_below() {
+        let below = [200u8, 30, 40, 255];
+        let Some(pixel) = centre_pixel(true, &[below, [255, 255, 255, 0]]) else {
             eprintln!("skipping: no GPU adapter in this environment");
             return;
         };
-        let canvas = [51u8, 102, 153, 255];
-        let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 2);
         assert!(
-            close(off, canvas),
-            "checkerboard off: expected the canvas {canvas:?}, got {off:?}"
-        );
-
-        let on = transparent_image_centre_pixel(true).expect("the adapter is still there");
-        assert!(
-            !close(on, canvas),
-            "checkerboard on: expected the backdrop, got the canvas {on:?}"
-        );
-        assert!(
-            on[0] < 40 && on[0] == on[1] && on[1] == on[2],
-            "a dark grey checker cell, got {on:?}"
+            close(pixel, below),
+            "expected the lower image {below:?} through the upper one, got {pixel:?}"
         );
     }
 }

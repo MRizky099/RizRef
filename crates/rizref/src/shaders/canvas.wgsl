@@ -155,7 +155,7 @@ fn fs_background(in: BgOut) -> @location(0) vec4f {
 
 struct ItemIn {
     @location(0) pos_size: vec4f, // center.xy, size.xy (world units)
-    @location(1) misc: vec4f,     // rotation (rad), checkerboard backdrop (0/1), -, -
+    @location(1) misc: vec4f,     // rotation (rad), -, -, -
     @location(2) uv: vec4f,       // uv rect (min.xy, max.xy)
     @location(3) tint: vec4f,
 }
@@ -163,9 +163,7 @@ struct ItemIn {
 struct ItemOut {
     @builtin(position) clip: vec4f,
     @location(0) uv: vec2f,
-    @location(1) world: vec2f,
-    @location(2) tint: vec4f,
-    @location(3) backdrop: f32,
+    @location(1) tint: vec4f,
 }
 
 @group(1) @binding(0) var item_tex: texture_2d<f32>;
@@ -192,26 +190,17 @@ fn vs_items(item: ItemIn, @builtin(vertex_index) vi: u32) -> ItemOut {
         mix(item.uv.x, item.uv.z, t.x),
         mix(item.uv.y, item.uv.w, t.y),
     );
-    out.world = world;
     out.tint = item.tint;
-    out.backdrop = item.misc.y;
     return out;
 }
 
 @fragment
 fn fs_items(in: ItemOut) -> @location(0) vec4f {
+    // Transparent pixels stay transparent: whatever lies underneath (other
+    // images, or the canvas with its optional checkerboard) shows through.
+    // There is deliberately no per-image backdrop, so a cut-out PNG never draws
+    // as a box.
     var color = textureSample(item_tex, item_samp, in.uv) * in.tint;
-    // Checkerboard behind translucent pixels, only when View → Checkerboard is
-    // on (g.flags.z): otherwise a transparent PNG shows the canvas through its
-    // transparent areas. World-space 16-unit cells, so the checker sticks to
-    // the board rather than to the screen.
-    if color.a < 0.999 && in.backdrop > 0.5 && g.flags.z > 0.5 {
-        let cell = floor(in.world / vec2f(16.0));
-        let parity = cell.x + cell.y;
-        let even = parity - 2.0 * floor(parity / 2.0);
-        let shade = select(0.05, 0.10, even > 0.5);
-        color = vec4f(mix(vec3f(shade), color.rgb, color.a), 1.0);
-    }
     // Reference study mode: luminance only, alpha preserved.
     if g.flags.w > 0.5 {
         let luma = dot(color.rgb, vec3f(0.2126, 0.7152, 0.0722));
