@@ -58,6 +58,14 @@ pub const MARQUEE_FILL: [f32; 4] = [0.30, 0.62, 1.0, 0.10];
 pub const HANDLE_BODY: [f32; 4] = [0.07, 0.08, 0.10, 1.0];
 /// Soft shadow drawn behind a selected item's outline.
 pub const SHADOW: [f32; 4] = [0.0, 0.0, 0.0, 0.30];
+/// Outline of a group the selection has entered.
+pub const GROUP: [f32; 4] = [0.30, 0.62, 1.0, 0.45];
+/// Crop handles and the uncropped image's outline.
+pub const CROP: [f32; 4] = [1.0, 0.78, 0.25, 1.0];
+/// The uncropped image's outline.
+pub const CROP_FULL: [f32; 4] = [1.0, 0.78, 0.25, 0.45];
+/// Length of a crop corner bracket's arms, in logical pixels.
+pub const CROP_BRACKET: f32 = 12.0;
 
 /// Edge width of a selection outline, in logical pixels.
 pub const OUTLINE_WIDTH: f32 = 1.5;
@@ -96,6 +104,12 @@ pub struct OverlayState<'a> {
     /// Whether only the four corner handles are drawn (a selection with a
     /// text item, which is only ever scaled, never stretched).
     pub corners_only: bool,
+    /// The bounds of the group the selection is inside, after a second
+    /// click entered it.
+    pub group_bounds: Option<Rect>,
+    /// The whole image's world corners while it is being cropped: the
+    /// handles then move crop edges and are drawn in the crop colour.
+    pub crop_full: Option<[Vec2; 4]>,
     /// The note toolbar or edit pill, drawn on top of everything.
     pub chrome: Option<NoteChrome>,
     /// The text caret of the note or text item being edited, while it is
@@ -159,8 +173,48 @@ pub fn build(state: &OverlayState) -> Vec<OverlayVertex> {
         outline_item(&mut vertices, state, item, HOVER_WIDTH, HOVER);
     }
 
+    // The group the selection is inside.
+    if let Some(bounds) = state.group_bounds {
+        let corners = [
+            state.screen(Vec2::new(bounds.min.x, bounds.min.y)),
+            state.screen(Vec2::new(bounds.max().x, bounds.min.y)),
+            state.screen(Vec2::new(bounds.max().x, bounds.max().y)),
+            state.screen(Vec2::new(bounds.min.x, bounds.max().y)),
+        ];
+        dashed_outline(&mut vertices, corners, 1.0, GROUP);
+    }
+
+    // Cropping: the whole image's outline, then the crop frame with
+    // corner brackets and edge bars instead of scale handles.
+    if let (Some(full), Some(frame)) = (state.crop_full, frame) {
+        dashed_outline(
+            &mut vertices,
+            full.map(|corner| state.screen(corner)),
+            1.0,
+            CROP_FULL,
+        );
+        let corners = frame.corners().map(|c| state.screen(c));
+        rect_outline(&mut vertices, corners, OUTLINE_WIDTH, CROP);
+        for index in 0..4 {
+            let corner = corners[index];
+            let next = corners[(index + 1) % 4];
+            let previous = corners[(index + 3) % 4];
+            for towards in [next, previous] {
+                let direction = (towards - corner).normalize_or_zero();
+                let arm = direction * CROP_BRACKET.min(corner.distance(towards) * 0.4);
+                line(&mut vertices, corner, corner + arm, 5.0, HANDLE_BODY);
+                line(&mut vertices, corner, corner + arm, 3.0, CROP);
+            }
+            let middle = (corner + next) * 0.5;
+            let direction = (next - corner).normalize_or_zero();
+            let arm = direction * (CROP_BRACKET * 0.5).min(corner.distance(next) * 0.2);
+            line(&mut vertices, middle - arm, middle + arm, 5.0, HANDLE_BODY);
+            line(&mut vertices, middle - arm, middle + arm, 3.0, CROP);
+        }
+    }
+
     // The selection frame and handles.
-    if let Some(frame) = frame {
+    if let Some(frame) = frame.filter(|_| state.crop_full.is_none()) {
         let multi = state.selection.len() > 1;
         if multi {
             rect_outline(
@@ -636,6 +690,38 @@ fn line(vertices: &mut Vec<OverlayVertex>, a: Vec2, b: Vec2, width: f32, color: 
 }
 
 /// Appends the four edges of a screen-space quad.
+fn dashed_outline(
+    vertices: &mut Vec<OverlayVertex>,
+    corners: [Vec2; 4],
+    width: f32,
+    color: [f32; 4],
+) {
+    const DASH: f32 = 6.0;
+    const GAP: f32 = 4.0;
+    for index in 0..4 {
+        let (a, b) = (corners[index], corners[(index + 1) % 4]);
+        let length = a.distance(b);
+        if length < 1.0e-4 {
+            continue;
+        }
+        let direction = (b - a) / length;
+        // Cap the dash count so a huge zoom never floods the buffer.
+        let step = (DASH + GAP).max(length / 512.0);
+        let mut start = 0.0;
+        while start < length {
+            let end = (start + DASH).min(length);
+            line(
+                vertices,
+                a + direction * start,
+                a + direction * end,
+                width,
+                color,
+            );
+            start += step;
+        }
+    }
+}
+
 fn rect_outline(
     vertices: &mut Vec<OverlayVertex>,
     corners: [Vec2; 4],
@@ -709,6 +795,8 @@ mod tests {
             guides: &[],
             rotatable: true,
             corners_only: false,
+            group_bounds: None,
+            crop_full: None,
             chrome: None,
             caret: None,
         }

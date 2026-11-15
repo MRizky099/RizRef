@@ -122,6 +122,109 @@ pub fn inner_note_width(width: f32) -> f32 {
     (width - 2.0 * NOTE_PADDING).max(MIN_WRAP_WIDTH)
 }
 
+/// The part of an image's source an item shows.
+///
+/// Edges are fractions of the source's width and height, in unmirrored
+/// texture space: `0..1` on both axes is the whole image. A crop only narrows
+/// what is sampled; the pixels outside it stay in the asset, which is why a
+/// transform reset brings the full image back.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Crop {
+    /// Left edge, `0..1`.
+    pub left: f32,
+    /// Top edge, `0..1`.
+    pub top: f32,
+    /// Right edge, `0..1`.
+    pub right: f32,
+    /// Bottom edge, `0..1`.
+    pub bottom: f32,
+}
+
+/// The narrowest crop span on either axis, as a fraction of the source.
+pub const MIN_CROP_SPAN: f32 = 1.0e-4;
+
+impl Crop {
+    /// The whole image.
+    pub const FULL: Self = Self {
+        left: 0.0,
+        top: 0.0,
+        right: 1.0,
+        bottom: 1.0,
+    };
+
+    /// A crop with the given edges, or `None` when they are not finite, leave
+    /// the image, or enclose (next to) nothing.
+    pub fn new(left: f32, top: f32, right: f32, bottom: f32) -> Option<Self> {
+        let unit = |v: f32| v.is_finite() && (0.0..=1.0).contains(&v);
+        (unit(left)
+            && unit(top)
+            && unit(right)
+            && unit(bottom)
+            && right - left >= MIN_CROP_SPAN
+            && bottom - top >= MIN_CROP_SPAN)
+            .then_some(Self {
+                left,
+                top,
+                right,
+                bottom,
+            })
+    }
+
+    /// Whether this shows the whole image.
+    pub fn is_full(&self) -> bool {
+        *self == Self::FULL
+    }
+
+    /// Width and height as fractions of the source.
+    pub fn span(&self) -> Vec2 {
+        Vec2::new(self.right - self.left, self.bottom - self.top)
+    }
+
+    /// The crop as seen on the board: mirrored with the item, so its left
+    /// edge is the left edge the user sees. Mirroring twice is the identity,
+    /// so this also maps a displayed crop back to the source.
+    pub fn displayed(&self, flip_x: bool, flip_y: bool) -> Self {
+        let (left, right) = if flip_x {
+            (1.0 - self.right, 1.0 - self.left)
+        } else {
+            (self.left, self.right)
+        };
+        let (top, bottom) = if flip_y {
+            (1.0 - self.bottom, 1.0 - self.top)
+        } else {
+            (self.top, self.bottom)
+        };
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    /// The UV rectangle a quad samples, `[left, top, right, bottom]` in the
+    /// order the quad's corners read them: mirroring swaps the edges.
+    pub fn uv(&self, flip_x: bool, flip_y: bool) -> [f32; 4] {
+        let (u0, u1) = if flip_x {
+            (self.right, self.left)
+        } else {
+            (self.left, self.right)
+        };
+        let (v0, v1) = if flip_y {
+            (self.bottom, self.top)
+        } else {
+            (self.top, self.bottom)
+        };
+        [u0, v0, u1, v1]
+    }
+}
+
+impl Default for Crop {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
 /// What an item shows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -162,6 +265,8 @@ pub struct ItemState {
     pub flip_x: bool,
     /// Whether the sampled texture is mirrored vertically.
     pub flip_y: bool,
+    /// The part of the source shown; always full for notes.
+    pub crop: Crop,
 }
 
 /// One item on the board.
@@ -174,6 +279,8 @@ pub struct Item {
     flip_x: bool,
     #[serde(default)]
     flip_y: bool,
+    #[serde(default, skip_serializing_if = "Crop::is_full")]
+    crop: Crop,
     body: ItemBody,
 }
 
@@ -186,6 +293,7 @@ impl Item {
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            crop: Crop::FULL,
             body: ItemBody::Image { asset },
         }
     }
@@ -211,6 +319,7 @@ impl Item {
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            crop: Crop::FULL,
             body: ItemBody::Note {
                 text,
                 format,
@@ -370,6 +479,7 @@ impl Item {
             transform: self.transform,
             flip_x: self.flip_x,
             flip_y: self.flip_y,
+            crop: self.crop,
         }
     }
 
@@ -378,6 +488,18 @@ impl Item {
         self.transform = state.transform;
         self.flip_x = state.flip_x;
         self.flip_y = state.flip_y;
+        self.set_crop(state.crop);
+    }
+
+    /// The part of the source this item shows.
+    pub const fn crop(&self) -> Crop {
+        self.crop
+    }
+
+    /// Sets the shown part of the source. Notes sample their whole rendered
+    /// texture, so a note always keeps the full crop.
+    pub fn set_crop(&mut self, crop: Crop) {
+        self.crop = if self.is_note() { Crop::FULL } else { crop };
     }
 
     /// The item's transform.
@@ -553,6 +675,7 @@ mod tests {
             transform: Transform::new(Vec2::splat(5.0), Vec2::splat(20.0)).with_rotation(0.4),
             flip_x: true,
             flip_y: true,
+            crop: super::Crop::new(0.1, 0.2, 0.9, 0.7).expect("valid"),
         };
 
         item.set_state(state);
@@ -560,6 +683,31 @@ mod tests {
         assert_eq!(item.state(), state);
         assert_eq!(item.center(), Vec2::splat(5.0));
         assert!(item.flip_x() && item.flip_y());
+    }
+
+    #[test]
+    fn crop_validation_mirroring_and_uv() {
+        use super::Crop;
+        assert!(Crop::new(0.5, 0.0, 0.5, 1.0).is_none(), "empty");
+        assert!(Crop::new(-0.1, 0.0, 0.5, 1.0).is_none(), "outside");
+        assert!(Crop::new(f32::NAN, 0.0, 0.5, 1.0).is_none());
+        let crop = Crop::new(0.25, 0.25, 0.5, 0.75).expect("valid");
+        assert!(!crop.is_full() && Crop::default().is_full());
+        let shown = crop.displayed(true, false);
+        assert_eq!((shown.left, shown.right), (0.5, 0.75));
+        assert_eq!(shown.displayed(true, false), crop);
+        assert_eq!(crop.uv(false, false), [0.25, 0.25, 0.5, 0.75]);
+        assert_eq!(crop.uv(true, true), [0.5, 0.75, 0.25, 0.25]);
+    }
+
+    #[test]
+    fn a_note_never_keeps_a_crop() {
+        use super::Crop;
+        let mut note = Item::note(ItemId::from_raw(3), "x", Vec2::ZERO, DEFAULT_NOTE_SIZE);
+        let mut state = note.state();
+        state.crop = Crop::new(0.0, 0.0, 0.5, 0.5).expect("valid");
+        note.set_state(state);
+        assert!(note.crop().is_full());
     }
 
     #[test]

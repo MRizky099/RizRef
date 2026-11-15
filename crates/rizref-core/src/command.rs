@@ -866,6 +866,7 @@ mod tests {
             transform: Transform::new(Vec2::new(x, 0.0), Vec2::splat(10.0)),
             flip_x: false,
             flip_y: false,
+            crop: crate::item::Crop::FULL,
         }
     }
 

@@ -542,6 +542,7 @@ pub fn build(context: &MenuContext) -> Vec<MenuEntry> {
             S::FlipVertical,
             Action::from_shortcut(S::FlipVertical),
         ),
+        MenuEntry::shortcut("Crop", S::CropImage, Action::from_shortcut(S::CropImage)),
         MenuEntry::separator(),
     ];
     transform.extend(transform_actions(
@@ -1498,6 +1499,7 @@ mod tests {
             Command::FlipHorizontal,
             Command::FlipVertical,
             Command::ResetTransform,
+            Command::ToggleCrop,
             Command::MatchWidth,
             Command::MatchHeight,
             Command::GroupSelection,

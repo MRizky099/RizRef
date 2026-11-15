@@ -323,7 +323,9 @@ fn print_help() {
     println!("CANVAS: middle-drag or space+drag pans, the wheel zooms, alt+wheel turns the view.");
     println!("ITEMS:  click/shift-click selects, drag moves, handles scale and rotate.");
     println!("        ctrl+A all, ctrl+D duplicate, del delete, ctrl+Z/Y undo/redo,");
-    println!("        ctrl+G / ctrl+shift+G group and ungroup, pgup/pgdn/home/end order,");
+    println!("        ctrl+G / ctrl+shift+U group and ungroup (click a selected group's");
+    println!("        member again to edit it alone), pgup/pgdn/home/end order,");
+    println!("        C crops the selected image (ctrl+shift+R reset brings it back),");
     println!("        3/4/5/6 arrange (grid/hierarchy/spread/stack), N adds a note,");
     println!("        ctrl+shift+arrows align, ctrl+shift+,/. distribute,");
     println!("        shift+H/V flip, ctrl+shift+W/H match size, ctrl+shift+R reset.");
@@ -1548,7 +1550,7 @@ impl App {
             DistributeHorizontal, DistributeVertical, DuplicateSelection, FitContent,
             FlipHorizontal, FlipVertical, GroupSelection, LowerSelection, LowerToBottom,
             MatchHeight, MatchWidth, RaiseSelection, RaiseToTop, Redo, ResetRotation,
-            ResetTransform, ResetView, SelectAll, Undo, UngroupSelection, ZoomHundred,
+            ResetTransform, ResetView, SelectAll, ToggleCrop, Undo, UngroupSelection, ZoomHundred,
         };
 
         if self.shell.locked && command_mutates_items(command) {
@@ -1618,6 +1620,19 @@ impl App {
             FlipHorizontal => self.board.flip(true),
             FlipVertical => self.board.flip(false),
             ResetTransform => self.board.reset_transform(),
+            ToggleCrop => {
+                let was_cropping = self.board.crop_target().is_some();
+                let changed = self.board.toggle_crop();
+                if !was_cropping {
+                    let message = if changed {
+                        "Crop: drag the handles · Enter or C to finish"
+                    } else {
+                        "Select one image to crop"
+                    };
+                    self.shell.toast(message, Instant::now());
+                }
+                changed
+            }
             MatchWidth => self.board.match_size(rizref_core::SizeAxis::Width),
             MatchHeight => self.board.match_size(rizref_core::SizeAxis::Height),
             GroupSelection => self.board.group_selection(),
@@ -3260,28 +3275,44 @@ impl App {
     /// textures cost anything while they are off screen.
     fn build_items(&self) -> Vec<ItemQuad> {
         let visible = self.view.camera.visible_world_rect(self.view.viewport());
-        self.board
-            .scene()
-            .visible_items(&visible)
-            .filter_map(|item| {
-                let asset = match item.body() {
-                    ItemBody::Image { asset } => *asset,
-                    ItemBody::Note { .. } => self.note_textures.get(&item.id())?.id,
-                };
-                let center = item.center();
-                let size = item.size();
-                let mut instance =
+        let cropping = self.board.crop_target();
+        let mut quads = Vec::new();
+        for item in self.board.scene().visible_items(&visible) {
+            let asset = match item.body() {
+                ItemBody::Image { asset } => *asset,
+                ItemBody::Note { .. } => match self.note_textures.get(&item.id()) {
+                    Some(texture) => texture.id,
+                    None => continue,
+                },
+            };
+            // While cropping, the whole image shows faintly behind the
+            // crop, so the user sees what an edge can grow back into.
+            if cropping == Some(item.id())
+                && let Some(corners) = self.board.crop_full_corners()
+            {
+                let center = (corners[0] + corners[2]) * 0.5;
+                let size = Vec2::new(
+                    corners[0].distance(corners[1]),
+                    corners[1].distance(corners[2]),
+                );
+                let mut ghost =
                     QuadInstance::new([center.x, center.y], [size.x, size.y], item.rotation());
-                instance.uv = match (item.flip_x(), item.flip_y()) {
-                    (false, false) => [0.0, 0.0, 1.0, 1.0],
-                    (true, false) => [1.0, 0.0, 0.0, 1.0],
-                    (false, true) => [0.0, 1.0, 1.0, 0.0],
-                    (true, true) => [1.0, 1.0, 0.0, 0.0],
-                };
-                instance.tint = [1.0, 1.0, 1.0, item.opacity()];
-                Some(ItemQuad { instance, asset })
-            })
-            .collect()
+                ghost.uv = rizref_core::Crop::FULL.uv(item.flip_x(), item.flip_y());
+                ghost.tint = [1.0, 1.0, 1.0, item.opacity() * 0.3];
+                quads.push(ItemQuad {
+                    instance: ghost,
+                    asset,
+                });
+            }
+            let center = item.center();
+            let size = item.size();
+            let mut instance =
+                QuadInstance::new([center.x, center.y], [size.x, size.y], item.rotation());
+            instance.uv = item.crop().uv(item.flip_x(), item.flip_y());
+            instance.tint = [1.0, 1.0, 1.0, item.opacity()];
+            quads.push(ItemQuad { instance, asset });
+        }
+        quads
     }
 
     /// Uploads previews for items whose full texture is missing or evicted,
@@ -3336,6 +3367,8 @@ impl App {
             guides: self.board.guides(),
             rotatable: self.board.selection_rotatable(),
             corners_only: self.board.selection_corners_only(),
+            group_bounds: self.board.entered_group_bounds(),
+            crop_full: self.board.crop_full_corners(),
             chrome: self.note_chrome(),
             caret: self.caret_overlay(Instant::now()),
         };
@@ -5349,6 +5382,15 @@ impl ApplicationHandler<AppEvent> for App {
                     self.redraw();
                     return;
                 }
+                // Escape or Enter finishes a crop before anything else.
+                if matches!(
+                    &event.logical_key,
+                    Key::Named(NamedKey::Escape | NamedKey::Enter)
+                ) && self.board.exit_crop()
+                {
+                    self.redraw();
+                    return;
+                }
                 if let Some(chord) = chord
                     && let Some(id) = self.shortcuts.resolve(chord)
                 {
@@ -5713,7 +5755,7 @@ fn command_mutates_items(command: Command) -> bool {
         ArrangeStack, CreateNote, CreateText, DeleteSelection, DistributeHorizontal,
         DistributeVertical, DuplicateSelection, FlipHorizontal, FlipVertical, GroupSelection,
         LowerSelection, LowerToBottom, MatchHeight, MatchWidth, Nudge, RaiseSelection, RaiseToTop,
-        Redo, ResetTransform, Undo, UngroupSelection,
+        Redo, ResetTransform, ToggleCrop, Undo, UngroupSelection,
     };
     matches!(
         command,
@@ -5724,6 +5766,7 @@ fn command_mutates_items(command: Command) -> bool {
             | FlipHorizontal
             | FlipVertical
             | ResetTransform
+            | ToggleCrop
             | MatchWidth
             | MatchHeight
             | GroupSelection

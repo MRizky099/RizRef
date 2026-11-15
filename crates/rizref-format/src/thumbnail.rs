@@ -141,10 +141,28 @@ fn draw_item(pixmap: &mut Pixmap, scene: &Scene, item: &Item, origin: Vec2, scal
             return;
         };
         let preview = asset.preview().image();
-        let Some(preview_pixmap) = premultiplied(preview) else {
+        let Some(mut preview_pixmap) = premultiplied(preview) else {
             return;
         };
-        let (px, py) = (preview.width() as f32, preview.height() as f32);
+        let crop = item.crop();
+        if !crop.is_full() {
+            // Draw only the shown part of the source.
+            let (w, h) = (preview.width() as f32, preview.height() as f32);
+            let left = (crop.left * w).floor() as i32;
+            let top = (crop.top * h).floor() as i32;
+            let right = ((crop.right * w).ceil() as i32).max(left + 1);
+            let bottom = ((crop.bottom * h).ceil() as i32).max(top + 1);
+            let Some(cropped) = tiny_skia::IntRect::from_ltrb(left, top, right, bottom)
+                .and_then(|rect| preview_pixmap.clone_rect(rect))
+            else {
+                return;
+            };
+            preview_pixmap = cropped;
+        }
+        let (px, py) = (
+            preview_pixmap.width() as f32,
+            preview_pixmap.height() as f32,
+        );
         let mut transform = Transform::from_translate(center.x, center.y)
             .pre_concat(Transform::from_rotate(rotation_deg));
         if item.flip_x() {

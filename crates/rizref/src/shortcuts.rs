@@ -511,6 +511,8 @@ pub enum ShortcutId {
     FlipVertical,
     /// Reset the item transform.
     ResetTransform,
+    /// Crop the selected image (toggles crop mode).
+    CropImage,
     /// Match the selection's width.
     MatchWidth,
     /// Match the selection's height.
@@ -613,7 +615,7 @@ pub enum ShortcutId {
 
 impl ShortcutId {
     /// Every shortcut, in the order the F1 overlay lists them.
-    pub const ALL: [Self; 66] = [
+    pub const ALL: [Self; 67] = [
         Self::Undo,
         Self::Redo,
         Self::SelectAll,
@@ -631,6 +633,7 @@ impl ShortcutId {
         Self::FlipHorizontal,
         Self::FlipVertical,
         Self::ResetTransform,
+        Self::CropImage,
         Self::MatchWidth,
         Self::MatchHeight,
         Self::GroupSelection,
@@ -702,6 +705,7 @@ impl ShortcutId {
             Self::FlipHorizontal => "Flip horizontal",
             Self::FlipVertical => "Flip vertical",
             Self::ResetTransform => "Reset transform",
+            Self::CropImage => "Crop",
             Self::MatchWidth => "Match width",
             Self::MatchHeight => "Match height",
             Self::GroupSelection => "Group",
@@ -811,6 +815,7 @@ impl ShortcutId {
             Self::FlipHorizontal => Command::FlipHorizontal,
             Self::FlipVertical => Command::FlipVertical,
             Self::ResetTransform => Command::ResetTransform,
+            Self::CropImage => Command::ToggleCrop,
             Self::MatchWidth => Command::MatchWidth,
             Self::MatchHeight => Command::MatchHeight,
             Self::GroupSelection => Command::GroupSelection,
@@ -865,6 +870,7 @@ impl ShortcutId {
             Self::FlipHorizontal => vec![KeyChord::shift(H)],
             Self::FlipVertical => vec![KeyChord::shift(V)],
             Self::ResetTransform => vec![KeyChord::ctrl_shift(R)],
+            Self::CropImage => vec![KeyChord::plain(C)],
             Self::MatchWidth => vec![KeyChord::ctrl_shift(W)],
             Self::MatchHeight => vec![KeyChord::ctrl_shift(H)],
             Self::GroupSelection => vec![KeyChord::ctrl(G)],

@@ -30,8 +30,8 @@ use std::sync::Arc;
 use glam::{DVec2, Vec2};
 use rizref_codecs::{ImageBuffer, ImageFormat};
 use rizref_core::{
-    Asset, AssetId, Camera, Group, GroupChild, GroupId, Item, ItemId, NoteContent, NoteFormat,
-    Rect, Scene, SceneId, TextSpan, TextStyle, Transform, clamp_wrap_width,
+    Asset, AssetId, Camera, Crop, Group, GroupChild, GroupId, Item, ItemId, NoteContent,
+    NoteFormat, Rect, Scene, SceneId, TextSpan, TextStyle, Transform, clamp_wrap_width,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -195,6 +195,11 @@ pub struct ItemEntry {
     /// Horizontal and vertical mirror flags.
     #[serde(default)]
     pub flip: [bool; 2],
+    /// The shown part of an image's source, `[left, top, right, bottom]` as
+    /// fractions of its unmirrored width and height. Absent means the whole
+    /// image; an invalid value is reported and read as the whole image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<[f32; 4]>,
     /// Members from a newer build.
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, Value>,
@@ -569,6 +574,9 @@ impl SceneDocument {
                     rotation: transform.rotation(),
                     opacity: item.opacity(),
                     flip: [item.flip_x(), item.flip_y()],
+                    crop: Some(item.crop())
+                        .filter(|crop| !crop.is_full())
+                        .map(|crop| [crop.left, crop.top, crop.right, crop.bottom]),
                     extra: BTreeMap::new(),
                 }
             })
@@ -817,6 +825,16 @@ impl SceneDocument {
             item.set_transform(transform);
             item.set_opacity(entry.opacity);
             item.set_flip(entry.flip[0], entry.flip[1]);
+            if let Some([left, top, right, bottom]) = entry.crop {
+                match Crop::new(left, top, right, bottom) {
+                    Some(crop) if !item.is_note() => item.set_crop(crop),
+                    _ => warnings.push(format!(
+                        "item {} has invalid crop {:?}; showing the whole image",
+                        entry.id,
+                        [left, top, right, bottom]
+                    )),
+                }
+            }
             scene.insert_item_at(index, item);
         }
 
@@ -1163,6 +1181,7 @@ mod tests {
             rotation: 0.0,
             opacity: 1.0,
             flip: [false, false],
+            crop: None,
             extra: BTreeMap::new(),
         });
 
@@ -1177,6 +1196,64 @@ mod tests {
             "the item survives for relinking"
         );
         assert!(loaded.scene.assets().is_empty());
+    }
+
+    #[test]
+    fn an_image_crop_round_trips_and_a_bad_crop_only_warns() {
+        let mut document = SceneDocument::new(scene_id(), "Cropped", &Camera::default());
+        document.assets.push(AssetEntry {
+            hash: "bb".repeat(32),
+            format: "png".to_owned(),
+            pixel_size: [10, 10],
+            byte_len: 4,
+            origin: AssetOrigin::File,
+            source_path: Some("missing.png".to_owned()),
+            source_url: None,
+            embedded: false,
+            preview: None,
+            extra: BTreeMap::new(),
+        });
+        let entry = |id, crop| ItemEntry {
+            id,
+            kind: ItemKind::Image,
+            asset: Some("bb".repeat(32)),
+            text: None,
+            text_format: None,
+            background: None,
+            wrap_width: None,
+            spans: None,
+            position: [0.0, 0.0],
+            size: [10.0, 10.0],
+            rotation: 0.0,
+            opacity: 1.0,
+            flip: [false, false],
+            crop,
+            extra: BTreeMap::new(),
+        };
+        document.items.push(entry(1, Some([0.25, 0.0, 0.75, 0.5])));
+        document.items.push(entry(2, Some([0.5, 0.0, 0.25, 1.0])));
+
+        let loaded = document
+            .build_scene(&BTreeMap::new(), &BTreeMap::new())
+            .expect("loads");
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        let crop = |raw| {
+            loaded
+                .scene
+                .item(rizref_core::ItemId::from_raw(raw))
+                .expect("item")
+                .crop()
+        };
+        assert_eq!(
+            crop(1),
+            rizref_core::Crop::new(0.25, 0.0, 0.75, 0.5).expect("valid")
+        );
+        assert!(crop(2).is_full());
+
+        let resaved =
+            SceneDocument::from_scene(&loaded.scene, "Cropped", &Camera::default(), Vec::new());
+        assert_eq!(resaved.items[0].crop, Some([0.25, 0.0, 0.75, 0.5]));
+        assert_eq!(resaved.items[1].crop, None, "a full crop is not written");
     }
 
     #[test]

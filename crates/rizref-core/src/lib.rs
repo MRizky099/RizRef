@@ -43,9 +43,9 @@ pub use frame::{Handle, Pivot, SelectionFrame, scale_item, scale_item_in_frame, 
 pub use geometry::Rect;
 pub use group::{Group, GroupChild, GroupId, Groups};
 pub use item::{
-    DEFAULT_NOTE_BACKGROUND, DEFAULT_NOTE_SIZE, Item, ItemBody, ItemState, MAX_WRAP_WIDTH,
-    MIN_WRAP_WIDTH, NOTE_PADDING, NoteContent, NoteFormat, TEXT_PADDING, clamp_wrap_width,
-    inner_note_width,
+    Crop, DEFAULT_NOTE_BACKGROUND, DEFAULT_NOTE_SIZE, Item, ItemBody, ItemState, MAX_WRAP_WIDTH,
+    MIN_CROP_SPAN, MIN_WRAP_WIDTH, NOTE_PADDING, NoteContent, NoteFormat, TEXT_PADDING,
+    clamp_wrap_width, inner_note_width,
 };
 pub use preview::{Fitted, PREVIEW_SIDE, fit_to_side, generate_preview};
 pub use rich::{DEFAULT_TEXT_SIZE, TextSpan, TextStyle};

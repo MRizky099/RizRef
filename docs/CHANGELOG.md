@@ -2,6 +2,25 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+## Crop, and editing inside a group
+
+Format revision 1.4 (additive; see `docs/format.md`, "Image crop").
+
+- **Crop** (`C`, Image ▸ Transform ▸ Crop) puts the selected image in crop mode: the
+  frame turns amber with corner brackets and edge bars, the whole image shows faintly
+  behind it inside a dashed outline, and dragging a handle moves that crop edge while
+  the visible pixels stay put. Edges stop at the original image. Each drag is one undo
+  step; `Enter`, `Esc`, `C` again or selecting anything else finishes. A cropped image
+  moves, scales, rotates and flips like any other, and **Reset transform**
+  (`Ctrl+Shift+R`) brings the whole image back at its natural size. Saved boards keep
+  the crop; thumbnails and PNG export draw it.
+- **Groups**: the first click on a grouped image selects the whole group as one box (a
+  drag moves it all, as before). A second click on a member, without dragging, enters
+  the group and selects just that image, shown inside a dashed group outline; it can
+  then be moved, scaled, cropped or deleted alone, and clicking a sibling picks that one
+  instead. Clicking away leaves it in the group, so the next click selects the whole
+  group again. Ungroup (`Ctrl+Shift+U`) dissolves the group.
+
 ## CI on a minute budget
 
 - One Linux job now runs rustfmt, clippy for Linux, Windows and both macOS

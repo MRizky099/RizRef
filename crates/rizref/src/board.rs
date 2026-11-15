@@ -14,9 +14,9 @@ use std::collections::BTreeSet;
 
 use glam::{DVec2, Vec2};
 use rizref_core::{
-    AddGroup, AddItems, Align, ArrangeMode, Camera, DEFAULT_NOTE_SIZE, DissolveGroup, Effects,
-    GroupChild, Handle, History, Item, ItemId, ItemState, NOTE_PADDING, NoteContent, NoteFormat,
-    Orientation, RemoveItems, ReorderItems, Selection, SelectionFrame, SetNoteContent,
+    AddGroup, AddItems, Align, ArrangeMode, Camera, Crop, DEFAULT_NOTE_SIZE, DissolveGroup,
+    Effects, GroupChild, Handle, History, Item, ItemId, ItemState, NOTE_PADDING, NoteContent,
+    NoteFormat, Orientation, RemoveItems, ReorderItems, Selection, SelectionFrame, SetNoteContent,
     SetTransforms, SizeAxis, align, arrange, distribute, scale_item, scale_item_in_frame,
     scale_rules, screen_tolerance, snap_rect,
 };
@@ -41,6 +41,9 @@ pub const DUPLICATE_PIXELS: f32 = 16.0;
 
 /// Gap used by arrange commands, in world units.
 pub const ARRANGE_GAP: f32 = 24.0;
+
+/// Smallest on-screen size a crop can close to, in pixels.
+pub const CROP_MIN_PIXELS: f32 = 8.0;
 
 /// Shift-rotation step.
 pub const ROTATE_STEP: f32 = std::f32::consts::PI / 12.0;
@@ -129,6 +132,19 @@ enum Gesture {
         targets: Vec<rizref_core::Rect>,
         before: Vec<(ItemId, ItemState)>,
         moved: bool,
+        /// A member of the selected group pressed a second time: a click
+        /// (no drag) enters the group and selects just this item.
+        enter: Option<ItemId>,
+    },
+    Crop {
+        id: ItemId,
+        handle: Handle,
+        start_world: Vec2,
+        start_screen: DVec2,
+        /// World units per screen pixel at the press, for the minimum size.
+        min_size: f32,
+        before: ItemState,
+        moved: bool,
     },
     Scale {
         handle: Handle,
@@ -199,6 +215,8 @@ pub struct Board {
     guides: Vec<rizref_core::Guide>,
     snap_enabled: bool,
     pending: Effects,
+    /// The image whose crop edges the handles move, while crop mode is on.
+    crop: Option<ItemId>,
 }
 
 impl Board {
@@ -219,6 +237,7 @@ impl Board {
             guides: Vec::new(),
             snap_enabled: true,
             pending: Effects::default(),
+            crop: None,
         }
     }
 
@@ -314,6 +333,7 @@ impl Board {
             }
         }
         self.pending.merge(effects);
+        self.sync_crop();
     }
 
     /// Applies live states during a gesture, without touching the history.
@@ -365,15 +385,24 @@ impl Board {
     // Selection
     // -----------------------------------------------------------------------
 
+    /// Drops crop mode once its image is no longer the whole selection.
+    fn sync_crop(&mut self) {
+        if self.crop_target().is_none() {
+            self.crop = None;
+        }
+    }
+
     /// Selects every item.
     pub fn select_all(&mut self) {
         self.selection
             .set_all(self.scene.items().iter().map(Item::id));
+        self.sync_crop();
     }
 
     /// Clears the selection.
     pub fn clear_selection(&mut self) {
         self.selection.clear();
+        self.sync_crop();
     }
 
     /// Selects exactly `id`, if it is on the board.
@@ -381,6 +410,7 @@ impl Board {
         if self.scene.contains(id) {
             self.selection.set_single(id);
         }
+        self.sync_crop();
     }
 
     // -----------------------------------------------------------------------
@@ -530,12 +560,15 @@ impl Board {
             if let Some(natural) = natural {
                 transform.set_size(natural);
             }
+            // The crop is undone too: the whole image comes back at its
+            // natural size.
             after.push((
                 id,
                 ItemState {
                     transform,
                     flip_x: false,
                     flip_y: false,
+                    crop: Crop::FULL,
                 },
             ));
         }
@@ -779,6 +812,80 @@ impl Board {
             self.run(Box::new(DissolveGroup::new(group)));
         }
         true
+    }
+
+    /// The group the selection is inside: some, but not all, of one group's
+    /// members are selected, after a second click entered it. Edits then
+    /// act on those members only; the group itself is untouched, so
+    /// deselecting simply leaves the members in it.
+    pub fn entered_group(&self) -> Option<rizref_core::GroupId> {
+        let first = self.selection.iter().next()?;
+        let group = self.scene.groups().top_group_of_item(first)?;
+        let leaves: BTreeSet<ItemId> = self.scene.group_leaves(group).into_iter().collect();
+        let inside = self.selection.iter().all(|id| leaves.contains(&id));
+        (inside && self.selection.len() < leaves.len()).then_some(group)
+    }
+
+    /// The bounds of [`Board::entered_group`], for the overlay.
+    pub fn entered_group_bounds(&self) -> Option<rizref_core::Rect> {
+        let group = self.entered_group()?;
+        self.scene
+            .group_leaves(group)
+            .into_iter()
+            .filter_map(|id| self.scene.item(id).map(Item::world_rect))
+            .reduce(|a, b| a.union(&b))
+    }
+
+    // -----------------------------------------------------------------------
+    // Crop
+    // -----------------------------------------------------------------------
+
+    /// The image being cropped: crop mode is on and that image is still the
+    /// whole selection.
+    pub fn crop_target(&self) -> Option<ItemId> {
+        self.crop.filter(|id| self.selected_image() == Some(*id))
+    }
+
+    /// Turns crop mode on for the selected image, or off again. Returns
+    /// whether anything changed.
+    pub fn toggle_crop(&mut self) -> bool {
+        if self.crop_target().is_some() {
+            return self.exit_crop();
+        }
+        self.cancel_gesture();
+        self.crop = self.selected_image();
+        self.crop.is_some()
+    }
+
+    /// Leaves crop mode, keeping the crop. Returns whether it was on.
+    pub fn exit_crop(&mut self) -> bool {
+        if matches!(self.gesture, Some(Gesture::Crop { .. })) {
+            self.cancel_gesture();
+        }
+        self.crop.take().is_some() && self.selected_image().is_some()
+    }
+
+    /// The four world corners of the whole, uncropped image while it is
+    /// being cropped, so the overlay can show what the crop can grow into.
+    pub fn crop_full_corners(&self) -> Option<[Vec2; 4]> {
+        let item = self.scene.item(self.crop_target()?)?;
+        let state = item.state();
+        let size = state.transform.size();
+        let shown = state.crop.displayed(state.flip_x, state.flip_y);
+        let span = shown.span();
+        let full = size / span;
+        let left = -size.x * 0.5 - shown.left * full.x;
+        let top = -size.y * 0.5 - shown.top * full.y;
+        let (right, bottom) = (left + full.x, top + full.y);
+        Some(
+            [
+                Vec2::new(left, top),
+                Vec2::new(right, top),
+                Vec2::new(right, bottom),
+                Vec2::new(left, bottom),
+            ]
+            .map(|local| state.transform.from_local(local)),
+        )
     }
 
     /// Moves the selection one step towards the front.
@@ -1206,6 +1313,26 @@ impl Board {
         let rotate_offset = view.pixels_to_world(ROTATE_HANDLE_PIXELS);
         let radius = view.pixels_to_world(HANDLE_PIXELS);
 
+        if let Some(id) = self.crop_target()
+            && let Some(frame) = self.frame()
+            && let Some(handle) = frame
+                .hit_with(world, radius, rotate_offset, false)
+                .filter(|handle| *handle != Handle::Rotate)
+            && let Some(item) = self.scene.item(id)
+        {
+            self.hover = None;
+            self.gesture = Some(Gesture::Crop {
+                id,
+                handle,
+                start_world: world,
+                start_screen: screen,
+                min_size: view.pixels_to_world(CROP_MIN_PIXELS),
+                before: item.state(),
+                moved: false,
+            });
+            return true;
+        }
+
         if let Some(frame) = self.frame()
             && let Some(handle) = frame
                 .hit_with(world, radius, rotate_offset, self.selection_corners_only())
@@ -1249,9 +1376,28 @@ impl Board {
                 self.hover = Some(id);
                 return true;
             }
-            if !self.selection.contains(id) {
+            let mut enter = None;
+            let group = self.scene.groups().top_group_of_item(id);
+            if group.is_some() && group == self.entered_group() {
+                // Inside a group already: a click picks one member.
+                if !self.selection.contains(id) {
+                    self.selection.set_single(id);
+                }
+            } else if !self.selection.contains(id) {
                 let members: Vec<ItemId> = self.scene.expand_item(id).into_iter().collect();
                 self.selection.set_all(members);
+            } else if let Some(group) = group
+                && self.selection.len() > 1
+                && self
+                    .scene
+                    .group_leaves(group)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+                    == self.selection.iter().collect()
+            {
+                // The second click on a selected group: a drag still moves
+                // the whole group, a click enters it.
+                enter = Some(id);
             }
             let before = self.selected_states();
             let bounds = before
@@ -1268,6 +1414,7 @@ impl Board {
                 targets,
                 before,
                 moved: false,
+                enter,
             });
             return true;
         }
@@ -1301,6 +1448,7 @@ impl Board {
                 targets,
                 before,
                 moved,
+                ..
             } => {
                 if (screen - *start_screen).length() > CLICK_SLOP_PIXELS {
                     *moved = true;
@@ -1393,6 +1541,26 @@ impl Board {
                 }
                 *moved
             }
+            Gesture::Crop {
+                id,
+                handle,
+                start_world,
+                start_screen,
+                min_size,
+                before,
+                moved,
+            } => {
+                if (screen - *start_screen).length() > CLICK_SLOP_PIXELS {
+                    *moved = true;
+                }
+                if *moved {
+                    let delta =
+                        before.transform.to_local(world) - before.transform.to_local(*start_world);
+                    let state = cropped_state(*before, *handle, delta, *min_size);
+                    self.apply_states(&[(*id, state)]);
+                }
+                *moved
+            }
             Gesture::Rotate {
                 pivot,
                 last_angle,
@@ -1461,6 +1629,8 @@ impl Board {
 
     /// Releases the pointer, committing a gesture as one command.
     pub fn pointer_up(&mut self, _screen: DVec2, _view: ViewInfo, _mods: Modifiers) -> bool {
+        // A press that picked something else ends crop mode.
+        self.sync_crop();
         let Some(gesture) = self.gesture.take() else {
             return false;
         };
@@ -1470,6 +1640,18 @@ impl Board {
             Gesture::Move { moved, before, .. } if moved => {
                 let ids: BTreeSet<ItemId> = before.iter().map(|(id, _)| *id).collect();
                 Some(("Move", before, self.current_states(&ids)))
+            }
+            Gesture::Move {
+                enter: Some(id), ..
+            } => {
+                self.selection.set_single(id);
+                return true;
+            }
+            Gesture::Crop {
+                id, before, moved, ..
+            } if moved => {
+                let after = self.current_states(&BTreeSet::from([id]));
+                Some(("Crop", vec![(id, before)], after))
             }
             Gesture::Scale { moved, before, .. } if moved => {
                 let ids: BTreeSet<ItemId> = before.iter().map(|(id, _)| *id).collect();
@@ -1560,16 +1742,28 @@ impl Board {
         if let Some(gesture) = &self.gesture {
             return match gesture {
                 Gesture::Move { .. } => CursorHint::Grabbing,
+                Gesture::Crop { handle, .. } => match self.frame() {
+                    Some(frame) => resize_cursor(*handle, &frame, view),
+                    None => CursorHint::Default,
+                },
                 Gesture::Scale { handle, frame, .. } => resize_cursor(*handle, frame, view),
                 Gesture::Rotate { .. } => CursorHint::Rotate,
                 Gesture::Marquee { .. } => CursorHint::Crosshair,
             };
         }
 
+        let cropping = self.crop_target().is_some();
         if let Some(frame) = self.frame()
             && let Some(handle) = frame
-                .hit_with(world, radius, rotate_offset, self.selection_corners_only())
-                .filter(|handle| *handle != Handle::Rotate || self.selection_rotatable())
+                .hit_with(
+                    world,
+                    radius,
+                    rotate_offset,
+                    !cropping && self.selection_corners_only(),
+                )
+                .filter(|handle| {
+                    *handle != Handle::Rotate || (!cropping && self.selection_rotatable())
+                })
         {
             return resize_cursor(handle, &frame, view);
         }
@@ -1606,6 +1800,76 @@ impl Order {
             Self::Front => "Bring to front",
             Self::Back => "Send to back",
         }
+    }
+}
+
+/// The state of an image after a crop handle moved `delta` in its local,
+/// unrotated frame.
+///
+/// The edges the handle owns follow the pointer while the others stay put on
+/// the board, so the visible pixels do not move: only the window onto them
+/// changes. An edge stops at the uncropped image's border and never closes
+/// to less than `min_size` world units (or the smallest crop span).
+fn cropped_state(before: ItemState, handle: Handle, delta: Vec2, min_size: f32) -> ItemState {
+    let size = before.transform.size();
+    let shown = before.crop.displayed(before.flip_x, before.flip_y);
+    let span = shown.span();
+    if span.x <= 0.0 || span.y <= 0.0 {
+        return before;
+    }
+    // World units per unit of source: the whole image's size on the board.
+    let full = size / span;
+    let full_min = Vec2::new(
+        -size.x * 0.5 - shown.left * full.x,
+        -size.y * 0.5 - shown.top * full.y,
+    );
+    let full_max = full_min + full;
+    let min = Vec2::new(
+        min_size.max(full.x * rizref_core::MIN_CROP_SPAN * 2.0),
+        min_size.max(full.y * rizref_core::MIN_CROP_SPAN * 2.0),
+    );
+
+    let (mut lo, mut hi) = (-size * 0.5, size * 0.5);
+    let (west, east, north, south) = match handle {
+        Handle::Nw => (true, false, true, false),
+        Handle::N => (false, false, true, false),
+        Handle::Ne => (false, true, true, false),
+        Handle::E => (false, true, false, false),
+        Handle::Se => (false, true, false, true),
+        Handle::S => (false, false, false, true),
+        Handle::Sw => (true, false, false, true),
+        Handle::W => (true, false, false, false),
+        Handle::Rotate => return before,
+    };
+    if west {
+        lo.x = (lo.x + delta.x).min(hi.x - min.x).max(full_min.x);
+    }
+    if east {
+        hi.x = (hi.x + delta.x).max(lo.x + min.x).min(full_max.x);
+    }
+    if north {
+        lo.y = (lo.y + delta.y).min(hi.y - min.y).max(full_min.y);
+    }
+    if south {
+        hi.y = (hi.y + delta.y).max(lo.y + min.y).min(full_max.y);
+    }
+
+    let unit = |v: f32| v.clamp(0.0, 1.0);
+    let Some(shown) = Crop::new(
+        unit((lo.x - full_min.x) / full.x),
+        unit((lo.y - full_min.y) / full.y),
+        unit((hi.x - full_min.x) / full.x),
+        unit((hi.y - full_min.y) / full.y),
+    ) else {
+        return before;
+    };
+    let mut transform = before.transform;
+    transform.set_center(before.transform.from_local((lo + hi) * 0.5));
+    transform.set_size(hi - lo);
+    ItemState {
+        transform,
+        crop: shown.displayed(before.flip_x, before.flip_y),
+        ..before
     }
 }
 
@@ -2074,6 +2338,171 @@ mod tests {
             Modifiers::default(),
         );
         assert_eq!(board.selection().len(), 1, "ungrouped again");
+    }
+
+    /// A press and release at `world`, with an optional drag to `to`.
+    fn click(board: &mut Board, camera: &Camera, world: Vec2, to: Option<Vec2>) {
+        let view = info(camera);
+        let mods = Modifiers::default();
+        board.pointer_down(screen(camera, world), view, mods);
+        let end = to.unwrap_or(world);
+        if to.is_some() {
+            board.pointer_move(screen(camera, end), view, mods);
+        }
+        board.pointer_up(screen(camera, end), view, mods);
+    }
+
+    #[test]
+    fn a_second_click_enters_a_group_and_edits_one_member() {
+        let mut board = board(3);
+        let camera = view();
+        board
+            .selection
+            .set_all([ItemId::from_raw(1), ItemId::from_raw(2)]);
+        assert!(board.group_selection());
+        board.clear_selection();
+
+        click(&mut board, &camera, Vec2::new(40.0, 0.0), None);
+        assert_eq!(board.selection().len(), 2, "first click: the whole group");
+        assert_eq!(board.entered_group(), None);
+
+        // A drag on the selected group still moves all of it.
+        click(
+            &mut board,
+            &camera,
+            Vec2::new(40.0, 0.0),
+            Some(Vec2::new(40.0, 10.0)),
+        );
+        assert_eq!(board.selection().len(), 2);
+        assert_eq!(item(&board, 1).center(), Vec2::new(0.0, 10.0));
+
+        // A second click without a drag enters the group.
+        click(&mut board, &camera, Vec2::new(40.0, 10.0), None);
+        assert_eq!(
+            board.selection().iter().collect::<Vec<_>>(),
+            vec![ItemId::from_raw(2)]
+        );
+        assert!(board.entered_group().is_some());
+        assert!(board.entered_group_bounds().is_some());
+
+        // Inside, a drag moves only that member.
+        click(
+            &mut board,
+            &camera,
+            Vec2::new(40.0, 10.0),
+            Some(Vec2::new(50.0, 10.0)),
+        );
+        assert_eq!(item(&board, 2).center(), Vec2::new(50.0, 10.0));
+        assert_eq!(item(&board, 1).center(), Vec2::new(0.0, 10.0));
+
+        // Clicking a sibling stays inside and picks it alone.
+        click(&mut board, &camera, Vec2::new(0.0, 10.0), None);
+        assert_eq!(
+            board.selection().iter().collect::<Vec<_>>(),
+            vec![ItemId::from_raw(1)]
+        );
+
+        // Deselecting leaves the member in its group.
+        click(&mut board, &camera, Vec2::new(300.0, 300.0), None);
+        assert!(board.selection().is_empty());
+        click(&mut board, &camera, Vec2::new(50.0, 10.0), None);
+        assert_eq!(board.selection().len(), 2, "still one group");
+        assert_eq!(board.entered_group(), None);
+
+        // Ungroup splits it for good.
+        assert!(board.ungroup_selection());
+        board.clear_selection();
+        click(&mut board, &camera, Vec2::new(50.0, 10.0), None);
+        assert_eq!(board.selection().len(), 1);
+    }
+
+    #[test]
+    fn crop_handles_move_edges_and_reset_restores_the_whole_image() {
+        let mut board = board(1);
+        let camera = view();
+        assert!(!board.toggle_crop(), "nothing selected");
+        board.select_only(ItemId::from_raw(1));
+        assert!(board.toggle_crop());
+        assert_eq!(board.crop_target(), Some(ItemId::from_raw(1)));
+        assert!(board.crop_full_corners().is_some());
+
+        // Drag the east edge to the centre: the left half stays in place.
+        click(
+            &mut board,
+            &camera,
+            Vec2::new(10.0, 0.0),
+            Some(Vec2::new(0.0, 0.0)),
+        );
+        let cropped = item(&board, 1);
+        assert_eq!(cropped.size(), Vec2::new(10.0, 20.0));
+        assert_eq!(cropped.center(), Vec2::new(-5.0, 0.0));
+        assert_eq!(
+            cropped.crop(),
+            rizref_core::Crop::new(0.0, 0.0, 0.5, 1.0).unwrap()
+        );
+
+        // An edge cannot grow past the original image.
+        click(
+            &mut board,
+            &camera,
+            Vec2::new(0.0, 0.0),
+            Some(Vec2::new(30.0, 0.0)),
+        );
+        assert!(item(&board, 1).crop().is_full());
+        assert_eq!(item(&board, 1).size(), Vec2::splat(20.0));
+
+        // Crop again, finish, and undo/redo it as one step.
+        click(
+            &mut board,
+            &camera,
+            Vec2::new(-10.0, 0.0),
+            Some(Vec2::new(0.0, 0.0)),
+        );
+        assert_eq!(item(&board, 1).center(), Vec2::new(5.0, 0.0));
+        assert!(board.exit_crop());
+        assert_eq!(board.crop_target(), None);
+        board.undo();
+        assert!(item(&board, 1).crop().is_full());
+        board.redo();
+        assert_eq!(item(&board, 1).crop().left, 0.5);
+
+        // Reset transform restores the uncropped image at its natural size.
+        assert!(board.reset_transform());
+        let reset = item(&board, 1);
+        assert!(reset.crop().is_full(), "reset brings the whole image back");
+        assert_eq!(reset.size(), Vec2::splat(20.0));
+        board.undo();
+        assert_eq!(item(&board, 1).crop().left, 0.5, "and reset undoes");
+    }
+
+    #[test]
+    fn crop_mode_ends_when_the_selection_moves_on() {
+        let mut board = board(2);
+        let camera = view();
+        board.select_only(ItemId::from_raw(1));
+        assert!(board.toggle_crop());
+        click(&mut board, &camera, Vec2::new(40.0, 0.0), None);
+        assert_eq!(board.crop_target(), None);
+        board.select_only(ItemId::from_raw(1));
+        assert_eq!(board.crop_target(), None, "re-selecting does not resume");
+    }
+
+    #[test]
+    fn a_mirrored_crop_keeps_the_edge_the_user_dragged() {
+        let before = rizref_core::ItemState {
+            transform: Transform::new(Vec2::ZERO, Vec2::splat(20.0)),
+            flip_x: true,
+            flip_y: false,
+            crop: rizref_core::Crop::FULL,
+        };
+        let after = super::cropped_state(before, rizref_core::Handle::W, Vec2::new(10.0, 0.0), 1.0);
+        // The visible left half is gone; mirrored, that is the source's right.
+        assert_eq!(
+            after.crop,
+            rizref_core::Crop::new(0.0, 0.0, 0.5, 1.0).unwrap()
+        );
+        assert_eq!(after.transform.center(), Vec2::new(5.0, 0.0));
+        assert_eq!(after.transform.size(), Vec2::new(10.0, 20.0));
     }
 
     #[test]

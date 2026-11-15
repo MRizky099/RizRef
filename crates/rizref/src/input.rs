@@ -62,6 +62,8 @@ pub enum Command {
     FlipVertical,
     /// `ctrl+shift+R`.
     ResetTransform,
+    /// `C` — crop the selected image: its handles move the crop edges.
+    ToggleCrop,
     /// `ctrl+shift+W`.
     MatchWidth,
     /// `ctrl+shift+H`.

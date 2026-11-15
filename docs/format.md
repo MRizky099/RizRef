@@ -277,6 +277,25 @@ no card; only its glyphs are drawn. One more optional member carries its styling
   rotate handle, and the text is drawn and edited along the rotated box.
 * Thumbnails do not draw text items (a card would be a box the board never shows).
 
+### Image crop (v1.4)
+
+```json
+"crop": [0.25, 0.0, 0.75, 0.5]
+```
+
+* `crop` is `[left, top, right, bottom]`, the part of an image item's source it shows,
+  as fractions of the source's width and height in **unmirrored** texture space (a
+  flipped item mirrors the cropped region; the crop itself does not change). `size`
+  is the box the cropped region fills on the board.
+* Absent means the whole image, and RizRef omits it for an uncropped item, so older
+  boards resave unchanged. Every value must be finite and in `0..=1` with
+  `right − left` and `bottom − top` at least `0.0001`; anything else (or a crop on a
+  note) is ignored with a load warning and the whole image shows.
+* The pixels outside the crop stay in the asset: Reset transform clears the crop and
+  returns the item to the source's natural size. Older readers keep `crop` in the
+  item's `extra` map while loaded and show the whole image squeezed into `size`.
+  `schema_version` stays 1.
+
 ## Board index — `INDX` JSON
 
 ```jsonc
@@ -399,3 +418,4 @@ file; 2 means a bad command line.
 | 1.2 | 06b | No new members. `source_url` is populated for browser pastes/drags; `origin`/`source_path` semantics, untrusted-URL handling and the dedup merge are specified. `schema_version` stays 1. |
 | 1.2 | 07 | No format change. Documented the shell-thumbnail read path; saves retry a refused final rename briefly and refuse a read-only target before writing; autosave recovery copies are ordinary v1 boards. |
 | 1.3 | text | Additive: `text_format: "rich"` text items and their optional `spans` member. `schema_version` stays 1. |
+| 1.4 | crop | Additive: the optional image-item `crop` member. `schema_version` stays 1. |
