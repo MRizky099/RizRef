@@ -4956,7 +4956,23 @@ impl ApplicationHandler<AppEvent> for App {
                     self.redraw();
                 }
             }
+            WindowEvent::PinchGesture { delta, .. } => {
+                // macOS trackpads report pinch-to-zoom as its own gesture.
+                if self.shell.mode() == Mode::Start
+                    || self.shell.menu.is_some()
+                    || self.shell.has_overlay()
+                    || self.shell.confirm_close.is_some()
+                    || self.shell.image_info.is_some()
+                {
+                    return;
+                }
+                self.view.pinch_zoom(delta);
+                self.redraw();
+            }
             WindowEvent::MouseInput { state, button, .. } => {
+                // Kept for `-v` logs: a press without its release is how a
+                // drag that never ends shows up.
+                tracing::debug!(?button, ?state, "mouse button");
                 let pressed = state == ElementState::Pressed;
                 let position = self.view.cursor_position().unwrap_or(self.viewport() * 0.5);
                 if self.shell.image_info.is_some() {

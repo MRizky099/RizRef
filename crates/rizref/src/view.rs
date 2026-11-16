@@ -192,6 +192,22 @@ impl ViewState {
         });
     }
 
+    /// Applies a trackpad pinch (macOS: `WindowEvent::PinchGesture`) at the
+    /// cursor. `magnification` is the gesture's delta since the last event:
+    /// `0.1` is 10 % larger, negative zooms out. Immediate, because the
+    /// gesture itself is already continuous; it also ends a running wheel
+    /// animation so the two never fight.
+    pub fn pinch_zoom(&mut self, magnification: f64) {
+        if !magnification.is_finite() || magnification == 0.0 {
+            return;
+        }
+        self.zoom_animation = None;
+        let anchor = self.cursor.unwrap_or(self.viewport * 0.5);
+        // A delta of -1 would mean "zero size"; keep every step invertible.
+        let factor = (1.0 + magnification).max(0.1);
+        self.zoom_to_at(anchor, self.camera.zoom * factor);
+    }
+
     /// Sets the zoom immediately, keeping the world point under `anchor`
     /// exactly in place.
     fn zoom_to_at(&mut self, anchor: DVec2, zoom: f64) {
@@ -472,5 +488,32 @@ mod tests {
         view.apply_command(Command::BeginPan(PanKind::SpaceDrag), None);
 
         assert_eq!(view.pan, Some(super::PanKind::MiddleDrag));
+    }
+
+    #[test]
+    fn a_pinch_zooms_about_the_cursor_and_undoes_itself() {
+        let mut view = view();
+        let cursor = DVec2::new(600.0, 150.0);
+        view.set_cursor(cursor);
+        let under = view.camera.screen_to_world(cursor, view.viewport());
+        let zoom = view.camera.zoom;
+
+        view.pinch_zoom(0.25);
+        assert!((view.camera.zoom - zoom * 1.25).abs() < 1e-9);
+        let after = view.camera.screen_to_world(cursor, view.viewport());
+        assert!(
+            (after - under).length() < 1e-6,
+            "the point under the fingers stays"
+        );
+
+        view.pinch_zoom(1.0 / 1.25 - 1.0);
+        assert!(
+            (view.camera.zoom - zoom).abs() < 1e-9,
+            "pinching back returns"
+        );
+
+        view.pinch_zoom(f64::NAN);
+        view.pinch_zoom(-5.0);
+        assert!(view.camera.zoom.is_finite() && view.camera.zoom > 0.0);
     }
 }
