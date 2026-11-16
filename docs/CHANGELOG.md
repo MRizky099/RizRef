@@ -2,6 +2,21 @@
 
 Summary of what each delivery phase landed. One section per phase; newest at the top.
 
+
+## GPU start-up on older Macs
+
+Reported on macOS 10.15: "could not initialise a GPU surface (Metal)". The device was
+requested with wgpu's *default* limits, which assume a recent GPU; adapters that report
+less (2012-era Intel GPUs, virtual GPUs) refuse such a device.
+
+- `renderer::required_limits`: wgpu's downlevel limits, raised to the adapter's texture
+  size and alignment. RizRef needs nothing more (no storage buffers or compute, at most
+  four bind groups, 4096 px item textures); a capable GPU keeps its large textures.
+- The swapchain asks for `COPY_SRC` (the colour picker's read-back) only where the
+  surface offers it; elsewhere the picker is off instead of the surface failing.
+- Every start-up failure now has a reason: no adapter (named as such, with the VM
+  hint), the device refused (with wgpu's error), or no surface/format. The alert shows
+  it and the log folder; the log also records the adapter, driver and limits.
 ## Crop, and editing inside a group
 
 Format revision 1.4 (additive; see `docs/format.md`, "Image crop").

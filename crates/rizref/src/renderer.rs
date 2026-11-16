@@ -63,6 +63,21 @@ pub fn backend_requirement() -> &'static str {
     }
 }
 
+/// The device limits RizRef asks for: wgpu's downlevel set — what any GPU
+/// that runs Metal, Vulkan or DX12 at all can meet, including the 2012-era
+/// Intel GPUs macOS 10.13–10.15 still support — raised to the adapter's own
+/// texture size and alignment, so large images still get large textures.
+///
+/// The renderer needs nothing beyond that set: no storage buffers or compute,
+/// at most four bind groups, and textures up to `MAX_TEXTURE_SIDE`. Asking
+/// for wgpu's *default* limits instead made `request_device` fail outright on
+/// adapters that report less than those defaults.
+pub fn required_limits(adapter: &wgpu::Limits) -> wgpu::Limits {
+    wgpu::Limits::downlevel_defaults()
+        .using_resolution(adapter.clone())
+        .using_alignment(adapter.clone())
+}
+
 /// The backend order as a list, for the adapter walk.
 ///
 /// `RIZREF_GPU_BACKEND=dx12` or `=vulkan` restricts the walk (and the wgpu
@@ -263,14 +278,20 @@ impl GpuDevice {
     /// fixes an order — Vulkan before DX12 — and a set-valued option cannot
     /// express order. Hardware adapters win over software ones inside a
     /// backend; every adapter found is logged at debug for bug reports.
-    pub fn create() -> Option<Self> {
+    ///
+    /// `Err` carries a one-line reason for the user (also logged): no
+    /// adapter, or a device the adapter refused.
+    pub fn create() -> Result<Self, String> {
         if !has_usable_backend() {
             tracing::error!(
                 compiled = %describe_backends(wgpu::Instance::enabled_backend_features()),
                 wanted = %describe_backends(preferred_backends()),
                 "this build has no GPU backend for this OS"
             );
-            return None;
+            return Err(format!(
+                "this build has no {} backend",
+                backend_requirement()
+            ));
         }
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = instance_backends();
@@ -303,17 +324,39 @@ impl GpuDevice {
                 break;
             }
         }
-        let adapter = chosen?;
+        let Some(adapter) = chosen else {
+            tracing::error!(
+                backends = %describe_backends(instance_backends()),
+                "no GPU adapter: the system offers no device for these backends"
+            );
+            return Err(format!(
+                "no {} graphics device was found (a virtual machine without GPU \
+                 acceleration has none)",
+                backend_requirement()
+            ));
+        };
 
+        let info = adapter.get_info();
+        let required_limits = required_limits(&adapter.limits());
+        tracing::info!(
+            driver = %info.driver,
+            driver_info = %info.driver_info,
+            device_type = ?info.device_type,
+            max_texture_side = required_limits.max_texture_dimension_2d,
+            "requesting the GPU device with downlevel limits"
+        );
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rizref-device"),
+            required_limits,
             ..Default::default()
         }))
-        .inspect_err(|e| tracing::error!(%e, "cannot acquire a GPU device"))
-        .ok()?;
+        .map_err(|e| {
+            tracing::error!(%e, adapter = %info.name, "cannot acquire a GPU device");
+            format!("{} refused to open a device: {e}", info.name)
+        })?;
         // Shader compilation and pipeline creation, off the UI thread too.
         let canvas = Canvas::new(&device, PREDICTED_FORMAT);
-        Some(Self {
+        Ok(Self {
             instance,
             adapter,
             device,
@@ -325,7 +368,7 @@ impl GpuDevice {
 
 impl GpuSurface {
     /// Creates the window surface on an existing device and configures it.
-    pub fn attach(gpu: GpuDevice, window: Arc<Window>, size: (u32, u32)) -> Option<Self> {
+    pub fn attach(gpu: GpuDevice, window: Arc<Window>, size: (u32, u32)) -> Result<Self, String> {
         let GpuDevice {
             instance,
             adapter,
@@ -335,18 +378,25 @@ impl GpuSurface {
         } = gpu;
         // Holding the window in an `Arc` (which the caller does) lets the
         // surface claim `'static` rather than borrowing the window.
-        let surface = instance
-            .create_surface(window)
-            .inspect_err(|e| tracing::error!(%e, "cannot create the window surface"))
-            .ok()?;
+        let surface = instance.create_surface(window).map_err(|e| {
+            tracing::error!(%e, "cannot create the window surface");
+            format!("cannot create the window surface: {e}")
+        })?;
 
-        let alpha_modes = surface.get_capabilities(&adapter).alpha_modes;
+        let capabilities = surface.get_capabilities(&adapter);
+        let alpha_modes = capabilities.alpha_modes.clone();
         let canvas_alpha = alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied);
         let config = match surface.get_default_config(&adapter, size.0.max(1), size.1.max(1)) {
             Some(mut config) => {
                 // The colour picker reads one pixel back from the presented
                 // surface; that requires COPY_SRC on the swapchain texture.
-                config.usage |= wgpu::TextureUsages::COPY_SRC;
+                // Asked for only where the surface offers it: requesting an
+                // unsupported usage fails the configuration outright.
+                if capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+                    config.usage |= wgpu::TextureUsages::COPY_SRC;
+                } else {
+                    tracing::warn!("the surface cannot be read back; the colour picker is off");
+                }
                 if canvas_alpha {
                     config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
                 }
@@ -357,8 +407,11 @@ impl GpuSurface {
                 config
             }
             None => {
-                tracing::error!("the surface supports no usable configuration");
-                return None;
+                tracing::error!(
+                    formats = ?capabilities.formats,
+                    "the surface supports no usable configuration"
+                );
+                return Err("the window surface offers no usable format".to_owned());
             }
         };
         surface.configure(&device, &config);
@@ -387,7 +440,7 @@ impl GpuSurface {
             "item textures ready"
         );
 
-        Some(Self {
+        Ok(Self {
             surface,
             device,
             queue,
@@ -506,7 +559,8 @@ impl GpuSurface {
             }
         };
 
-        let pick = frame.pick.map(|(x, y)| {
+        let readable = self.config.usage.contains(wgpu::TextureUsages::COPY_SRC);
+        let pick = frame.pick.filter(|_| readable).map(|(x, y)| {
             (
                 x.min(self.config.width.saturating_sub(1)),
                 y.min(self.config.height.saturating_sub(1)),
@@ -721,6 +775,30 @@ mod tests {
             "compiled backends {} do not include {}",
             describe_backends(wgpu::Instance::enabled_backend_features()),
             describe_backends(preferred_backends())
+        );
+    }
+
+    #[test]
+    fn the_device_asks_only_for_what_any_adapter_can_give() {
+        // An adapter that offers less than wgpu's defaults (an old Intel GPU,
+        // a virtual GPU) still meets what RizRef requests.
+        let weak = wgpu::Limits::downlevel_defaults();
+        let asked = super::required_limits(&weak);
+        assert!(
+            asked.check_limits(&weak),
+            "the request fits a downlevel adapter"
+        );
+        // A capable adapter keeps its large textures.
+        let strong = wgpu::Limits {
+            max_texture_dimension_2d: 16_384,
+            ..wgpu::Limits::default()
+        };
+        let asked = super::required_limits(&strong);
+        assert_eq!(asked.max_texture_dimension_2d, 16_384);
+        assert!(asked.check_limits(&strong));
+        assert!(
+            asked.max_texture_dimension_2d >= crate::textures::MAX_TEXTURE_SIDE,
+            "item textures fit"
         );
     }
 

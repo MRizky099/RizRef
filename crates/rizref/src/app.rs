@@ -630,7 +630,7 @@ struct App {
     /// Open-to-first-frame time of the last opened board.
     last_board_load: Option<Duration>,
     /// The device being created on a background thread, until it arrives.
-    gpu_init: Option<std::sync::mpsc::Receiver<Option<GpuDevice>>>,
+    gpu_init: Option<std::sync::mpsc::Receiver<Result<GpuDevice, String>>>,
     /// Whether the device thread was started (after the first CPU frame).
     gpu_started: bool,
     /// Changes since the last autosave.
@@ -4547,13 +4547,14 @@ impl App {
         let (Some(receiver), Some(window)) = (self.gpu_init.as_ref(), self.window.clone()) else {
             return;
         };
+        let lost = || Err("the GPU start-up thread stopped".to_owned());
         let device = if wait {
-            receiver.recv().ok().flatten()
+            receiver.recv().unwrap_or_else(|_| lost())
         } else {
             match receiver.try_recv() {
                 Ok(device) => device,
                 Err(std::sync::mpsc::TryRecvError::Empty) => return,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => lost(),
             }
         };
         self.gpu_init = None;
@@ -4561,7 +4562,7 @@ impl App {
         match device.and_then(|device| {
             GpuSurface::attach(device, window.clone(), (size.width, size.height))
         }) {
-            Some(renderer) => {
+            Ok(renderer) => {
                 self.startup.mark(Milestone::Gpu);
                 let canvas_alpha = renderer.supports_canvas_alpha();
                 self.renderer = Some(renderer);
@@ -4585,14 +4586,16 @@ impl App {
                 }
                 window.request_redraw();
             }
-            None => {
+            Err(reason) => {
                 // No GPU device or surface at all. There is no CPU canvas for
                 // images yet; be loud and honest rather than a grey box.
                 platform::alert(
                     "RizRef",
                     &format!(
-                        "RizRef could not initialise a GPU surface ({})\nand must close.",
-                        crate::renderer::backend_requirement()
+                        "RizRef could not initialise a GPU surface ({}) and must close.\n\n\
+                         Reason: {reason}.\n\nThe log in {} has the details.",
+                        crate::renderer::backend_requirement(),
+                        crate::paths::logs_dir().display()
                     ),
                 );
                 event_loop.exit();
@@ -5883,7 +5886,9 @@ fn tick_animations(
 /// ends — before `run` returns and the process exits.
 /// Starts building the GPU device on its own thread; the result arrives on
 /// the returned channel, announced by `AppEvent::GpuReady`.
-fn spawn_gpu_init(proxy: EventLoopProxy<AppEvent>) -> std::sync::mpsc::Receiver<Option<GpuDevice>> {
+fn spawn_gpu_init(
+    proxy: EventLoopProxy<AppEvent>,
+) -> std::sync::mpsc::Receiver<Result<GpuDevice, String>> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("rizref-gpu-init".to_owned())
