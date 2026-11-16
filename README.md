@@ -355,7 +355,16 @@ with every file, `SHA256SUMS.txt` and notes generated from the conventional comm
 
 Packages are never committed; CI does not build them, and the hand-over between
 release jobs expires after a day. A maintainer reviews and publishes the draft by
-hand; the workflow never publishes. Windows signing activates once the secrets
+hand; the workflow never publishes.
+
+To try a branch on real hardware before a release, run the workflow by hand as a
+**test build** (*Actions → Release → Run workflow*, tick "test build", pick the
+platform). It packages that branch without a tag, tests or a release; the files are
+a run artifact that expires after three days:
+
+```bash
+gh workflow run release.yml --ref <branch> -f test_build=true -f platforms=macos
+``` Windows signing activates once the secrets
 `RIZREF_SIGN_PFX_BASE64` and `RIZREF_SIGN_PASSWORD` exist; the macOS app is ad-hoc
 signed and not notarized.
 

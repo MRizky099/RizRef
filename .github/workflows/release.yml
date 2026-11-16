@@ -16,25 +16,44 @@ name: Release
 # installer are signed; without them they are not, and the log says so. The
 # macOS app is ad-hoc signed and not notarized (no Apple Developer account);
 # README → Installation → macOS explains the first-launch confirmation.
+#
+# Test builds: run the workflow by hand with "test build" ticked, on any
+# branch, to get one platform's packages for trying on real hardware. That
+# skips the tag check, the tests and the release: the packages are only a
+# run artifact that expires after three days. From the command line:
+#   gh workflow run release.yml --ref <branch> -f test_build=true -f platforms=macos
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build a draft release for"
-        required: true
+        description: "Existing tag to (re)build a draft release for (not for a test build)"
+        required: false
+      test_build:
+        description: "Test build: package the chosen branch, no tag, no release"
+        type: boolean
+        default: false
+      platforms:
+        description: "Test build platforms"
+        type: choice
+        options: [macos, windows, all]
+        default: macos
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
-  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  # The ref to build: the branch for a test build, otherwise the tag.
+  TAG: ${{ inputs.test_build && github.ref_name || (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) }}
+  # Release hand-overs live a day; test builds three, to download and try.
+  RETENTION: ${{ inputs.test_build && 3 || 1 }}
 
 jobs:
   version:
     name: check the tag
+    if: ${{ !inputs.test_build }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -51,6 +70,10 @@ jobs:
   windows:
     name: Windows (test, package)
     needs: version
+    # After the tag check, or without it for a test build that asks for Windows.
+    if: >-
+      ${{ !cancelled() && (needs.version.result == 'success' ||
+      (inputs.test_build && inputs.platforms != 'macos')) }}
     runs-on: windows-latest
     env:
       # `if:` cannot read secrets directly; this flag can.
@@ -62,6 +85,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
+        if: ${{ !inputs.test_build }}
         run: cargo test --workspace
       - name: Restore the signing certificate
         if: ${{ env.HAS_CERT == 'true' }}
@@ -80,16 +104,19 @@ jobs:
         run: ./packaging/package.ps1 -Sign
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
+          name: ${{ inputs.test_build && format('test-build-windows-{0}', github.sha) || 'windows' }}
           path: |
             dist/*-portable.zip
             dist/*-setup.exe
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ env.RETENTION }}
 
   macos:
     name: macOS (test, package)
     needs: version
+    if: >-
+      ${{ !cancelled() && (needs.version.result == 'success' ||
+      (inputs.test_build && inputs.platforms != 'windows')) }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
@@ -100,6 +127,7 @@ jobs:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Test
+        if: ${{ !inputs.test_build }}
         run: cargo test --workspace
       # Intel built for 10.13, Apple Silicon for 11.0, merged with lipo and
       # checked with otool (minimum OS per slice, system libraries only),
@@ -111,16 +139,17 @@ jobs:
         run: packaging/macos/build-dmg.sh dist/macos/RizRef.app dist/macos
       - uses: actions/upload-artifact@v4
         with:
-          name: macos
+          name: ${{ inputs.test_build && format('test-build-macos-{0}', github.sha) || 'macos' }}
           path: |
             dist/macos/*.dmg
             dist/macos/*.zip
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ env.RETENTION }}
 
   publish:
     name: create the draft release
     needs: [windows, macos]
+    if: ${{ !inputs.test_build }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
