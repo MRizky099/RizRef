@@ -168,10 +168,10 @@ fn u32_at_be(bytes: &[u8], at: usize) -> u32 {
 
 #[test]
 fn both_icns_files_hold_every_size_finder_asks_for() {
+    // No `icp4`/`icp5`/`icp6`: macOS 10.15 draws PNG data in them as noise.
     let expected: Vec<([u8; 4], u32)> = [
-        (*b"icp4", 16),
-        (*b"icp5", 32),
-        (*b"icp6", 64),
+        (*b"ic11", 32),
+        (*b"ic12", 64),
         (*b"ic07", 128),
         (*b"ic08", 256),
         (*b"ic09", 512),

@@ -78,6 +78,19 @@ pub fn required_limits(adapter: &wgpu::Limits) -> wgpu::Limits {
         .using_alignment(adapter.clone())
 }
 
+/// The wgpu instance flags RizRef runs with: wgpu's own, minus indirect-call
+/// validation.
+///
+/// With that flag (on by default, release builds included) wgpu compiles a
+/// compute pipeline while opening every device, to check indirect draws. The
+/// Metal compiler of an Intel HD Graphics 4000 on macOS 10.15 crashes on that
+/// shader ("Compiler encountered an internal error") and the device is lost
+/// before RizRef draws anything. RizRef issues no indirect draws or
+/// dispatches, so the check guards nothing here.
+pub fn instance_flags(defaults: wgpu::InstanceFlags) -> wgpu::InstanceFlags {
+    defaults - wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL
+}
+
 /// The backend order as a list, for the adapter walk.
 ///
 /// `RIZREF_GPU_BACKEND=dx12` or `=vulkan` restricts the walk (and the wgpu
@@ -295,6 +308,7 @@ impl GpuDevice {
         }
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = instance_backends();
+        descriptor.flags = instance_flags(descriptor.flags);
         // A swapchain on a DirectComposition visual rather than on the HWND:
         // the only DX12 presentation that composites per-pixel alpha (an HWND
         // swapchain is opaque by DXGI's rules). It only affects DX12.
@@ -799,6 +813,18 @@ mod tests {
         assert!(
             asked.max_texture_dimension_2d >= crate::textures::MAX_TEXTURE_SIDE,
             "item textures fit"
+        );
+    }
+
+    #[test]
+    fn no_indirect_validation_pipeline_is_compiled() {
+        let flags = super::instance_flags(wgpu::InstanceFlags::from_build_config());
+        assert!(!flags.contains(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL));
+        // Everything else wgpu enables stays as it was.
+        assert_eq!(
+            flags | wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL,
+            wgpu::InstanceFlags::from_build_config()
+                | wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL
         );
     }
 

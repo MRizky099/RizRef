@@ -1081,6 +1081,7 @@ mod tests {
         assert!(crate::renderer::has_usable_backend());
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = crate::renderer::preferred_backends();
+        descriptor.flags = crate::renderer::instance_flags(descriptor.flags);
         let instance = wgpu::Instance::new(descriptor);
         // CI runners may have no GPU (or only a software one): the test then
         // skips, saying so, rather than failing.

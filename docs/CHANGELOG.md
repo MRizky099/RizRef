@@ -14,6 +14,14 @@ less (2012-era Intel GPUs, virtual GPUs) refuse such a device.
   four bind groups, 4096 px item textures); a capable GPU keeps its large textures.
 - The swapchain asks for `COPY_SRC` (the colour picker's read-back) only where the
   surface offers it; elsewhere the picker is off instead of the surface failing.
+- **The actual cause, from the 10.15 log (MacBook Pro, Intel HD Graphics 4000):** wgpu's
+  indirect-call validation compiles a compute pipeline while opening every device, and
+  that GPU's Metal compiler crashes on it ("Compiler encountered an internal error"),
+  losing the device. RizRef issues no indirect draws, so `renderer::instance_flags`
+  drops `VALIDATION_INDIRECT_CALL`.
+- **Glitched icon on 10.15:** the `.icns` held 16–64 px PNGs as `icp4`/`icp5`/`icp6`,
+  which macOS 10.15 draws as noise. `make_icon` now writes `iconutil`'s types (`ic11`,
+  `ic12`, `ic07`–`ic10`).
 - Every start-up failure now has a reason: no adapter (named as such, with the VM
   hint), the device refused (with wgpu's error), or no surface/format. The alert shows
   it and the log folder; the log also records the adapter, driver and limits.

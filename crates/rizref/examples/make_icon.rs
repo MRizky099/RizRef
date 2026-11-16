@@ -408,17 +408,19 @@ fn renditions_at(
         .collect()
 }
 
-/// The `.icns` sizes, one PNG chunk each. The @2x chunk types (`ic11`–`ic14`)
-/// would repeat the same PNGs; AppKit picks the next larger rendition for a
-/// Retina display without them, so each image is stored once.
-const ICNS_SIZES: [u32; 7] = [16, 32, 64, 128, 256, 512, 1024];
+/// The `.icns` sizes, one PNG chunk each, in the chunk types Apple's
+/// `iconutil` writes for PNG data: `ic11` (32 px, 16 pt @2x), `ic12` (64 px,
+/// 32 pt @2x), then `ic07`–`ic10` (128–1024 px). The `icp4`/`icp5`/`icp6`
+/// types also hold 16–64 px images, but macOS 10.15 draws PNG data in them
+/// as noise (seen in Finder's Get Info), so they are not used; AppKit scales
+/// the 16 and 32 pt icons down from these.
+const ICNS_SIZES: [u32; 6] = [32, 64, 128, 256, 512, 1024];
 
 /// The `.icns` chunk type for a `side`-pixel PNG.
 fn icns_types(side: u32) -> &'static [&'static [u8; 4]] {
     match side {
-        16 => &[b"icp4"],
-        32 => &[b"icp5"],
-        64 => &[b"icp6"],
+        32 => &[b"ic11"],
+        64 => &[b"ic12"],
         128 => &[b"ic07"],
         256 => &[b"ic08"],
         512 => &[b"ic09"],
